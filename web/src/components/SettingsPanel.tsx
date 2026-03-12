@@ -8,6 +8,8 @@ export interface DubbingSettings {
     original_volume: number;
     use_chatterbox: boolean;
     use_elevenlabs: boolean;
+    use_google_tts: boolean;
+    use_coqui_xtts: boolean;
     use_edge_tts: boolean;
     prefer_youtube_subs: boolean;
     multi_speaker: boolean;
@@ -128,6 +130,46 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                     <div className={`
                                         w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                         ${settings.use_elevenlabs ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* Coqui XTTS v2 */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Coqui XTTS v2</p>
+                                    <p className="text-xs text-text-muted">Free, GPU required, voice cloning from original speaker</p>
+                                </div>
+                                <button
+                                    onClick={() => update({ use_coqui_xtts: !settings.use_coqui_xtts })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.use_coqui_xtts ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.use_coqui_xtts ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* Google Cloud TTS */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Google Cloud TTS</p>
+                                    <p className="text-xs text-text-muted">Free 1M chars/mo, WaveNet/Neural2 voices, needs GCP credentials</p>
+                                </div>
+                                <button
+                                    onClick={() => update({ use_google_tts: !settings.use_google_tts })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.use_google_tts ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.use_google_tts ? 'translate-x-6' : 'translate-x-1'}
                                     `} />
                                 </button>
                             </div>

@@ -14,11 +14,13 @@ export default function HomePage() {
     const [sourceLanguage, setSourceLanguage] = useState('auto');
     const [targetLanguage, setTargetLanguage] = useState('hi');
     const [settings, setSettings] = useState<DubbingSettings>({
-        tts_rate: '+100%',
+        tts_rate: '+0%',
         mix_original: false,
         original_volume: 0.10,
         use_chatterbox: true,
         use_elevenlabs: false,
+        use_google_tts: false,
+        use_coqui_xtts: false,
         use_edge_tts: false,
         prefer_youtube_subs: false,
         multi_speaker: false,
@@ -28,7 +30,7 @@ export default function HomePage() {
     const [recentJobs, setRecentJobs] = useState<JobStatus[]>([]);
 
     const loadJobs = useCallback(() => {
-        getJobs().then(setRecentJobs).catch(() => {});
+        getJobs().then(setRecentJobs).catch(() => { });
     }, []);
 
     useEffect(() => {

@@ -209,11 +209,13 @@ class PipelineConfig:
     target_language: str = "hi"
     asr_model: str = "small"
     tts_voice: str = "hi-IN-SwaraNeural"
-    tts_rate: str = "+100%"
+    tts_rate: str = "+0%"
     mix_original: bool = False
     original_volume: float = 0.10
     use_chatterbox: bool = True
     use_elevenlabs: bool = False
+    use_google_tts: bool = False
+    use_coqui_xtts: bool = False
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
     multi_speaker: bool = False
@@ -526,30 +528,33 @@ class Pipeline:
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
         write_srt(self.segments, srt_translated, text_key="text_translated")
 
-        # Step 5: Generate TTS at natural speed (no speed manipulation)
+        # Step 5: Generate TTS at natural speed, then speed up to 1.5x
         self._report("synthesize", 0.0,
                      f"Generating natural speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
-        self._report("synthesize", 1.0,
-                     f"Generated {len(tts_data)} speech segments")
+        self._report("synthesize", 0.9,
+                     f"Generated {len(tts_data)} segments, speeding up to 1.25x...")
 
-        # Step 6: Assemble — normal video speed + uniform audio stretch
-        self._report("assemble", 0.0, "Building dubbed output...")
+        # Speed up all TTS clips to 1.25x for snappier delivery
+        TTS_SPEED = 1.25
+        for idx, tts in enumerate(tts_data):
+            sped_wav = self.cfg.work_dir / f"tts_fast_{idx:04d}.wav"
+            self._time_stretch(tts["wav"], TTS_SPEED, sped_wav)
+            tts["wav"] = sped_wav
+            tts["duration"] = tts["duration"] / TTS_SPEED
+
+        self._report("synthesize", 1.0,
+                     f"All {len(tts_data)} segments at 1.25x speed")
+
+        # Step 6: Assemble — AUDIO IS MASTER, video adapts
+        # TTS plays at natural speed (uniform, no speedup/slowdown).
+        # Video is slowed (max 1.1x) and scenes are looped to match audio duration.
+        self._report("assemble", 0.0, "Building dubbed output (video adapts to audio)...")
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)
 
-        # Place TTS clips at original timestamps
-        self._report("assemble", 0.2, "Placing speech at original timestamps...")
-        tts_audio = self._build_timeline(tts_data, video_duration, prefix="final_")
-
-        if self.cfg.mix_original:
-            self._report("assemble", 0.4, "Mixing original audio...")
-            tts_audio = self._mix_audio(audio_raw, tts_audio, self.cfg.original_volume)
-
-        # No speed changes — both video and audio stay at 1x
-        # Word-count matching in translation ensures TTS fits naturally
-        self._report("assemble", 0.6, "Muxing final video (1x speed, no stretch)...")
-        self._mux_replace_audio(video_path, tts_audio, self.cfg.output_path)
+        self._report("assemble", 0.1, "Assembling: video will adapt to match natural audio...")
+        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -905,7 +910,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-2.5-pro",
                         contents=prompt,
                     )
                     translated_parts.append(response.text.strip())
@@ -1019,35 +1024,34 @@ class Pipeline:
             end = min(start + batch_size, len(segments))
             batch = segments[start:end]
 
-            # Build numbered input with duration + word count hints
+            # Build numbered input
             lines = []
             for i, seg in enumerate(batch):
-                duration = seg["end"] - seg["start"]
-                src_wc = len(seg["text"].split())
-                tgt_wc = self._compute_target_word_count(duration, self.cfg.target_language)
-                lines.append(f"{i+1}. [{duration:.1f}s | {src_wc}w -> aim ~{tgt_wc}w] {seg['text']}")
+                lines.append(f"{i+1}. {seg['text']}")
 
             prompt = (
-                f"You are a dubbing translator who writes {target_name} like a novelist writing dialogue — "
-                f"flowing, natural, the way people actually speak in daily life. "
+                f"You are a world-class dubbing translator. Your ONE job: make {target_name} translations "
+                f"sound like they were ORIGINALLY written in {target_name} by a native speaker.\n\n"
                 f"Translate each numbered line from {source_name} to {target_name}.\n\n"
-                f"LANGUAGE STYLE (THIS IS THE MOST IMPORTANT RULE):\n"
-                f"- Write like a NOVEL's dialogue — smooth, flowing, conversational {target_name}.\n"
-                f"- Use the COLLOQUIAL everyday language that normal people speak at home, with friends, on the street.\n"
-                f"- NEVER use pure, refined, literary, or textbook {target_name}. NO shudh/formal register.\n"
-                f"- Use the mixed language people ACTUALLY speak — Hindi speakers say 'actually', 'but', 'so', "
-                f"'problem', 'use', 'phone', 'video' etc. naturally. Keep those English words as-is.\n"
-                f"- Think of how a YouTuber or podcast host talks — that's your target register.\n"
-                f"- Contractions, filler words, and run-on sentences are GOOD if that's how people talk.\n"
-                f"- Match the energy — excited = excited, calm = calm, funny = funny.\n"
-                f"- Keep proper nouns, brands, and technical terms as-is.\n"
-                f"- Short lines stay short. Don't over-explain.\n\n"
-                f"WORD COUNT RULE (CRITICAL FOR DUBBING SYNC):\n"
-                f"- Each line shows [Xs | Nw -> aim ~Mw] = duration, source word count, target word count.\n"
-                f"- Your {target_name} translation MUST be approximately M words (tolerance: +/-2 words).\n"
-                f"- If hitting the exact count sounds awkward, prioritize natural flow but stay within +/-2.\n\n"
+                f"VOICE & STYLE (THE #1 PRIORITY):\n"
+                f"- Sound like a REAL PERSON talking — a friend explaining something, a YouTuber narrating, "
+                f"a podcast host telling a story. NOT a textbook, NOT a news anchor, NOT a robot.\n"
+                f"- Use the EXACT way native speakers ACTUALLY talk in everyday life.\n"
+                f"  - Hindi example: 'toh basically yeh cheez hai ki...' NOT 'yah vastu yah hai ki...'\n"
+                f"  - Bengali example: 'mane hocche ta holo...' NOT 'arthat etar tatparya holo...'\n"
+                f"- Keep English words that people naturally use: 'actually', 'problem', 'basically', "
+                f"'phone', 'video', 'use', 'point', 'so', 'but', 'right?', 'like' etc.\n"
+                f"- Use contractions, filler words, and sentence connectors that real people use.\n"
+                f"- Match the speaker's ENERGY and EMOTION exactly — excited = excited, sarcastic = sarcastic.\n"
+                f"- NEVER use formal/literary/textbook language. NEVER use shudh Hindi or sadhu Bengali.\n"
+                f"- Keep proper nouns, brand names, and technical terms unchanged.\n\n"
+                f"TRANSLATION COMPLETENESS (ABSOLUTELY CRITICAL):\n"
+                f"- Translate EVERY word and EVERY idea. NOTHING may be skipped or summarized.\n"
+                f"- Each line must be COMPLETE — no truncation, no cutting, no paraphrasing that loses detail.\n"
+                f"- The video will adapt to match audio length — so DO NOT worry about translation length.\n"
+                f"- Longer translations are fine. Incomplete translations are UNACCEPTABLE.\n\n"
                 f"Output ONLY the numbered {target_name} translations, one per line, matching input numbering.\n"
-                f"Do NOT echo the bracket metadata.\n\n"
+                f"Do NOT add notes, comments, explanations, or metadata.\n\n"
                 + "\n".join(lines)
             )
 
@@ -1056,7 +1060,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash", contents=prompt)
+                        model="gemini-2.5-pro", contents=prompt)
                     translations = self._parse_numbered_translations(response.text, len(batch))
                     for i, seg in enumerate(batch):
                         seg["text_translated"] = translations[i] if translations[i] else seg["text"]
@@ -1089,18 +1093,17 @@ class Pipeline:
         total_batches = (len(segments) + batch_size - 1) // batch_size
 
         system_msg = (
-            f"You are a dubbing translator who writes {target_name} like a novelist writing dialogue — "
-            f"flowing, natural, the way people actually speak in daily life. "
-            f"NEVER use pure, refined, literary, or textbook {target_name}. NO shudh/formal register. "
-            f"Use the COLLOQUIAL everyday language people speak at home, with friends, on the street. "
-            f"Keep commonly used English words as-is (e.g., 'actually', 'problem', 'use', 'phone', 'video', 'so', 'but'). "
-            f"Think YouTuber/podcast host register — that's your target. "
-            f"Keep proper nouns, brands, and technical terms as-is.\n\n"
-            f"WORD COUNT MATCHING (CRITICAL FOR DUBBING SYNC):\n"
-            f"Each line has [Xs | Nw -> aim ~Mw] where X=duration, N=source words, M=target word count. "
-            f"Your {target_name} translation MUST be approximately M words (tolerance: +/-2 words). "
-            f"If the exact count sounds unnatural, prioritize fluency but stay within the tolerance. "
-            f"Output ONLY numbered translations, one per line. Do NOT echo the bracket metadata."
+            f"You are a world-class dubbing translator. Make {target_name} sound like it was ORIGINALLY "
+            f"written by a native speaker — a real person talking, not a textbook.\n"
+            f"Sound like a YouTuber, podcast host, or friend explaining something. "
+            f"Use the EXACT way native speakers talk in everyday life. "
+            f"Keep English words people naturally mix in: 'actually', 'basically', 'problem', 'phone', 'video', 'so', 'but'. "
+            f"NEVER use formal/literary/textbook language. NO shudh Hindi, NO sadhu Bengali. "
+            f"Match the speaker's energy and emotion exactly. "
+            f"Keep proper nouns, brands, and technical terms unchanged.\n\n"
+            f"COMPLETENESS: Translate EVERY word and idea. NOTHING may be skipped. "
+            f"Each translation must be COMPLETE. Video adapts to audio — don't worry about length. "
+            f"Output ONLY numbered translations. No notes or metadata."
         )
 
         for batch_idx in range(total_batches):
@@ -1110,16 +1113,12 @@ class Pipeline:
 
             lines = []
             for i, seg in enumerate(batch):
-                duration = seg["end"] - seg["start"]
-                src_wc = len(seg["text"].split())
-                tgt_wc = self._compute_target_word_count(duration, self.cfg.target_language)
-                lines.append(f"{i+1}. [{duration:.1f}s | {src_wc}w -> aim ~{tgt_wc}w] {seg['text']}")
+                lines.append(f"{i+1}. {seg['text']}")
 
             user_msg = (
                 f"Translate each line from {source_name} to {target_name}. "
-                f"Flowing, conversational, daily-spoken style — like novel dialogue. "
-                f"Match the target word count shown in each line's metadata. "
-                f"Output ONLY numbered {target_name} translations:\n\n"
+                f"Natural, conversational, the way real people actually talk — like a friend explaining something. "
+                f"Translate COMPLETELY — every idea, every nuance. Video adapts to audio length.\n\n"
                 + "\n".join(lines)
             )
 
@@ -1169,19 +1168,17 @@ class Pipeline:
         total_batches = (len(segments) + batch_size - 1) // batch_size
 
         system_msg = (
-            f"You are a dubbing translator who writes {target_name} like a novelist writing dialogue — "
-            f"flowing, natural, the way people actually speak in daily life. "
-            f"NEVER use pure, refined, literary, or textbook {target_name}. NO shudh/formal register. "
-            f"Use the COLLOQUIAL everyday language people speak at home, with friends, on the street. "
-            f"Keep commonly used English words as-is (e.g., 'actually', 'problem', 'use', 'phone', 'video', 'so', 'but'). "
-            f"Match the vibe/energy — excited = excited, calm = calm, funny = funny. "
-            f"Think YouTuber/podcast host register — that's your target. "
-            f"Keep proper nouns and tech terms as-is.\n\n"
-            f"WORD COUNT MATCHING (CRITICAL FOR DUBBING SYNC):\n"
-            f"Each segment shows [Xs | Nw -> aim ~Mw] where X=seconds, N=source words, M=target word count. "
-            f"Your {target_name} translation MUST be approximately M words (tolerance: +/-2 words). "
-            f"If the exact count sounds unnatural, prioritize fluency but stay within +/-2 of the target. "
-            f"Output ONLY numbered translations matching input numbering. Do NOT echo bracket metadata."
+            f"You are a world-class dubbing translator. Make {target_name} sound like it was ORIGINALLY "
+            f"written by a native speaker — a real person talking, not a textbook.\n"
+            f"Sound like a YouTuber, podcast host, or friend explaining something. "
+            f"Use the EXACT way native speakers talk in everyday life. "
+            f"Keep English words people naturally mix in: 'actually', 'basically', 'problem', 'phone', 'video', 'so', 'but'. "
+            f"NEVER use formal/literary/textbook language. NO shudh Hindi, NO sadhu Bengali. "
+            f"Match the speaker's energy and emotion exactly. "
+            f"Keep proper nouns, brands, and technical terms unchanged.\n\n"
+            f"COMPLETENESS: Translate EVERY word and idea. NOTHING may be skipped. "
+            f"Each translation must be COMPLETE. Video adapts to audio — don't worry about length. "
+            f"Output ONLY numbered translations. No notes or metadata."
         )
 
         for batch_idx in range(total_batches):
@@ -1191,15 +1188,12 @@ class Pipeline:
 
             lines = []
             for i, seg in enumerate(batch):
-                duration = seg["end"] - seg["start"]
-                src_wc = len(seg["text"].split())
-                tgt_wc = self._compute_target_word_count(duration, self.cfg.target_language)
-                lines.append(f"{i+1}. [{duration:.1f}s | {src_wc}w -> aim ~{tgt_wc}w] {seg['text']}")
+                lines.append(f"{i+1}. {seg['text']}")
 
             user_msg = (
                 f"Translate from {source_name} to {target_name}. "
-                f"Flowing, conversational, daily-spoken style — like novel dialogue. "
-                f"Hit the target word count (+/-2) while keeping it natural.\n\n"
+                f"Natural, conversational, the way real people actually talk — like a friend explaining something. "
+                f"Translate COMPLETELY — every idea, every nuance. Video adapts to audio length.\n\n"
                 + "\n".join(lines)
             )
 
@@ -1400,6 +1394,370 @@ class Pipeline:
 
         return output
 
+    # ── Speed-fit & no-cut assembly ─────────────────────────────────────
+
+    # Speed limits: slow TTS → speed up to max 1.1x, long TTS → speed up to max 1.25x
+    SPEED_MIN = 1.0 / 1.1    # 0.909 — slowest we allow (1.1x slower than natural)
+    SPEED_MAX = 1.25          # fastest we allow (1.25x faster than natural)
+
+    def _speed_fit_segments(self, tts_data):
+        """Speed-adjust each TTS segment to fit its time slot.
+
+        Rules:
+        - If TTS is shorter than slot → slow down up to 1.1x (SPEED_MIN atempo)
+        - If TTS is longer than slot → speed up up to 1.25x (SPEED_MAX atempo)
+        - NEVER cut or truncate audio — all speech must be heard completely
+        - If TTS still doesn't fit after max speed-up, let it overflow into the gap
+        """
+        fitted = []
+        for idx, tts in enumerate(tts_data):
+            seg_start = tts["start"]
+            seg_end = tts["end"]
+            slot_dur = seg_end - seg_start
+            tts_dur = tts["duration"]
+            tts_wav = tts["wav"]
+
+            if slot_dur < 0.1 or tts_dur < 0.1:
+                fitted.append(tts.copy())
+                continue
+
+            ratio = tts_dur / slot_dur  # >1 = TTS longer than slot
+
+            # Close enough — no adjustment needed
+            if abs(ratio - 1.0) < 0.05:
+                fitted.append(tts.copy())
+                continue
+
+            # Clamp ratio to our speed limits
+            clamped_ratio = max(self.SPEED_MIN, min(ratio, self.SPEED_MAX))
+
+            stretched_wav = self.cfg.work_dir / f"speedfit_{idx:04d}.wav"
+            self._time_stretch(tts_wav, clamped_ratio, stretched_wav)
+
+            new_dur = tts_dur / clamped_ratio  # duration after speed change
+            fitted.append({
+                "start": seg_start,
+                "end": seg_end,
+                "wav": stretched_wav,
+                "duration": new_dur,
+            })
+
+        return fitted
+
+    def _build_timeline_no_cut(self, tts_data, total_duration, prefix=""):
+        """Place TTS segments on a timeline WITHOUT cutting any audio.
+
+        If a segment overflows its slot, the full audio is still placed —
+        it may overlap into the next gap, but no speech is ever truncated.
+        The timeline is extended if necessary to fit all audio.
+        """
+        # Calculate the required timeline length — may exceed video duration
+        max_end = total_duration
+        for seg in tts_data:
+            seg_audio_end = seg["start"] + seg["duration"]
+            if seg_audio_end > max_end:
+                max_end = seg_audio_end
+
+        total_samples = int((max_end + 0.5) * self.SAMPLE_RATE)
+        bytes_per_frame = 2 * self.N_CHANNELS
+        timeline = bytearray(total_samples * bytes_per_frame)
+
+        for seg in tts_data:
+            start_byte = int(seg["start"] * self.SAMPLE_RATE) * bytes_per_frame
+
+            with wave.open(str(seg["wav"]), 'rb') as w:
+                raw = w.readframes(w.getnframes())
+
+            # Place ALL audio — never truncate
+            end_byte = start_byte + len(raw)
+            if end_byte > len(timeline):
+                # Extend the timeline to fit
+                timeline.extend(b'\x00' * (end_byte - len(timeline)))
+            timeline[start_byte:end_byte] = raw
+
+        # Trim back to video duration (but only silence, not speech)
+        # The muxer will use video duration as the master
+        final_samples = int((total_duration + 0.5) * self.SAMPLE_RATE)
+        final_bytes = final_samples * bytes_per_frame
+        if len(timeline) > final_bytes:
+            # Keep all audio up to video end — FFmpeg will naturally end at video length
+            timeline = timeline[:final_bytes]
+
+        output = self.cfg.work_dir / f"{prefix}tts_no_cut.wav"
+        with wave.open(str(output), 'wb') as w:
+            w.setnchannels(self.N_CHANNELS)
+            w.setsampwidth(2)
+            w.setframerate(self.SAMPLE_RATE)
+            w.writeframes(bytes(timeline))
+
+        return output
+
+    # ── Video-adapts-to-audio assembly ──────────────────────────────────
+    # Maximum video slowdown: 1.1x (setpts=1.1*PTS makes it 10% slower)
+    VIDEO_SLOW_MAX = 1.1
+
+    def _assemble_video_adapts_to_audio(self, video_path, audio_raw, tts_data, total_video_duration):
+        """Assemble dubbed video where AUDIO IS MASTER and video adapts.
+
+        For each segment:
+        1. TTS audio plays at NATURAL speed — never sped up, slowed, or cut.
+        2. If TTS fits within the video slot: use the scene as-is (or slow up to 1.1x).
+        3. If TTS is longer than the slot even at 1.1x slowdown: LOOP the scene
+           to fill the remaining time so the full audio is heard.
+        4. Gaps between speech segments play at normal video speed.
+
+        Result: complete, uniform audio with video stretched to match.
+        """
+        sections = []
+        current_pos = 0.0
+        audio_pos = 0.0  # running position in the output audio timeline
+
+        for tts in tts_data:
+            seg_start = tts["start"]
+            seg_end = tts["end"]
+            tts_dur = tts["duration"]
+            slot_dur = seg_end - seg_start
+
+            # Gap before this segment — play at normal speed
+            if seg_start > current_pos + 0.05:
+                gap_dur = seg_start - current_pos
+                sections.append({
+                    "type": "gap",
+                    "video_start": current_pos,
+                    "video_end": seg_start,
+                    "output_dur": gap_dur,
+                })
+                audio_pos += gap_dur
+
+            # Speech segment — video adapts to TTS duration
+            if tts_dur <= slot_dur:
+                # TTS fits or is shorter — slow video slightly to fill
+                slow_factor = max(1.0, tts_dur / slot_dur) if slot_dur > 0.1 else 1.0
+                sections.append({
+                    "type": "speech",
+                    "video_start": seg_start,
+                    "video_end": seg_end,
+                    "pts_factor": slow_factor,
+                    "freeze": False,
+                    "tts_wav": tts["wav"],
+                    "tts_dur": tts_dur,
+                    "output_dur": max(tts_dur, slot_dur * slow_factor),
+                })
+            else:
+                # TTS is longer than slot — slow video to 1.1x first
+                slowed_slot = slot_dur * self.VIDEO_SLOW_MAX
+                if tts_dur <= slowed_slot:
+                    # Slowing to 1.1x is enough
+                    pts_factor = tts_dur / slot_dur  # between 1.0 and 1.1
+                    sections.append({
+                        "type": "speech",
+                        "video_start": seg_start,
+                        "video_end": seg_end,
+                        "pts_factor": pts_factor,
+                        "freeze": False,
+                        "tts_wav": tts["wav"],
+                        "tts_dur": tts_dur,
+                        "output_dur": tts_dur,
+                    })
+                else:
+                    # Even at 1.1x the TTS doesn't fit — slow to 1.1x AND freeze last frame
+                    sections.append({
+                        "type": "speech",
+                        "video_start": seg_start,
+                        "video_end": seg_end,
+                        "pts_factor": self.VIDEO_SLOW_MAX,
+                        "freeze": True,
+                        "freeze_target_dur": tts_dur,
+                        "tts_wav": tts["wav"],
+                        "tts_dur": tts_dur,
+                        "output_dur": tts_dur,
+                    })
+
+            audio_pos += sections[-1]["output_dur"]
+            current_pos = seg_end
+
+        # Trailing gap
+        if current_pos < total_video_duration - 0.05:
+            gap_dur = total_video_duration - current_pos
+            sections.append({
+                "type": "gap",
+                "video_start": current_pos,
+                "video_end": total_video_duration,
+                "output_dur": gap_dur,
+            })
+            audio_pos += gap_dur
+
+        # Build video clips for each section
+        num_sections = len(sections)
+        clip_paths = []
+        clip_section_indices = []  # track which section each clip belongs to
+
+        for idx, sec in enumerate(sections):
+            self._report("assemble",
+                         0.15 + 0.50 * (idx / max(num_sections, 1)),
+                         f"Building section {idx + 1}/{num_sections}...")
+
+            clip = self.cfg.work_dir / f"adapt_{idx:04d}.mp4"
+            vs = sec["video_start"]
+            ve = sec["video_end"]
+            dur = ve - vs
+
+            if dur < 0.05:
+                continue
+
+            if sec["type"] == "gap":
+                # Normal speed gap
+                subprocess.run(
+                    [self._ffmpeg, "-y",
+                     "-ss", f"{vs:.3f}", "-i", str(video_path),
+                     "-t", f"{dur:.3f}",
+                     "-an",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                     str(clip)],
+                    check=True, capture_output=True,
+                )
+                clip_paths.append(clip)
+                clip_section_indices.append(idx)
+
+            elif sec["type"] == "speech":
+                pts_factor = sec["pts_factor"]
+
+                if not sec.get("freeze", False):
+                    # Slow down video (or keep normal) — no freeze needed
+                    if abs(pts_factor - 1.0) < 0.03:
+                        # Normal speed
+                        subprocess.run(
+                            [self._ffmpeg, "-y",
+                             "-ss", f"{vs:.3f}", "-i", str(video_path),
+                             "-t", f"{dur:.3f}",
+                             "-an",
+                             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                             str(clip)],
+                            check=True, capture_output=True,
+                        )
+                    else:
+                        subprocess.run(
+                            [self._ffmpeg, "-y",
+                             "-ss", f"{vs:.3f}", "-i", str(video_path),
+                             "-t", f"{dur:.3f}",
+                             "-filter:v", f"setpts={pts_factor:.6f}*PTS",
+                             "-an",
+                             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                             str(clip)],
+                            check=True, capture_output=True,
+                        )
+                    clip_paths.append(clip)
+                    clip_section_indices.append(idx)
+
+                else:
+                    # Freeze: slow the scene to 1.1x, then freeze the last frame
+                    target_dur = sec["freeze_target_dur"]
+
+                    # First, create the slowed scene clip
+                    slowed_clip = self.cfg.work_dir / f"adapt_{idx:04d}_slow.mp4"
+                    subprocess.run(
+                        [self._ffmpeg, "-y",
+                         "-ss", f"{vs:.3f}", "-i", str(video_path),
+                         "-t", f"{dur:.3f}",
+                         "-filter:v", f"setpts={self.VIDEO_SLOW_MAX:.6f}*PTS",
+                         "-an",
+                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                         str(slowed_clip)],
+                        check=True, capture_output=True,
+                    )
+                    slowed_dur = dur * self.VIDEO_SLOW_MAX
+
+                    if slowed_dur >= target_dur:
+                        # Slowed clip is long enough (shouldn't normally reach here)
+                        clip_paths.append(slowed_clip)
+                        clip_section_indices.append(idx)
+                    else:
+                        # Freeze the last frame to fill remaining time
+                        freeze_dur = target_dur - slowed_dur
+                        # Extract the last frame from the slowed clip
+                        last_frame = self.cfg.work_dir / f"adapt_{idx:04d}_lastframe.png"
+                        subprocess.run(
+                            [self._ffmpeg, "-y",
+                             "-sseof", "-0.1", "-i", str(slowed_clip),
+                             "-frames:v", "1",
+                             "-update", "1",
+                             str(last_frame)],
+                            check=True, capture_output=True,
+                        )
+                        # Create a still video from the last frame
+                        freeze_clip = self.cfg.work_dir / f"adapt_{idx:04d}_freeze.mp4"
+                        subprocess.run(
+                            [self._ffmpeg, "-y",
+                             "-loop", "1", "-i", str(last_frame),
+                             "-t", f"{freeze_dur:.3f}",
+                             "-vf", "fps=30",
+                             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                             "-pix_fmt", "yuv420p",
+                             str(freeze_clip)],
+                            check=True, capture_output=True,
+                        )
+                        # Concatenate slowed clip + frozen frame clip
+                        concat_list = self.cfg.work_dir / f"adapt_{idx:04d}_concat.txt"
+                        concat_list.write_text(
+                            f"file '{slowed_clip}'\nfile '{freeze_clip}'\n"
+                        )
+                        subprocess.run(
+                            [self._ffmpeg, "-y",
+                             "-f", "concat", "-safe", "0",
+                             "-i", str(concat_list),
+                             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                             str(clip)],
+                            check=True, capture_output=True,
+                        )
+                        clip_paths.append(clip)
+                        clip_section_indices.append(idx)
+
+        if not clip_paths:
+            raise RuntimeError("No video sections produced")
+
+        # Concatenate all video clips
+        self._report("assemble", 0.70, "Joining video sections...")
+        adapted_video = self.cfg.work_dir / "video_adapted.mp4"
+        if len(clip_paths) == 1:
+            shutil.copy2(clip_paths[0], adapted_video)
+        else:
+            self._concatenate_videos(clip_paths, adapted_video)
+
+        # Probe actual durations of each video clip to avoid cumulative drift
+        self._report("assemble", 0.72, "Measuring actual clip durations...")
+        actual_durations = {}  # section_index -> actual duration
+        for clip_path, sec_idx in zip(clip_paths, clip_section_indices):
+            actual_dur = self._get_duration(clip_path)
+            if actual_dur > 0:
+                actual_durations[sec_idx] = actual_dur
+
+        # Build the TTS audio timeline using ACTUAL video clip durations (not theoretical)
+        self._report("assemble", 0.80, "Building audio timeline...")
+        audio_timeline_pos = 0.0
+        audio_segments = []
+        for idx, sec in enumerate(sections):
+            # Use actual probed duration if available, otherwise fallback to theoretical
+            real_dur = actual_durations.get(idx, sec["output_dur"])
+            if sec["type"] == "speech":
+                audio_segments.append({
+                    "start": audio_timeline_pos,
+                    "wav": sec["tts_wav"],
+                    "duration": sec["tts_dur"],
+                })
+            audio_timeline_pos += real_dur
+
+        total_output_dur = audio_timeline_pos
+        tts_audio = self._build_timeline(audio_segments, total_output_dur, prefix="adapted_")
+
+        # Mix original audio at low volume if requested
+        if self.cfg.mix_original:
+            self._report("assemble", 0.85, "Mixing original audio...")
+            tts_audio = self._mix_audio(audio_raw, tts_audio, self.cfg.original_volume)
+
+        # Mux adapted video + natural TTS audio
+        self._report("assemble", 0.90, "Muxing final video...")
+        self._mux_replace_audio(adapted_video, tts_audio, self.cfg.output_path)
+
     # ── Natural TTS + Video sync ────────────────────────────────────────
     # Languages that Chatterbox TTS can pronounce well (English only for now)
     CHATTERBOX_SUPPORTED_LANGS = {"en"}
@@ -1435,6 +1793,30 @@ class Pipeline:
                 return self._tts_elevenlabs(segments, elevenlabs_key)
             if not self.cfg.use_chatterbox:
                 raise RuntimeError("ElevenLabs enabled but ELEVENLABS_API_KEY not set in .env")
+
+        if self.cfg.use_coqui_xtts:
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    raise RuntimeError("No CUDA GPU available for XTTS")
+                self._report("synthesize", 0.05, "Using Coqui XTTS v2 (GPU, voice cloning)...")
+                return self._tts_coqui_xtts(segments)
+            except Exception as e:
+                self._report("synthesize", 0.05,
+                             f"Coqui XTTS failed ({e}) — falling back...")
+
+        if self.cfg.use_google_tts:
+            google_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+            if google_creds or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip():
+                self._report("synthesize", 0.05, "Using Google Cloud TTS (WaveNet/Neural2)...")
+                try:
+                    return self._tts_google_cloud(segments)
+                except Exception as e:
+                    self._report("synthesize", 0.05,
+                                 f"Google Cloud TTS failed ({e}) — falling back to Edge-TTS...")
+            else:
+                self._report("synthesize", 0.05,
+                             "Google Cloud TTS enabled but no credentials found — falling back to Edge-TTS...")
 
         # Fall through to Edge-TTS (supports 70+ languages with native voices)
         voice = self.cfg.tts_voice
@@ -1570,6 +1952,217 @@ class Pipeline:
 
         return tts_data
 
+    def _tts_google_cloud(self, segments):
+        """Generate TTS using Google Cloud Text-to-Speech (WaveNet/Neural2).
+
+        Free tier: 1M characters/month (WaveNet) or 1M chars (Neural2).
+        Requires GOOGLE_APPLICATION_CREDENTIALS env var pointing to service account JSON,
+        or running on a Google Cloud instance with default credentials.
+        """
+        from google.cloud import texttospeech
+
+        client = texttospeech.TextToSpeechClient()
+        target = self.cfg.target_language
+
+        # Map target language to Google Cloud voice config
+        GOOGLE_VOICE_MAP = {
+            "hi": ("hi-IN", "hi-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "bn": ("bn-IN", "bn-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "ta": ("ta-IN", "ta-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "te": ("te-IN", "te-IN-Standard-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "mr": ("mr-IN", "mr-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "gu": ("gu-IN", "gu-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "kn": ("kn-IN", "kn-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "ml": ("ml-IN", "ml-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "pa": ("pa-IN", "pa-IN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "en": ("en-US", "en-US-Neural2-F", texttospeech.SsmlVoiceGender.FEMALE),
+            "es": ("es-ES", "es-ES-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "fr": ("fr-FR", "fr-FR-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "de": ("de-DE", "de-DE-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "ja": ("ja-JP", "ja-JP-Neural2-B", texttospeech.SsmlVoiceGender.FEMALE),
+            "ko": ("ko-KR", "ko-KR-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "zh": ("cmn-CN", "cmn-CN-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "ar": ("ar-XA", "ar-XA-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "pt": ("pt-BR", "pt-BR-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "ru": ("ru-RU", "ru-RU-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+            "it": ("it-IT", "it-IT-Neural2-A", texttospeech.SsmlVoiceGender.FEMALE),
+        }
+
+        lang_code, voice_name, gender = GOOGLE_VOICE_MAP.get(
+            target, (f"{target}-IN", None, texttospeech.SsmlVoiceGender.FEMALE)
+        )
+
+        voice_params = texttospeech.VoiceSelectionParams(
+            language_code=lang_code,
+            name=voice_name,
+            ssml_gender=gender,
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=self.SAMPLE_RATE,
+        )
+
+        tts_data = []
+        for i, seg in enumerate(segments):
+            text = seg.get("text_translated", seg["text"]).strip()
+            if not text:
+                continue
+
+            wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
+
+            try:
+                synthesis_input = texttospeech.SynthesisInput(text=text)
+                response = client.synthesize_speech(
+                    input=synthesis_input, voice=voice_params, audio_config=audio_config
+                )
+                with open(wav_path, "wb") as f:
+                    f.write(response.audio_content)
+
+                # Ensure correct format (stereo, target sample rate)
+                wav_fixed = self.cfg.work_dir / f"tts_{i:04d}_fixed.wav"
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(wav_path),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     str(wav_fixed)],
+                    check=True, capture_output=True,
+                )
+                import shutil
+                shutil.move(str(wav_fixed), str(wav_path))
+
+            except Exception as e:
+                self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
+                             f"Google TTS error on seg {i+1}: {e}, falling back to Edge-TTS...")
+                mp3 = self.cfg.work_dir / f"tts_{i:04d}.mp3"
+                try:
+                    asyncio.run(self._edge_tts_single(text, mp3))
+                    subprocess.run(
+                        [self._ffmpeg, "-y", "-i", str(mp3),
+                         "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                         str(wav_path)],
+                        check=True, capture_output=True,
+                    )
+                    mp3.unlink(missing_ok=True)
+                except Exception:
+                    continue
+
+            if not wav_path.exists() or wav_path.stat().st_size == 0:
+                continue
+
+            tts_dur = self._get_duration(wav_path)
+            tts_data.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "wav": wav_path,
+                "duration": tts_dur,
+            })
+            self._report(
+                "synthesize",
+                0.1 + 0.8 * ((i + 1) / len(segments)),
+                f"Synthesized {i + 1}/{len(segments)} segments (Google Cloud TTS)...",
+            )
+
+        return tts_data
+
+    def _tts_coqui_xtts(self, segments):
+        """Generate TTS using Coqui XTTS v2 — open-source voice cloning.
+
+        Can clone the original speaker's voice and speak in Hindi/Bengali/etc.
+        Requires GPU. Uses the extracted audio as voice reference.
+        """
+        import torch
+        import torchaudio
+        from TTS.api import TTS
+
+        self._report("synthesize", 0.02, "Loading XTTS v2 model on GPU (this may take a minute)...")
+        tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+
+        # Use original audio as speaker reference for voice cloning
+        ref_wav = self.cfg.work_dir / "voice_ref.wav"
+        audio_raw = self.cfg.work_dir / "audio_raw.wav"
+        if not ref_wav.exists() and audio_raw.exists():
+            # Extract a 15-second clip from the original audio for voice reference
+            subprocess.run(
+                [self._ffmpeg, "-y", "-i", str(audio_raw),
+                 "-t", "15", "-ar", "22050", "-ac", "1",
+                 str(ref_wav)],
+                check=True, capture_output=True,
+            )
+
+        # Check if we also have a user-provided reference in voices/
+        user_ref = Path("voices/my_voice_refs")
+        if user_ref.exists():
+            ref_files = list(user_ref.glob("*.wav")) + list(user_ref.glob("*.mp3"))
+            if ref_files:
+                ref_wav = ref_files[0]
+                self._report("synthesize", 0.05, f"Using custom voice reference: {ref_wav.name}")
+
+        if not ref_wav.exists():
+            raise RuntimeError("No voice reference available for XTTS voice cloning")
+
+        # Map language codes for XTTS
+        XTTS_LANG_MAP = {
+            "hi": "hi", "bn": "bn", "ta": "ta", "te": "te",
+            "en": "en", "es": "es", "fr": "fr", "de": "de",
+            "it": "it", "pt": "pt", "pl": "pl", "tr": "tr",
+            "ru": "ru", "nl": "nl", "cs": "cs", "ar": "ar",
+            "zh": "zh-cn", "ja": "ja", "ko": "ko", "hu": "hu",
+        }
+        xtts_lang = XTTS_LANG_MAP.get(self.cfg.target_language, self.cfg.target_language)
+
+        tts_data = []
+        for i, seg in enumerate(segments):
+            text = seg.get("text_translated", seg["text"]).strip()
+            if not text:
+                continue
+
+            wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
+
+            try:
+                tts_model.tts_to_file(
+                    text=text,
+                    speaker_wav=str(ref_wav),
+                    language=xtts_lang,
+                    file_path=str(wav_path),
+                )
+
+                # Convert to target sample rate and stereo
+                wav_fixed = self.cfg.work_dir / f"tts_{i:04d}_fixed.wav"
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(wav_path),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     str(wav_fixed)],
+                    check=True, capture_output=True,
+                )
+                import shutil
+                shutil.move(str(wav_fixed), str(wav_path))
+
+            except Exception as e:
+                self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
+                             f"XTTS error on seg {i+1}: {e}, skipping...")
+                continue
+
+            if not wav_path.exists() or wav_path.stat().st_size == 0:
+                continue
+
+            tts_dur = self._get_duration(wav_path)
+            tts_data.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "wav": wav_path,
+                "duration": tts_dur,
+            })
+            self._report(
+                "synthesize",
+                0.1 + 0.8 * ((i + 1) / len(segments)),
+                f"Synthesized {i + 1}/{len(segments)} segments (XTTS v2 voice clone)...",
+            )
+
+        # Free GPU memory
+        del tts_model
+        torch.cuda.empty_cache()
+
+        return tts_data
+
     async def _edge_tts_single(self, text, mp3_path):
         """Generate a single segment with edge-tts."""
         import edge_tts
@@ -1632,10 +2225,12 @@ class Pipeline:
         return tts_data
 
     def _build_fitted_audio(self, video_path, audio_raw, tts_data, total_video_duration):
-        """Keep video at original speed, stretch each TTS clip to fit its segment timing.
+        """Keep video at original speed, speed-adjust each TTS clip (1.1x–1.25x).
 
-        This ensures perfect scene-audio sync: each dubbed line plays exactly
-        during its original scene. TTS is sped up or slowed down to fit.
+        Rules:
+        - Slow TTS (shorter than slot) → slow down up to 1.1x
+        - Fast TTS (longer than slot) → speed up up to 1.25x
+        - NEVER cut or truncate any audio — all speech must be heard
         """
         num_segs = len(tts_data)
         fitted_segments = []
@@ -1652,7 +2247,6 @@ class Pipeline:
             tts_wav = tts["wav"]
 
             if original_dur < 0.1 or tts_dur < 0.1:
-                # Too short to stretch, use as-is
                 fitted_segments.append({
                     "start": seg_start,
                     "wav": tts_wav,
@@ -1662,8 +2256,7 @@ class Pipeline:
 
             ratio = tts_dur / original_dur  # > 1 = TTS is longer, need to speed up
 
-            if abs(ratio - 1.0) < 0.08:
-                # Close enough, no stretching needed
+            if abs(ratio - 1.0) < 0.05:
                 fitted_segments.append({
                     "start": seg_start,
                     "wav": tts_wav,
@@ -1671,21 +2264,22 @@ class Pipeline:
                 })
                 continue
 
-            # Clamp ratio to avoid extreme distortion (0.5x to 2.5x)
-            ratio = max(0.5, min(ratio, 2.5))
+            # Clamp ratio: slow down max 1.1x, speed up max 1.25x
+            clamped_ratio = max(self.SPEED_MIN, min(ratio, self.SPEED_MAX))
 
             stretched_wav = self.cfg.work_dir / f"fitted_{idx:04d}.wav"
-            self._time_stretch(tts_wav, ratio, stretched_wav)
+            self._time_stretch(tts_wav, clamped_ratio, stretched_wav)
 
+            new_dur = tts_dur / clamped_ratio
             fitted_segments.append({
                 "start": seg_start,
                 "wav": stretched_wav,
-                "duration": original_dur,  # now fits the original slot
+                "duration": new_dur,
             })
 
-        # Build audio timeline at original video timing
-        self._report("assemble", 0.65, "Building audio timeline...")
-        fitted_audio = self._build_timeline(fitted_segments, total_video_duration, prefix="fitted_")
+        # Build audio timeline — no cutting, all speech preserved
+        self._report("assemble", 0.65, "Building audio timeline (no cuts)...")
+        fitted_audio = self._build_timeline_no_cut(fitted_segments, total_video_duration, prefix="fitted_")
 
         # Mix original audio at low volume if requested
         if self.cfg.mix_original:
@@ -1726,8 +2320,8 @@ class Pipeline:
             # setpts factor: tts_dur / original_dur
             # > 1 = slow video down (TTS is longer), < 1 = speed video up (TTS is shorter)
             pts_factor = (tts_dur / original_dur) if original_dur > 0.1 else 1.0
-            # Clamp to avoid extreme distortion (0.4x to 2.5x)
-            pts_factor = max(0.4, min(pts_factor, 2.5))
+            # Clamp to 1.1x slow / 1.25x fast limits
+            pts_factor = max(self.SPEED_MIN, min(pts_factor, self.SPEED_MAX))
 
             sections.append({
                 "type": "speech",
@@ -2007,9 +2601,9 @@ class Pipeline:
                 "-i", str(video_path),
                 "-i", str(audio_path),
                 "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                "-shortest",
                 str(output_path),
             ],
             check=True,

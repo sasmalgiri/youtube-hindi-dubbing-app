@@ -35,6 +35,8 @@ export interface BatchSettings {
     original_volume?: number;
     use_chatterbox?: boolean;
     use_elevenlabs?: boolean;
+    use_google_tts?: boolean;
+    use_coqui_xtts?: boolean;
     use_edge_tts?: boolean;
 }
 
@@ -62,7 +64,7 @@ export function useBatchManager(): UseBatchManagerReturn {
                 const parsed = JSON.parse(stored);
                 if (parsed.items) setItems(parsed.items);
                 if (parsed.autoDownload !== undefined) setAutoDownload(parsed.autoDownload);
-            } catch {}
+            } catch { }
         }
     }, []);
 
@@ -193,6 +195,8 @@ export function useBatchManager(): UseBatchManagerReturn {
                     original_volume: settings.original_volume,
                     use_chatterbox: settings.use_chatterbox,
                     use_elevenlabs: settings.use_elevenlabs,
+                    use_google_tts: settings.use_google_tts,
+                    use_coqui_xtts: settings.use_coqui_xtts,
                     use_edge_tts: settings.use_edge_tts,
                 };
 

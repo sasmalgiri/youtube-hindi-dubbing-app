@@ -68,6 +68,8 @@ class JobCreateRequest(BaseModel):
     original_volume: float = 0.10
     use_chatterbox: bool = True
     use_elevenlabs: bool = False
+    use_google_tts: bool = False
+    use_coqui_xtts: bool = False
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
     multi_speaker: bool = False
@@ -169,6 +171,8 @@ def _run_job(job: Job, req: JobCreateRequest):
             original_volume=req.original_volume,
             use_chatterbox=req.use_chatterbox,
             use_elevenlabs=req.use_elevenlabs,
+            use_google_tts=req.use_google_tts,
+            use_coqui_xtts=req.use_coqui_xtts,
             use_edge_tts=req.use_edge_tts,
             prefer_youtube_subs=req.prefer_youtube_subs,
             multi_speaker=req.multi_speaker,
@@ -256,6 +260,8 @@ async def create_job_upload(
     original_volume: float = Form(0.10),
     use_chatterbox: bool = Form(True),
     use_elevenlabs: bool = Form(False),
+    use_google_tts: bool = Form(False),
+    use_coqui_xtts: bool = Form(False),
     use_edge_tts: bool = Form(False),
     prefer_youtube_subs: bool = Form(False),
     multi_speaker: bool = Form(False),
@@ -289,6 +295,8 @@ async def create_job_upload(
         original_volume=original_volume,
         use_chatterbox=use_chatterbox,
         use_elevenlabs=use_elevenlabs,
+        use_google_tts=use_google_tts,
+        use_coqui_xtts=use_coqui_xtts,
         use_edge_tts=use_edge_tts,
         prefer_youtube_subs=prefer_youtube_subs,
         multi_speaker=multi_speaker,

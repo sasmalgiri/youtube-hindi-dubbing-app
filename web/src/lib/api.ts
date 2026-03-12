@@ -26,6 +26,8 @@ export interface JobCreateRequest {
     original_volume?: number;
     use_chatterbox?: boolean;
     use_elevenlabs?: boolean;
+    use_google_tts?: boolean;
+    use_coqui_xtts?: boolean;
     use_edge_tts?: boolean;
     prefer_youtube_subs?: boolean;
     multi_speaker?: boolean;
