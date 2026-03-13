@@ -1,5 +1,37 @@
+import re
 from pathlib import Path
 from typing import List, Dict
+
+
+def _parse_time(ts: str) -> float:
+    """Parse SRT timestamp '00:01:23,456' to seconds."""
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 3:
+        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    return 0.0
+
+
+def parse_srt(srt_path: Path, text_key: str = "text_translated") -> List[Dict]:
+    """Parse an SRT file into segments: [{"start": float, "end": float, text_key: str}, ...]"""
+    content = srt_path.read_text(encoding="utf-8")
+    segments = []
+    # Split on blank lines to get blocks
+    blocks = re.split(r"\n\s*\n", content.strip())
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) < 3:
+            continue
+        # Line 1: index (skip), Line 2: timestamps, Line 3+: text
+        ts_match = re.search(r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})", lines[1])
+        if not ts_match:
+            continue
+        start = _parse_time(ts_match.group(1))
+        end = _parse_time(ts_match.group(2))
+        text = " ".join(lines[2:]).strip()
+        if text:
+            segments.append({"start": start, "end": end, text_key: text})
+    return segments
 
 
 def _fmt_time(t: float) -> str:

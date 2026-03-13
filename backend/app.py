@@ -37,7 +37,7 @@ from pipeline import Pipeline, PipelineConfig, list_voices, DEFAULT_VOICES
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
-JobState = Literal["queued", "running", "done", "error"]
+JobState = Literal["queued", "running", "done", "error", "waiting_for_srt"]
 
 
 @dataclass
@@ -73,6 +73,7 @@ class JobCreateRequest(BaseModel):
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
     multi_speaker: bool = False
+    transcribe_only: bool = False
 
 
 # ── Step weights for overall progress ────────────────────────────────────────
@@ -176,17 +177,26 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_edge_tts=req.use_edge_tts,
             prefer_youtube_subs=req.prefer_youtube_subs,
             multi_speaker=req.multi_speaker,
+            transcribe_only=req.transcribe_only,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
         pipeline.run()
 
+        job.video_title = pipeline.video_title or "Untitled"
+        job.segments = pipeline.segments
+
+        if req.transcribe_only:
+            job.overall_progress = 1.0
+            job.state = "waiting_for_srt"
+            job.message = "Transcription complete. Download SRT and upload translation."
+            job.events.append({"type": "complete", "state": "waiting_for_srt"})
+            return
+
         if not out_path.exists():
             raise RuntimeError("Pipeline finished but output file not found")
 
         job.result_path = out_path
-        job.video_title = pipeline.video_title or "Untitled"
-        job.segments = pipeline.segments
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
@@ -344,7 +354,7 @@ async def job_events(job_id: str):
                     if event.get("type") == "complete":
                         return
                 last_index = len(job.events)
-            if job.state in ("done", "error"):
+            if job.state in ("done", "error", "waiting_for_srt"):
                 if last_index >= len(job.events):
                     yield {"data": json.dumps({"type": "complete", "state": job.state})}
                     return
@@ -391,6 +401,84 @@ def get_srt(job_id: str):
         media_type="text/plain",
         filename=f"subtitles_{job_id}.srt",
     )
+
+
+@app.get("/api/jobs/{job_id}/source-srt")
+def get_source_srt(job_id: str):
+    """Download the source-language SRT (for manual translation)."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    srt_path = OUTPUTS / job_id / "work" / "transcript_source.srt"
+    if not srt_path.exists():
+        raise HTTPException(status_code=404, detail="Source SRT not found — run with Transcribe Only first")
+
+    return FileResponse(
+        path=str(srt_path),
+        media_type="text/plain",
+        filename=f"source_{job_id}.srt",
+    )
+
+
+def _run_resume(job: Job):
+    """Resume pipeline from uploaded translated SRT in a background thread."""
+    try:
+        job.state = "running"
+        job.message = "Resuming from uploaded SRT..."
+        job.events = []  # Reset events for fresh SSE stream
+
+        job_dir = OUTPUTS / job.id
+        work_dir = job_dir / "work"
+        out_path = job_dir / "dubbed.mp4"
+        translated_srt = work_dir / "translated_upload.srt"
+
+        cfg = PipelineConfig(
+            source="resume",
+            work_dir=work_dir,
+            output_path=out_path,
+            target_language=job.target_language,
+        )
+
+        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
+        pipeline.run_from_srt(translated_srt)
+
+        if not out_path.exists():
+            raise RuntimeError("Pipeline finished but output file not found")
+
+        job.result_path = out_path
+        job.video_title = job.video_title or "Untitled"
+        job.overall_progress = 1.0
+        job.state = "done"
+        job.message = "Complete"
+        job.events.append({"type": "complete", "state": "done"})
+
+    except Exception as e:
+        job.state = "error"
+        job.error = str(e)
+        job.message = f"Error: {e}"
+        job.events.append({"type": "complete", "state": "error", "error": str(e)})
+
+
+@app.post("/api/jobs/{job_id}/resume-with-srt")
+async def resume_with_srt(job_id: str, file: UploadFile = File(...)):
+    """Upload a translated SRT and resume the pipeline (TTS + assembly)."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state != "waiting_for_srt":
+        raise HTTPException(status_code=409, detail=f"Job is '{job.state}', not waiting for SRT")
+
+    work_dir = OUTPUTS / job_id / "work"
+    srt_path = work_dir / "translated_upload.srt"
+    with open(srt_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+
+    t = threading.Thread(target=_run_resume, args=(job,), daemon=True)
+    t.start()
+
+    return {"id": job_id, "state": "running"}
 
 
 @app.get("/api/jobs/{job_id}/original")

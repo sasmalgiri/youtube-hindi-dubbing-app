@@ -219,6 +219,7 @@ class PipelineConfig:
     use_edge_tts: bool = False
     prefer_youtube_subs: bool = False
     multi_speaker: bool = False
+    transcribe_only: bool = False
 
 
 class Pipeline:
@@ -244,15 +245,29 @@ class Pipeline:
         ext = ".exe" if sys.platform == "win32" else ""
         full_name = name + ext
 
+        def _works(path: str) -> bool:
+            """Verify executable actually runs (catches broken venv shims)."""
+            try:
+                r = subprocess.run([path, "--version"], capture_output=True, timeout=5)
+                return r.returncode == 0 and (r.stdout or r.stderr)
+            except Exception:
+                return False
+
         # 1. Check venv Scripts dir (where python.exe lives)
         venv_path = Path(sys.executable).parent / full_name
-        if venv_path.exists():
+        if venv_path.exists() and _works(str(venv_path)):
             return str(venv_path)
 
-        # 2. Check current PATH
+        # 2. Check current PATH (verify it works to skip broken shims)
         found = shutil.which(name)
-        if found:
+        if found and _works(found):
             return found
+
+        # 2b. Check Python's own Scripts directory (pip-installed tools)
+        scripts_path = Path(sys.executable).parent / "Scripts" / full_name
+        if scripts_path.exists() and _works(str(scripts_path)):
+            os.environ["PATH"] = str(scripts_path.parent) + os.pathsep + os.environ.get("PATH", "")
+            return str(scripts_path)
 
         if sys.platform == "win32":
             # 3. Scan WinGet packages directory
@@ -520,6 +535,15 @@ class Pipeline:
                 self._report("transcribe", 0.99,
                              f"Assigned {len(self._voice_map)} distinct voices")
 
+        # Transcribe-only mode: save source SRT and stop
+        if self.cfg.transcribe_only:
+            from srt_utils import write_srt as _write_srt
+            source_srt = self.cfg.work_dir / "transcript_source.srt"
+            _write_srt(text_segments, source_srt, text_key="text")
+            self._report("transcribe", 1.0,
+                         f"Transcription complete — {len(text_segments)} segments. Download SRT to translate.")
+            return  # Pipeline pauses here; user translates externally
+
         # Step 4: Translate each segment (preserving timestamps for scene sync)
         target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
         self._report("translate", 0.0, f"Translating segments to {target_name}...")
@@ -552,6 +576,75 @@ class Pipeline:
         # Step 6: Assemble — AUDIO IS MASTER, video adapts
         # TTS plays at natural speed (uniform, no speedup/slowdown).
         # Video is slowed (max 1.1x) and scenes are looped to match audio duration.
+        self._report("assemble", 0.0, "Building dubbed output (video adapts to audio)...")
+        self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+        video_duration = self._get_duration(video_path)
+
+        self._report("assemble", 0.1, "Assembling: video will adapt to match natural audio...")
+        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+
+        # Copy SRT to output
+        out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
+        shutil.copy2(srt_translated, out_srt)
+
+        self._report("assemble", 1.0, "Done!")
+
+    def run_from_srt(self, translated_srt_path: Path):
+        """Resume pipeline from an uploaded translated SRT — runs TTS + assembly only."""
+        from srt_utils import parse_srt
+
+        self._ensure_ffmpeg()
+
+        # Load translated segments
+        self._report("translate", 0.0, "Loading uploaded translated SRT...")
+        translated = parse_srt(translated_srt_path, text_key="text_translated")
+        if not translated:
+            raise RuntimeError("Uploaded SRT is empty or invalid")
+
+        self.segments = translated
+        self._report("translate", 1.0, f"Loaded {len(translated)} translated segments")
+
+        # Find existing video and audio from first run
+        video_path = None
+        for ext in ["mp4", "webm", "mkv"]:
+            p = self.cfg.work_dir / f"source.{ext}"
+            if p.exists():
+                video_path = p
+                break
+        if not video_path:
+            sources = list(self.cfg.work_dir.glob("source.*"))
+            video_path = sources[0] if sources else None
+        if not video_path:
+            raise RuntimeError("Original video not found in work directory")
+
+        audio_raw = self.cfg.work_dir / "audio_raw.wav"
+        if not audio_raw.exists():
+            self._report("extract", 0.0, "Re-extracting audio...")
+            audio_raw = self._extract_audio(video_path)
+
+        # Write the translated SRT to standard location
+        srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
+        shutil.copy2(translated_srt_path, srt_translated)
+
+        # Step 5: Generate TTS
+        text_segments = translated
+        self._report("synthesize", 0.0,
+                     f"Generating natural speech ({self.cfg.tts_voice})...")
+        tts_data = self._generate_tts_natural(text_segments)
+        self._report("synthesize", 0.9,
+                     f"Generated {len(tts_data)} segments, speeding up to 1.25x...")
+
+        TTS_SPEED = 1.25
+        for idx, tts in enumerate(tts_data):
+            sped_wav = self.cfg.work_dir / f"tts_fast_{idx:04d}.wav"
+            self._time_stretch(tts["wav"], TTS_SPEED, sped_wav)
+            tts["wav"] = sped_wav
+            tts["duration"] = tts["duration"] / TTS_SPEED
+
+        self._report("synthesize", 1.0,
+                     f"All {len(tts_data)} segments at 1.25x speed")
+
+        # Step 6: Assemble
         self._report("assemble", 0.0, "Building dubbed output (video adapts to audio)...")
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)

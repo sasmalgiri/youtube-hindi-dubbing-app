@@ -24,6 +24,7 @@ export default function HomePage() {
         use_edge_tts: false,
         prefer_youtube_subs: false,
         multi_speaker: false,
+        transcribe_only: false,
     });
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);

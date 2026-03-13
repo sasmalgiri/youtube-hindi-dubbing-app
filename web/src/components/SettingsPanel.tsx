@@ -13,6 +13,7 @@ export interface DubbingSettings {
     use_edge_tts: boolean;
     prefer_youtube_subs: boolean;
     multi_speaker: boolean;
+    transcribe_only: boolean;
 }
 
 interface SettingsPanelProps {
@@ -66,6 +67,26 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                             <div className={`
                                 w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                 ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
+                            `} />
+                        </button>
+                    </div>
+
+                    {/* Transcribe Only (manual translation) */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-sm text-text-primary">Transcribe Only</p>
+                            <p className="text-xs text-text-muted">Get SRT to translate yourself (e.g. with Claude), then upload back</p>
+                        </div>
+                        <button
+                            onClick={() => update({ transcribe_only: !settings.transcribe_only })}
+                            className={`
+                                w-11 h-6 rounded-full transition-colors relative
+                                ${settings.transcribe_only ? 'bg-primary' : 'bg-white/10'}
+                            `}
+                        >
+                            <div className={`
+                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                ${settings.transcribe_only ? 'translate-x-6' : 'translate-x-1'}
                             `} />
                         </button>
                     </div>

@@ -31,11 +31,12 @@ export interface JobCreateRequest {
     use_edge_tts?: boolean;
     prefer_youtube_subs?: boolean;
     multi_speaker?: boolean;
+    transcribe_only?: boolean;
 }
 
 export interface JobStatus {
     id: string;
-    state: 'queued' | 'running' | 'done' | 'error';
+    state: 'queued' | 'running' | 'done' | 'error' | 'waiting_for_srt';
     current_step: string;
     step_progress: number;
     overall_progress: number;
@@ -155,6 +156,25 @@ export function originalVideoUrl(id: string): string {
 
 export function resultSrtUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/srt`;
+}
+
+export function sourceSrtUrl(id: string): string {
+    return `${API_BASE}/api/jobs/${id}/source-srt`;
+}
+
+export async function uploadTranslatedSrt(id: string, file: File): Promise<{ id: string; state: string }> {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${API_BASE}/api/jobs/${id}/resume-with-srt`, {
+        method: 'POST',
+        headers: { ...EXTRA_HEADERS },
+        body: form,
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
+        throw new Error(err.detail || 'Failed to upload translated SRT');
+    }
+    return res.json();
 }
 
 // ── Local Download + Upload (for remote backend) ────────────────────────────
