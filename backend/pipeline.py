@@ -233,6 +233,7 @@ class Pipeline:
         self._on_progress = on_progress or (lambda *_: None)
         self.segments: List[Dict] = []
         self.video_title: str = ""
+        self._voice_map = None
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve executable paths
@@ -1896,7 +1897,7 @@ class Pipeline:
             else:
                 target_name = LANGUAGE_NAMES.get(target, target)
                 self._report("synthesize", 0.05,
-                             f"Chatterbox is English-only — switching to Edge-TTS for {target_name}...")
+                             f"Chatterbox is English-only — trying next engine for {target_name}...")
 
         if self.cfg.use_elevenlabs:
             elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
