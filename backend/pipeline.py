@@ -1443,7 +1443,7 @@ class Pipeline:
         # Generate all TTS at natural rate
         async def tts_generate():
             for i, seg in enumerate(segments):
-                text = seg.get("text_translated", seg["text"]).strip()
+                text = seg.get("text_translated", seg.get("text", "")).strip()
                 if not text:
                     continue
                 mp3 = self.cfg.work_dir / f"{prefix}seg_{i:04d}.mp3"
@@ -1953,7 +1953,7 @@ class Pipeline:
 
         tts_data = []
         for i, seg in enumerate(segments):
-            text = seg.get("text_translated", seg["text"]).strip()
+            text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 continue
 
@@ -2017,7 +2017,7 @@ class Pipeline:
 
         tts_data = []
         for i, seg in enumerate(segments):
-            text = seg.get("text_translated", seg["text"]).strip()
+            text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 continue
 
@@ -2117,7 +2117,7 @@ class Pipeline:
 
         tts_data = []
         for i, seg in enumerate(segments):
-            text = seg.get("text_translated", seg["text"]).strip()
+            text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 continue
 
@@ -2224,7 +2224,7 @@ class Pipeline:
 
         tts_data = []
         for i, seg in enumerate(segments):
-            text = seg.get("text_translated", seg["text"]).strip()
+            text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 continue
 
@@ -2292,7 +2292,7 @@ class Pipeline:
 
         async def generate():
             for i, seg in enumerate(segments):
-                text = seg.get("text_translated", seg["text"]).strip()
+                text = seg.get("text_translated", seg.get("text", "")).strip()
                 if not text:
                     continue
                 # Pick voice: per-speaker if multi-speaker, else default
