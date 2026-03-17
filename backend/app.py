@@ -204,8 +204,10 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.events.append({"type": "complete", "state": "done"})
 
     except Exception as e:
-        import traceback, logging
-        logging.error(f"[JOB ERROR] {e}\n{traceback.format_exc()}")
+        import traceback
+        _Path("/tmp/voicedub_error.log").write_text(
+            f"[JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
+        )
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"
@@ -475,8 +477,10 @@ def _run_resume(job: Job):
         job.events.append({"type": "complete", "state": "done"})
 
     except Exception as e:
-        import traceback, logging
-        logging.error(f"[RESUME ERROR] {e}\n{traceback.format_exc()}")
+        import traceback
+        _Path("/tmp/voicedub_error.log").write_text(
+            f"[RESUME ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
+        )
         job.state = "error"
         job.error = str(e)
         job.message = f"Error: {e}"

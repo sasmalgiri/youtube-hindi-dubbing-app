@@ -1,6 +1,7 @@
-// Set NEXT_PUBLIC_API_URL to your Colab ngrok URL when running backend remotely
+// Set NEXT_PUBLIC_API_URL to your backend URL when running remotely
 // e.g., NEXT_PUBLIC_API_URL=https://abc-123.ngrok-free.app
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';  // empty = Next.js proxy to localhost:8000
+// For desktop app (static export), defaults to same origin (served by FastAPI)
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';  // empty = same origin
 
 // ngrok free tier requires this header to skip the interstitial warning page
 const EXTRA_HEADERS: Record<string, string> = API_BASE.includes('ngrok')
