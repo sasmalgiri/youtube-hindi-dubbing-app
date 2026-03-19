@@ -207,7 +207,7 @@ class PipelineConfig:
     output_path: Path
     source_language: str = "auto"
     target_language: str = "hi"
-    asr_model: str = "small"
+    asr_model: str = "large-v3"
     tts_voice: str = "hi-IN-SwaraNeural"
     tts_rate: str = "+0%"
     mix_original: bool = False
@@ -1062,7 +1062,17 @@ class Pipeline:
 
         self._report("transcribe", 0.2, "Transcribing audio with word timestamps...")
         # Pass language hint if source language is specified (not auto)
-        transcribe_kwargs = {"vad_filter": True, "word_timestamps": True}
+        transcribe_kwargs = {
+            "vad_filter": True,
+            "word_timestamps": True,
+            "beam_size": 5,
+            "best_of": 5,
+            "patience": 2.0,
+            "condition_on_previous_text": True,
+            "no_speech_threshold": 0.5,
+            "compression_ratio_threshold": 2.4,
+            "vad_parameters": {"min_silence_duration_ms": 300},
+        }
         if self.cfg.source_language and self.cfg.source_language != "auto":
             transcribe_kwargs["language"] = self.cfg.source_language
             self._report("transcribe", 0.2, f"Transcribing ({self.cfg.source_language.upper()}) with word timestamps...")
@@ -1098,10 +1108,14 @@ class Pipeline:
         self._report("translate", 0.2, f"Translating {len(full_text)} characters...")
 
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
         if gemini_key:
             translated_text = self._translate_with_gemini(full_text, gemini_key, speech_duration)
+        elif groq_key:
+            self._report("translate", 0.25, "Using Groq (Llama 3.3 70B) for translation...")
+            translated_text = self._translate_with_groq(full_text, groq_key, speech_duration)
         else:
-            self._report("translate", 0.25, "No GEMINI_API_KEY found, using Google Translate...")
+            self._report("translate", 0.25, "No GEMINI/GROQ API key found, using Google Translate...")
             translated_text = self._translate_with_google(full_text)
 
         return full_text, translated_text
@@ -1171,11 +1185,78 @@ class Pipeline:
                                      f"Rate limited, retrying in {wait}s...")
                         time.sleep(wait)
                     else:
+                        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+                        if groq_key:
+                            self._report("translate", 0.2, f"Gemini failed: {e}, falling back to Groq...")
+                            return self._translate_with_groq(full_text, groq_key, speech_duration)
                         self._report("translate", 0.2, f"Gemini failed: {e}, falling back to Google Translate...")
                         return self._translate_with_google(full_text)
 
             self._report("translate", 0.2 + 0.8 * ((i + 1) / len(chunks)),
                          f"Translated chunk {i + 1}/{len(chunks)} (Gemini)")
+
+        return " ".join(translated_parts)
+
+    def _translate_with_groq(self, full_text: str, api_key: str, speech_duration: float = 0) -> str:
+        """Translate using Groq (Llama 3.3 70B) for natural, fluent output."""
+        import requests as _requests
+
+        target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+        source_name = LANGUAGE_NAMES.get(self.cfg.source_language, "the source language") if self.cfg.source_language != "auto" else "the source language"
+
+        word_count = len(full_text.split())
+        duration_hint = ""
+        if speech_duration > 0:
+            wpm = LANGUAGE_WPM.get(self.cfg.target_language, 135)
+            target_words = int(speech_duration / 60 * wpm)
+            duration_hint = (
+                f"IMPORTANT TIMING CONSTRAINT: The original narration is {int(speech_duration)} seconds long "
+                f"({word_count} words). Aim for approximately {target_words} {target_name} words. "
+                f"Be concise — use shorter phrases where possible without losing meaning. "
+            )
+
+        chunks = self._split_text_for_translation(full_text, max_chars=8000)
+        translated_parts = []
+
+        for i, chunk in enumerate(chunks):
+            prompt = (
+                f"Translate the following narration from {source_name} into natural, fluent {target_name}. "
+                f"This is a voiceover script for a dubbed video, so it must sound like a native "
+                f"{target_name} speaker is narrating — conversational, smooth, and natural. "
+                f"{duration_hint}"
+                f"Do NOT translate literally word-by-word. Adapt idioms and phrasing to sound "
+                f"natural in {target_name}. Keep proper nouns (names, places, brands) as-is. "
+                f"Output ONLY the {target_name} translation, nothing else.\n\n"
+                f"{chunk}"
+            )
+
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    resp = _requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}]},
+                        timeout=60,
+                    )
+                    data = resp.json()
+                    if "choices" in data:
+                        translated_parts.append(data["choices"][0]["message"]["content"].strip())
+                        break
+                    else:
+                        raise RuntimeError(data.get("error", {}).get("message", "Groq API error"))
+                except Exception as e:
+                    if attempt < retries - 1:
+                        wait = 2 * (attempt + 1)
+                        self._report("translate", 0.2 + 0.6 * (i / len(chunks)),
+                                     f"Groq rate limited, retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        self._report("translate", 0.2, f"Groq failed: {e}, falling back to Google Translate...")
+                        return self._translate_with_google(full_text)
+
+            self._report("translate", 0.2 + 0.8 * ((i + 1) / len(chunks)),
+                         f"Translated chunk {i + 1}/{len(chunks)} (Groq)")
 
         return " ".join(translated_parts)
 
@@ -1925,14 +2006,30 @@ class Pipeline:
                         freeze_dur = target_dur - slowed_dur
                         # Extract the last frame from the slowed clip
                         last_frame = self.cfg.work_dir / f"adapt_{idx:04d}_lastframe.png"
-                        subprocess.run(
+                        # Try -sseof first; if clip is too short, fall back to extracting first frame
+                        frame_ok = subprocess.run(
                             [self._ffmpeg, "-y",
                              "-sseof", "-0.1", "-i", str(slowed_clip),
                              "-frames:v", "1",
                              "-update", "1",
                              str(last_frame)],
-                            check=True, capture_output=True,
+                            capture_output=True,
                         )
+                        if frame_ok.returncode != 0 or not last_frame.exists():
+                            # Fallback: extract first frame instead
+                            subprocess.run(
+                                [self._ffmpeg, "-y",
+                                 "-i", str(slowed_clip),
+                                 "-frames:v", "1",
+                                 "-update", "1",
+                                 str(last_frame)],
+                                capture_output=True,
+                            )
+                        if not last_frame.exists():
+                            # If we still can't get a frame, just use the slowed clip as-is
+                            clip_paths.append(slowed_clip)
+                            clip_section_indices.append(idx)
+                            continue
                         # Create a still video from the last frame
                         freeze_clip = self.cfg.work_dir / f"adapt_{idx:04d}_freeze.mp4"
                         subprocess.run(
