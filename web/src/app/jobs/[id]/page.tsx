@@ -7,13 +7,14 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
-import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob } from '@/lib/api';
+import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, retryJob } from '@/lib/api';
 
 export default function JobPage() {
     const params = useParams();
     const router = useRouter();
     const jobId = params.id as string;
     const [cancelling, setCancelling] = useState(false);
+    const [retrying, setRetrying] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -187,9 +188,32 @@ export default function JobPage() {
                                 <line x1="12" x2="12" y1="8" y2="12" />
                                 <line x1="12" x2="12.01" y1="16" y2="16" />
                             </svg>
-                            <div>
+                            <div className="flex-1">
                                 <p className="text-sm font-medium text-error mb-1">Dubbing Failed</p>
-                                <p className="text-sm text-text-secondary">{error}</p>
+                                <p className="text-sm text-text-secondary mb-3">{error}</p>
+                                <button
+                                    onClick={async () => {
+                                        setRetrying(true);
+                                        try {
+                                            await retryJob(jobId);
+                                            restart();
+                                        } catch (e) {
+                                            alert(e instanceof Error ? e.message : 'Retry failed');
+                                        } finally {
+                                            setRetrying(false);
+                                        }
+                                    }}
+                                    disabled={retrying}
+                                    className="px-4 py-2 rounded-lg bg-primary text-white text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center gap-2"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M21 2v6h-6" />
+                                        <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+                                        <path d="M3 22v-6h6" />
+                                        <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+                                    </svg>
+                                    {retrying ? 'Retrying...' : 'Retry Job'}
+                                </button>
                             </div>
                         </div>
                     </div>

@@ -19,6 +19,8 @@ export interface DubbingSettings {
     audio_priority: boolean;
     audio_bitrate: string;
     encode_preset: string;
+    remove_watermark: boolean;
+    use_groq_whisper: boolean;
 }
 
 interface SettingsPanelProps {
@@ -157,6 +159,26 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                         </button>
                     </div>
 
+                    {/* Groq Whisper API */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-sm text-text-primary">Groq Whisper API</p>
+                            <p className="text-xs text-text-muted">Cloud transcription — much faster than local Whisper (needs GROQ_API_KEY)</p>
+                        </div>
+                        <button
+                            onClick={() => update({ use_groq_whisper: !settings.use_groq_whisper })}
+                            className={`
+                                w-11 h-6 rounded-full transition-colors relative
+                                ${settings.use_groq_whisper ? 'bg-primary' : 'bg-white/10'}
+                            `}
+                        >
+                            <div className={`
+                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                ${settings.use_groq_whisper ? 'translate-x-6' : 'translate-x-1'}
+                            `} />
+                        </button>
+                    </div>
+
                     {/* Transcribe Only (manual translation) */}
                     <div className="flex items-center justify-between">
                         <div>
@@ -193,6 +215,26 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                             <div className={`
                                 w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                 ${settings.multi_speaker ? 'translate-x-6' : 'translate-x-1'}
+                            `} />
+                        </button>
+                    </div>
+
+                    {/* Remove Watermark */}
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-sm text-text-primary">Remove Watermark</p>
+                            <p className="text-xs text-text-muted">Detect & remove static logos/overlays from video (adds processing time)</p>
+                        </div>
+                        <button
+                            onClick={() => update({ remove_watermark: !settings.remove_watermark })}
+                            className={`
+                                w-11 h-6 rounded-full transition-colors relative
+                                ${settings.remove_watermark ? 'bg-primary' : 'bg-white/10'}
+                            `}
+                        >
+                            <div className={`
+                                w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                ${settings.remove_watermark ? 'translate-x-6' : 'translate-x-1'}
                             `} />
                         </button>
                     </div>

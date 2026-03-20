@@ -30,6 +30,8 @@ export default function HomePage() {
         audio_priority: false,
         audio_bitrate: '192k',
         encode_preset: 'veryfast',
+        remove_watermark: false,
+        use_groq_whisper: true,
     });
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);

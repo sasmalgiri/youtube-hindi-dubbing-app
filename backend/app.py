@@ -80,6 +80,7 @@ class JobCreateRequest(BaseModel):
     audio_priority: bool = False
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
+    use_groq_whisper: bool = False
 
 
 # ── Step weights for overall progress ────────────────────────────────────────
@@ -189,6 +190,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             audio_priority=req.audio_priority,
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            use_groq_whisper=req.use_groq_whisper,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job))
@@ -292,6 +294,7 @@ async def create_job_upload(
     prefer_youtube_subs: bool = Form(False),
     multi_speaker: bool = Form(False),
     transcribe_only: bool = Form(False),
+    use_groq_whisper: bool = Form(False),
     voice: str = Form("hi-IN-SwaraNeural"),
     asr_model: str = Form("large-v3"),
     translation_engine: str = Form("auto"),
@@ -340,6 +343,7 @@ async def create_job_upload(
         audio_priority=audio_priority,
         audio_bitrate=audio_bitrate,
         encode_preset=encode_preset,
+        use_groq_whisper=use_groq_whisper,
     )
     job.original_req = req
 
@@ -579,3 +583,30 @@ def delete_job(job_id: str):
         shutil.rmtree(job_dir, ignore_errors=True)
 
     return {"status": "deleted"}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state not in ("error", "done"):
+        raise HTTPException(status_code=400, detail="Job is still running")
+
+    req = job.original_req
+    if not req:
+        raise HTTPException(status_code=400, detail="Original request not found — cannot retry")
+
+    # Reset job state
+    job.state = "queued"
+    job.current_step = "download"
+    job.step_progress = 0
+    job.overall_progress = 0
+    job.message = "Retrying..."
+    job.error = None
+    job.events = []
+
+    t = threading.Thread(target=_run_job, args=(job, req), daemon=True)
+    t.start()
+
+    return {"id": job.id, "state": "queued"}

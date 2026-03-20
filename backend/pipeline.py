@@ -227,6 +227,7 @@ class PipelineConfig:
     audio_bitrate: str = "192k"
     # Video encode speed: ultrafast (fastest), veryfast, fast, medium (best quality)
     encode_preset: str = "veryfast"
+    use_groq_whisper: bool = False
 
 
 class Pipeline:
@@ -610,10 +611,24 @@ class Pipeline:
                          f"Using YouTube subtitles ({len(sub_segments)} segments, skipped Whisper)")
         else:
             if self.cfg.prefer_youtube_subs:
-                self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
-            self._report("transcribe", 0.1, "Loading ASR model...")
-            self.segments = self._transcribe(audio_raw)
-            self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+                self._report("transcribe", 0.05, "No subtitles found...")
+            # Try Groq Whisper API first (very fast), fall back to local Whisper
+            groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+            if self.cfg.use_groq_whisper and groq_key:
+                self._report("transcribe", 0.1, "Transcribing via Groq Whisper API (fast)...")
+                try:
+                    self.segments = self._transcribe_groq(audio_raw, groq_key)
+                    self._report("transcribe", 1.0,
+                                 f"Transcribed {len(self.segments)} segments via Groq API")
+                except Exception as e:
+                    self._report("transcribe", 0.1,
+                                 f"Groq API failed ({e}), falling back to local Whisper...")
+                    self.segments = self._transcribe(audio_raw)
+                    self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+            else:
+                self._report("transcribe", 0.1, "Loading ASR model...")
+                self.segments = self._transcribe(audio_raw)
+                self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
 
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
@@ -1112,6 +1127,116 @@ class Pipeline:
             )
 
         return segments
+
+    # ── Step 3c: Transcribe via Groq Whisper API (fast cloud) ────────────
+    def _transcribe_groq(self, wav_path: Path, api_key: str) -> List[Dict]:
+        """Transcribe using Groq's Whisper API — extremely fast cloud transcription."""
+        from groq import Groq
+        import tempfile
+        import subprocess as sp
+
+        client = Groq(api_key=api_key)
+
+        # Groq Whisper API accepts files up to 25MB. Convert to mp3 to reduce size.
+        self._report("transcribe", 0.15, "Converting audio for Groq API...")
+        mp3_path = wav_path.parent / "audio_for_groq.mp3"
+        sp.run([
+            self._ffmpeg, "-y", "-i", str(wav_path),
+            "-ac", "1", "-ar", "16000", "-b:a", "64k",
+            str(mp3_path),
+        ], capture_output=True, check=True)
+
+        file_size = mp3_path.stat().st_size
+        max_size = 25 * 1024 * 1024  # 25MB
+
+        if file_size <= max_size:
+            # Single file — send directly
+            self._report("transcribe", 0.3, "Sending to Groq Whisper API...")
+            with open(mp3_path, "rb") as f:
+                transcribe_kwargs = {
+                    "file": ("audio.mp3", f),
+                    "model": "whisper-large-v3",
+                    "response_format": "verbose_json",
+                    "timestamp_granularities": ["segment", "word"],
+                }
+                if self.cfg.source_language and self.cfg.source_language != "auto":
+                    transcribe_kwargs["language"] = self.cfg.source_language
+
+                result = client.audio.transcriptions.create(**transcribe_kwargs)
+
+            self._report("transcribe", 0.8, "Processing Groq response...")
+            segments = []
+            for seg in (result.segments or []):
+                entry = {
+                    "start": float(seg.get("start", seg["start"])),
+                    "end": float(seg.get("end", seg["end"])),
+                    "text": seg.get("text", "").strip(),
+                }
+                if "words" in seg and seg["words"]:
+                    entry["words"] = [
+                        {"word": w["word"].strip(), "start": float(w["start"]), "end": float(w["end"])}
+                        for w in seg["words"]
+                    ]
+                if entry["text"]:
+                    segments.append(entry)
+            return segments
+        else:
+            # File too large — split into chunks
+            self._report("transcribe", 0.2, f"Audio too large ({file_size // 1024 // 1024}MB), splitting into chunks...")
+            chunk_duration = 600  # 10 min chunks
+            # Get duration
+            probe = sp.run([
+                self._ffmpeg.replace("ffmpeg", "ffprobe"), "-v", "error",
+                "-show_entries", "format=duration", "-of", "csv=p=0",
+                str(mp3_path),
+            ], capture_output=True, text=True)
+            total_duration = float(probe.stdout.strip())
+            n_chunks = int(total_duration / chunk_duration) + 1
+
+            all_segments = []
+            for i in range(n_chunks):
+                start_time = i * chunk_duration
+                chunk_path = wav_path.parent / f"groq_chunk_{i}.mp3"
+                sp.run([
+                    self._ffmpeg, "-y", "-i", str(mp3_path),
+                    "-ss", str(start_time), "-t", str(chunk_duration),
+                    "-ac", "1", "-ar", "16000", "-b:a", "64k",
+                    str(chunk_path),
+                ], capture_output=True, check=True)
+
+                self._report("transcribe", 0.2 + 0.6 * (i / n_chunks),
+                             f"Transcribing chunk {i + 1}/{n_chunks} via Groq...")
+
+                with open(chunk_path, "rb") as f:
+                    transcribe_kwargs = {
+                        "file": ("audio.mp3", f),
+                        "model": "whisper-large-v3",
+                        "response_format": "verbose_json",
+                        "timestamp_granularities": ["segment", "word"],
+                    }
+                    if self.cfg.source_language and self.cfg.source_language != "auto":
+                        transcribe_kwargs["language"] = self.cfg.source_language
+                    result = client.audio.transcriptions.create(**transcribe_kwargs)
+
+                for seg in (result.segments or []):
+                    entry = {
+                        "start": float(seg.get("start", seg["start"])) + start_time,
+                        "end": float(seg.get("end", seg["end"])) + start_time,
+                        "text": seg.get("text", "").strip(),
+                    }
+                    if "words" in seg and seg["words"]:
+                        entry["words"] = [
+                            {"word": w["word"].strip(),
+                             "start": float(w["start"]) + start_time,
+                             "end": float(w["end"]) + start_time}
+                            for w in seg["words"]
+                        ]
+                    if entry["text"]:
+                        all_segments.append(entry)
+
+                chunk_path.unlink(missing_ok=True)
+
+            return all_segments
 
     # ── Step 4: Translate full narrative ─────────────────────────────────
     def _translate_full_narrative(self, text_segments: List[Dict], speech_duration: float = 0) -> tuple:

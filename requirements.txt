@@ -8,5 +8,7 @@ googletrans==4.0.0-rc1
 gTTS==2.2.3
 pysrt==1.1.2
 webvtt-py==0.4.1
+opencv-python-headless==4.13.0.92
+numpy>=1.22
 pytest==6.2.5
 python-dotenv==0.19.2

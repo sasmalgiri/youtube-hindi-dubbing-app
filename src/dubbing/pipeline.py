@@ -10,13 +10,15 @@ from ..mt.translator import translate_text
 from ..tts.synthesizer import Synthesizer
 from ..subtitles.srt import create_srt_subtitle
 from ..utils.logging import setup_logging
+from ..utils.watermark import detect_static_overlay, remove_watermark
 
 logger = setup_logging()
 
 class DubbingPipeline:
-    def __init__(self, video_url: str, target_language: str):
+    def __init__(self, video_url: str, target_language: str, remove_watermark: bool = False):
         self.video_url = video_url
         self.target_language = target_language
+        self.remove_watermark_flag = remove_watermark
         self.video_path = None
         self.audio_path = None
         self.transcription = None
@@ -26,6 +28,8 @@ class DubbingPipeline:
     def run(self):
         logger.info("Starting the dubbing pipeline.")
         self.download_video()
+        if self.remove_watermark_flag:
+            self.clean_watermark()
         self.extract_audio()
         self.transcribe_audio()
         self.translate_text()
@@ -36,6 +40,12 @@ class DubbingPipeline:
     def download_video(self):
         logger.info("Downloading video from URL.")
         self.video_path = download_video(self.video_url)
+
+    def clean_watermark(self):
+        logger.info("Detecting and removing watermark from video.")
+        cleaned_path = self.video_path.replace('.mp4', '_clean.mp4')
+        remove_watermark(self.video_path, cleaned_path)
+        self.video_path = cleaned_path
 
     def extract_audio(self):
         logger.info("Extracting audio from video.")
