@@ -2795,12 +2795,21 @@ class Pipeline:
         self._report("synthesize", 0.05,
                      f"Hybrid: {len(coqui_segments)} segs → Coqui GPU, {len(edge_segments)} segs → Edge-TTS cloud")
 
+        def _match_results_to_segments(results, indexed_segments, out_dict):
+            """Match TTS results back to original segment indices by start time.
+            TTS functions may skip segments (empty text, errors), so positional
+            zip would misalign results. Match by start time instead."""
+            for result in results:
+                for orig_idx, seg in indexed_segments:
+                    if orig_idx not in out_dict and abs(result["start"] - seg["start"]) < 0.01:
+                        out_dict[orig_idx] = result
+                        break
+
         def run_coqui():
             try:
                 coqui_segs_only = [seg for _, seg in coqui_segments]
                 results = self._tts_coqui_xtts(coqui_segs_only, work_dir=coqui_dir)
-                for result, (orig_idx, _) in zip(results, coqui_segments):
-                    coqui_results[orig_idx] = result
+                _match_results_to_segments(results, coqui_segments, coqui_results)
             except Exception as e:
                 errors.append(f"Coqui: {e}")
 
@@ -2808,8 +2817,7 @@ class Pipeline:
             try:
                 edge_segs_only = [seg for _, seg in edge_segments]
                 results = self._tts_edge(edge_segs_only, voice_map=self._voice_map, work_dir=edge_dir)
-                for result, (orig_idx, _) in zip(results, edge_segments):
-                    edge_results[orig_idx] = result
+                _match_results_to_segments(results, edge_segments, edge_results)
             except Exception as e:
                 errors.append(f"Edge: {e}")
 
@@ -2835,8 +2843,7 @@ class Pipeline:
                          "Coqui failed — re-generating its segments via Edge-TTS...")
             coqui_segs_only = [seg for _, seg in coqui_segments]
             fallback_results = self._tts_edge(coqui_segs_only, voice_map=self._voice_map, work_dir=coqui_dir)
-            for result, (orig_idx, _) in zip(fallback_results, coqui_segments):
-                all_results[orig_idx] = result
+            _match_results_to_segments(fallback_results, coqui_segments, all_results)
 
         # If Edge-TTS failed entirely, re-generate its segments via Edge-TTS retry
         if not edge_results and edge_segments:
@@ -2844,8 +2851,7 @@ class Pipeline:
                          "Edge-TTS failed — retrying its segments...")
             edge_segs_only = [seg for _, seg in edge_segments]
             fallback_results = self._tts_edge(edge_segs_only, voice_map=self._voice_map, work_dir=edge_dir)
-            for result, (orig_idx, _) in zip(fallback_results, edge_segments):
-                all_results[orig_idx] = result
+            _match_results_to_segments(fallback_results, edge_segments, all_results)
 
         # Sort by original segment index
         tts_data = [all_results[i] for i in sorted(all_results.keys())]
