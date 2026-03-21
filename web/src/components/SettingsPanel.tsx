@@ -300,7 +300,13 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                 </button>
                             </div>
                         </div>
-                        <p className="text-[10px] text-text-muted mt-2">First enabled engine from top to bottom will be used.</p>
+                        {settings.use_coqui_xtts && settings.use_edge_tts ? (
+                            <p className="text-[10px] text-primary mt-2 font-medium">
+                                Hybrid Mode: Coqui XTTS + Edge-TTS will run in parallel (~2x faster)
+                            </p>
+                        ) : (
+                            <p className="text-[10px] text-text-muted mt-2">First enabled engine from top to bottom will be used. Enable both Coqui + Edge for hybrid parallel mode.</p>
+                        )}
                     </div>
 
                     {/* TTS Speech Rate */}

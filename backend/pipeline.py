@@ -291,7 +291,27 @@ class Pipeline:
                         os.environ["PATH"] = str(exe.parent) + os.pathsep + os.environ.get("PATH", "")
                         return str(exe)
 
-            # 4. Refresh PATH from system registry and try again
+            # 4. Check well-known Windows installation directories
+            well_known_dirs = [
+                Path(os.environ.get("PROGRAMFILES", "C:\\Program Files")),
+                Path(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")),
+                Path(os.environ.get("LOCALAPPDATA", "")),
+            ]
+            # Map executable names to their typical install subdirectories
+            known_subdirs = {
+                "node": ["nodejs"],
+                "ffmpeg": ["ffmpeg", "ffmpeg\\bin"],
+            }
+            for base_dir in well_known_dirs:
+                if not base_dir or not base_dir.exists():
+                    continue
+                for subdir in known_subdirs.get(name, []):
+                    candidate = base_dir / subdir / full_name
+                    if candidate.exists() and _works(str(candidate)):
+                        os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+                        return str(candidate)
+
+            # 5. Refresh PATH from system registry and try again
             try:
                 result = subprocess.run(
                     ["powershell.exe", "-NoProfile", "-Command",
@@ -301,7 +321,7 @@ class Pipeline:
                 if result.returncode == 0 and result.stdout.strip():
                     os.environ["PATH"] = result.stdout.strip() + os.pathsep + os.environ.get("PATH", "")
                     found = shutil.which(name)
-                    if found:
+                    if found and _works(found):
                         return found
             except Exception:
                 pass
@@ -874,15 +894,27 @@ class Pipeline:
 
             # Enable Node.js runtime for YouTube extraction (required since yt-dlp 2025+)
             node_path = self._find_executable("node")
-            js_args = ["--js-runtimes", f"node:{node_path}"] if node_path else []
+            # Only use --js-runtimes if we found a real path (not bare "node" fallback)
+            js_args = ["--js-runtimes", f"node:{node_path}"] if (node_path and node_path != "node" and Path(node_path).exists()) else []
 
-            # Download video and get title in one call (saves an extra yt-dlp invocation)
+            # Fetch video title first (--print is print-only in yt-dlp 2025+)
+            try:
+                title_cmd = [
+                    self._ytdlp, "--print", "%(title)s",
+                ] + cookies_args + js_args + [src]
+                title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=30)
+                title_line = (title_result.stdout or "").strip().split("\n")[0].strip()
+                if title_line:
+                    self.video_title = title_line
+            except Exception:
+                pass  # Title fetch is best-effort
+
+            # Download video
             try:
                 dl_cmd = [
                     self._ytdlp,
                     "-f", "bv*+ba/b",
                     "--merge-output-format", "mp4",
-                    "--print", "%(title)s",
                     "-o", out_tpl,
                 ]
                 # Only add --ffmpeg-location if we have a real path (not bare "ffmpeg")
@@ -894,10 +926,6 @@ class Pipeline:
                 if result.returncode != 0:
                     error_msg = (result.stderr or result.stdout or "Unknown error").strip()
                     raise RuntimeError(f"yt-dlp failed: {error_msg}")
-                # First line of stdout is the title (from --print)
-                title_line = (result.stdout or "").strip().split("\n")[0].strip()
-                if title_line:
-                    self.video_title = title_line
             except RuntimeError:
                 raise
             except Exception as e:

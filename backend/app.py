@@ -555,7 +555,7 @@ def _job_config(job: Job) -> Dict[str, Any]:
     else:
         tts = "Edge-TTS"
     engine_labels = {
-        "auto": "Auto", "turbo": "Turbo (Multi-Engine)", "gemini": "Gemini",
+        "auto": "Auto", "turbo": "Turbo (Groq+SambaNova)", "gemini": "Gemini",
         "groq": "Groq", "sambanova": "SambaNova",
         "ollama": "Ollama", "google": "Google Translate", "hinglish": "Hinglish AI",
     }
