@@ -157,8 +157,14 @@ export function useBatchManager(): UseBatchManagerReturn {
                 });
             },
             () => {
-                // SSE connection error — mark as error
-                updateItem(index, { state: 'error', error: 'Connection lost' });
+                // SSE connection error — guard against stale index from prior batch
+                setItems((prev) => {
+                    const item = prev[index];
+                    if (!item || item.jobId !== jobId) return prev;
+                    const next = [...prev];
+                    next[index] = { ...item, state: 'error', error: 'Connection lost' };
+                    return next;
+                });
                 unsubscribesRef.current.delete(jobId);
             },
         );
@@ -169,7 +175,7 @@ export function useBatchManager(): UseBatchManagerReturn {
     // Auto-download effect
     useEffect(() => {
         if (!autoDownload) return;
-        const toDownload = items.filter((item) => item.state === 'done' && !item.downloaded && item.jobId);
+        const toDownload = items.filter((item) => item.state === 'done' && !item.downloaded && item.jobId && item.step !== 'Awaiting SRT');
         if (toDownload.length === 0) return;
         toDownload.forEach((item) => triggerDownload(item.jobId!, item.videoTitle));
         setItems((prev) => {
@@ -253,6 +259,11 @@ export function useBatchManager(): UseBatchManagerReturn {
     }, [items, updateItem, subscribeToJob]);
 
     const start = useCallback((urls: string[], settings: BatchSettings) => {
+        // Clean up prior batch's SSE subscriptions and launching state
+        unsubscribesRef.current.forEach((unsub) => unsub());
+        unsubscribesRef.current.clear();
+        launchingRef.current.clear();
+
         sessionStorage.setItem('batch_settings', JSON.stringify(settings));
 
         const newItems: BatchItem[] = urls.map((url) => ({

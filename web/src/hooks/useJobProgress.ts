@@ -71,16 +71,22 @@ export function useJobProgress(jobId: string | null): JobProgress {
                 updateEta(job.overall_progress, job.created_at);
                 if (job.state === 'done') {
                     setIsComplete(true);
+                    setIsError(false);
+                    setIsWaitingForSrt(false);
                     setOverallProgress(1);
                     setEta('');
                     if (pollRef.current) clearInterval(pollRef.current);
                 } else if (job.state === 'error') {
                     setIsError(true);
+                    setIsComplete(false);
+                    setIsWaitingForSrt(false);
                     setError(job.error || 'Unknown error');
                     setEta('');
                     if (pollRef.current) clearInterval(pollRef.current);
                 } else if (job.state === 'waiting_for_srt') {
                     setIsWaitingForSrt(true);
+                    setIsComplete(false);
+                    setIsError(false);
                     setOverallProgress(0.4);
                     setEta('');
                     if (pollRef.current) clearInterval(pollRef.current);
@@ -118,15 +124,21 @@ export function useJobProgress(jobId: string | null): JobProgress {
                 if (event.type === 'complete') {
                     if (event.state === 'done') {
                         setIsComplete(true);
+                        setIsError(false);
+                        setIsWaitingForSrt(false);
                         setOverallProgress(1);
                         setMessage('Complete');
                         setEta('');
                     } else if (event.state === 'error') {
                         setIsError(true);
+                        setIsComplete(false);
+                        setIsWaitingForSrt(false);
                         setError(event.error || 'Unknown error');
                         setEta('');
                     } else if (event.state === 'waiting_for_srt') {
                         setIsWaitingForSrt(true);
+                        setIsComplete(false);
+                        setIsError(false);
                         setOverallProgress(0.4);
                         setMessage('Transcription complete. Download SRT and upload translation.');
                         setEta('');
@@ -153,7 +165,7 @@ export function useJobProgress(jobId: string | null): JobProgress {
             if (unsubRef.current) unsubRef.current();
             if (pollRef.current) clearInterval(pollRef.current);
         };
-    }, [jobId, startPolling]);
+    }, [jobId, startPolling, updateEta]);
 
     const restart = useCallback(() => {
         if (!jobId) return;
@@ -182,13 +194,19 @@ export function useJobProgress(jobId: string | null): JobProgress {
                 if (event.type === 'complete') {
                     if (event.state === 'done') {
                         setIsComplete(true);
+                        setIsError(false);
+                        setIsWaitingForSrt(false);
                         setOverallProgress(1);
                         setMessage('Complete');
                     } else if (event.state === 'error') {
                         setIsError(true);
+                        setIsComplete(false);
+                        setIsWaitingForSrt(false);
                         setError(event.error || 'Unknown error');
                     } else if (event.state === 'waiting_for_srt') {
                         setIsWaitingForSrt(true);
+                        setIsComplete(false);
+                        setIsError(false);
                         setOverallProgress(0.4);
                         setMessage('Transcription complete. Download SRT and upload translation.');
                     }
