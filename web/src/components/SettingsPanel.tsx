@@ -110,12 +110,13 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                     {/* ── Translation Section ── */}
                     <div>
                         <p className="text-sm font-medium text-text-primary mb-3">Translation Engine</p>
-                        <div className="grid grid-cols-4 gap-2 mb-3">
+                        <div className="grid grid-cols-5 gap-2 mb-3">
                             {[
                                 { value: 'auto', label: 'Auto', desc: 'Best available' },
-                                { value: 'turbo', label: 'Turbo', desc: 'Groq+Cerebras parallel' },
+                                { value: 'turbo', label: 'Turbo', desc: 'All 3 engines parallel' },
                                 { value: 'groq', label: 'Groq', desc: 'Llama 3.3 70B (free)' },
-                                { value: 'cerebras', label: 'Cerebras', desc: 'Llama 3.3 70B (free)' },
+                                { value: 'sambanova', label: 'SambaNova', desc: 'Llama 3.3 70B (free)' },
+                                { value: 'together', label: 'Together', desc: 'Llama 3.3 70B (free)' },
                             ].map((m) => (
                                 <button
                                     key={m.value}
