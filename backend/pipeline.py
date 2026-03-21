@@ -3038,7 +3038,6 @@ class Pipeline:
                      str(wav_fixed)],
                     check=True, capture_output=True,
                 )
-                import shutil
                 shutil.move(str(wav_fixed), str(wav_path))
 
             except Exception as e:
@@ -3106,13 +3105,14 @@ class Pipeline:
         from TTS.api import TTS
 
         self._report("synthesize", 0.02, "Loading XTTS v2 model on GPU (this may take a minute)...")
-        try:
-            tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
-        finally:
-            torch.load = _original_torch_load  # Restore original
-
         tts_data = []
+        tts_model = None
         try:
+            try:
+                tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
+            finally:
+                torch.load = _original_torch_load  # Restore original
+
             # Build per-speaker reference map if available
             refs_dir = self.cfg.work_dir / "speaker_refs"
             speaker_ref_map: Dict[str, Path] = {}
@@ -3182,7 +3182,6 @@ class Pipeline:
                          str(wav_fixed)],
                         check=True, capture_output=True,
                     )
-                    import shutil
                     shutil.move(str(wav_fixed), str(wav_path))
 
                 except Exception as e:
@@ -3206,8 +3205,9 @@ class Pipeline:
                     f"Synthesized {i + 1}/{len(segments)} segments (XTTS v2 voice clone)...",
                 )
         finally:
-            del tts_model
-            torch.cuda.empty_cache()
+            if tts_model is not None:
+                del tts_model
+                torch.cuda.empty_cache()
             # Detach wrappers before restoring to prevent GC from closing shared buffer
             if sys.stdout is not _orig_stdout:
                 try:
