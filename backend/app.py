@@ -173,23 +173,9 @@ def _sanitize_filename(name: str) -> str:
     return name or "Untitled"
 
 
-def _cleanup_work_dir(work_dir: Path):
-    """Remove intermediate TTS/assembly files from work dir, keep source + transcripts."""
-    keep_patterns = {"source.", "transcript", ".srt", "dubbed"}
-    removed = 0
-    for f in work_dir.iterdir():
-        if f.is_dir():
-            continue
-        if any(p in f.name for p in keep_patterns):
-            continue
-        f.unlink(missing_ok=True)
-        removed += 1
-    if removed:
-        print(f"[CLEANUP] Removed {removed} intermediate files from {work_dir}")
-
 
 def _save_to_titled_folder(job: Job):
-    """Copy dubbed video + SRT to a titled folder in dubbed_outputs/."""
+    """Move dubbed video + SRT to a titled folder in dubbed_outputs/, then delete work dir."""
     if not job.result_path or not job.result_path.exists():
         return
 
@@ -201,19 +187,27 @@ def _save_to_titled_folder(job: Job):
     folder = SAVED_DIR / folder_name
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Copy video with title as filename
+    # Move video with title as filename
     video_name = f"{title} - {lang.upper()} Dubbed.mp4"
     saved_video = folder / video_name
-    shutil.copy2(job.result_path, saved_video)
+    shutil.move(str(job.result_path), str(saved_video))
 
-    # Copy SRT if available
+    # Move SRT if available
     srt_src = job.result_path.parent / f"subtitles_{lang}.srt"
     if srt_src.exists():
         srt_name = f"{title} - {lang.upper()} Dubbed.srt"
-        shutil.copy2(srt_src, folder / srt_name)
+        shutil.move(str(srt_src), str(folder / srt_name))
 
+    # Update job to point to new location
+    job.result_path = saved_video
     job.saved_folder = str(folder)
     job.saved_video = str(saved_video)
+
+    # Delete the entire work/outputs/<job_id> directory to free space
+    job_work_dir = OUTPUTS / job.id
+    if job_work_dir.exists():
+        shutil.rmtree(job_work_dir, ignore_errors=True)
+        print(f"[CLEANUP] Deleted work directory {job_work_dir}")
 
 
 def _generate_youtube_description(job: Job) -> str:
@@ -386,12 +380,6 @@ def _run_job(job: Job, req: JobCreateRequest):
         except Exception as desc_err:
             print(f"[WARN] Failed to generate description: {desc_err}")
 
-        # Clean up intermediate work files (adapt_*, TTS clips, etc.)
-        try:
-            _cleanup_work_dir(job_dir / "work")
-        except Exception as clean_err:
-            print(f"[WARN] Failed to clean work dir: {clean_err}")
-
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
@@ -404,6 +392,14 @@ def _run_job(job: Job, req: JobCreateRequest):
                 f"[JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
             )
         except OSError:
+            pass
+        # Clean up failed job's work directory too
+        try:
+            job_dir = OUTPUTS / job.id
+            if job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+                print(f"[CLEANUP] Deleted failed job work directory {job_dir}")
+        except Exception:
             pass
         job.state = "error"
         job.error = str(e)
@@ -772,12 +768,6 @@ def _run_resume(job: Job):
         except Exception:
             pass
 
-        # Clean up intermediate work files
-        try:
-            _cleanup_work_dir(OUTPUTS / job.id / "work")
-        except Exception:
-            pass
-
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
@@ -790,6 +780,13 @@ def _run_resume(job: Job):
                 f"[RESUME ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
             )
         except OSError:
+            pass
+        # Clean up failed job's work directory
+        try:
+            job_dir = OUTPUTS / job.id
+            if job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
             pass
         job.state = "error"
         job.error = str(e)

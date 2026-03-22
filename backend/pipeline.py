@@ -902,12 +902,19 @@ class Pipeline:
                 title_cmd = [
                     self._ytdlp, "--print", "%(title)s",
                 ] + cookies_args + js_args + [src]
-                title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=30)
+                print(f"[YTDLP] title cmd: {title_cmd}", flush=True)
+                title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=60)
+                print(f"[YTDLP] title rc={title_result.returncode} stdout={repr((title_result.stdout or '')[:200])}", flush=True)
+                if title_result.returncode != 0:
+                    print(f"[YTDLP] title stderr: {(title_result.stderr or '')[:300]}", flush=True)
                 title_line = (title_result.stdout or "").strip().split("\n")[0].strip()
                 if title_line:
                     self.video_title = title_line
-            except Exception:
-                pass  # Title fetch is best-effort
+                    print(f"[YTDLP] Got title: {self.video_title}", flush=True)
+                else:
+                    print(f"[YTDLP] No title in output, using fallback", flush=True)
+            except Exception as e:
+                print(f"[YTDLP] Title fetch failed: {e}", flush=True)
 
             # Download video
             try:
