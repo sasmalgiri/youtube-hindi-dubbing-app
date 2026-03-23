@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { extractYouTubeId, isValidYouTubeUrl, getThumbnailUrl } from '@/lib/utils';
+import { addLink } from '@/lib/api';
 
 type InputMode = 'url' | 'upload' | 'batch';
 
@@ -31,10 +32,29 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
     const videoId = extractYouTubeId(url);
     const isValid = isValidYouTubeUrl(url);
 
+    // Auto-save valid URL to saved links
+    const savedRef = useRef<Set<string>>(new Set());
+    useEffect(() => {
+        if (isValid && url && !savedRef.current.has(url)) {
+            savedRef.current.add(url);
+            addLink(url).catch(() => {});
+        }
+    }, [url, isValid]);
+
     // Batch URL parsing
     const parsedLines = batchText.split('\n').map(l => l.trim()).filter(Boolean);
     const validUrls = parsedLines.filter(isValidYouTubeUrl);
     const invalidCount = parsedLines.length - validUrls.length;
+
+    // Auto-save valid batch URLs
+    useEffect(() => {
+        validUrls.forEach(u => {
+            if (!savedRef.current.has(u)) {
+                savedRef.current.add(u);
+                addLink(u).catch(() => {});
+            }
+        });
+    }, [batchText]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleUrlSubmit = useCallback(() => {
         if (isValid && !disabled) {
