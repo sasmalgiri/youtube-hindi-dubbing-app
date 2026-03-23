@@ -63,6 +63,8 @@ class Job:
     saved_video: Optional[str] = None   # Path to saved video file
     description: Optional[str] = None   # YouTube description
     qa_score: Optional[float] = None    # Transcription QA score (0-1)
+    chain_languages: List[str] = field(default_factory=list)  # Remaining languages in chain
+    chain_parent_id: Optional[str] = None  # Parent job ID in chain
 
 
 class JobCreateRequest(BaseModel):
@@ -86,6 +88,7 @@ class JobCreateRequest(BaseModel):
     audio_priority: bool = True
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
+    dub_chain: List[str] = []  # e.g. ["en", "hi"] — dub through languages sequentially
 
     @validator("target_language", "source_language")
     def validate_language(cls, v):
@@ -392,7 +395,13 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         # Mark this URL as completed so it won't be re-queued on restart
         if job.source_url:
-            _mark_url_completed(job.source_url)
+            # Only mark completed if no chain remaining (final language done)
+            if not job.chain_languages:
+                _mark_url_completed(job.source_url)
+
+        # Chain dubbing: if more languages remain, queue next step
+        if job.chain_languages and job.saved_video:
+            _queue_chain_next(job)
 
     except Exception as e:
         import traceback
@@ -416,6 +425,50 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.events.append({"type": "complete", "state": "error", "error": str(e)})
     finally:
         _pipeline_semaphore.release()
+
+
+def _queue_chain_next(parent_job: Job):
+    """Queue the next language in a dub chain, using the parent's output as input."""
+    next_lang = parent_job.chain_languages[0]
+    remaining = parent_job.chain_languages[1:]
+
+    print(f"[CHAIN] Job {parent_job.id} done ({parent_job.target_language}). "
+          f"Queuing next: {next_lang} (remaining: {remaining})", flush=True)
+
+    job_id = uuid.uuid4().hex[:12]
+    # Use the saved video from previous step as input
+    input_path = parent_job.saved_video
+
+    # Create request using the output video as source
+    req = JobCreateRequest(
+        url=input_path,
+        source_language=parent_job.target_language,  # Previous output language
+        target_language=next_lang,
+        prefer_youtube_subs=False,  # No YouTube subs for local file
+        use_chatterbox=parent_job.original_req.use_chatterbox if parent_job.original_req else True,
+        use_edge_tts=parent_job.original_req.use_edge_tts if parent_job.original_req else False,
+        mix_original=parent_job.original_req.mix_original if parent_job.original_req else False,
+        original_volume=parent_job.original_req.original_volume if parent_job.original_req else 0.10,
+        audio_priority=parent_job.original_req.audio_priority if parent_job.original_req else True,
+        audio_bitrate=parent_job.original_req.audio_bitrate if parent_job.original_req else "192k",
+        encode_preset=parent_job.original_req.encode_preset if parent_job.original_req else "veryfast",
+    )
+
+    job = Job(
+        id=job_id,
+        source_url=parent_job.source_url,  # Keep original URL for tracking
+        target_language=next_lang,
+        chain_languages=remaining,
+        chain_parent_id=parent_job.id,
+    )
+    job.original_req = req
+    job.video_title = parent_job.video_title  # Carry title forward
+    JOBS[job_id] = job
+
+    parent_job.message = f"Complete — next: dubbing to {next_lang.upper()}"
+
+    t = threading.Thread(target=_run_job, args=(job, req), daemon=True)
+    t.start()
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -479,8 +532,24 @@ def create_job(req: JobCreateRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
 
+    # Handle dub chain: e.g. ["en", "hi"] means dub to English first, then Hindi
+    if req.dub_chain and len(req.dub_chain) >= 2:
+        first_lang = req.dub_chain[0]
+        remaining = req.dub_chain[1:]
+        req.target_language = first_lang
+        # Force YouTube subs for first step (use existing English subs)
+        if first_lang == "en":
+            req.prefer_youtube_subs = True
+    else:
+        remaining = []
+
     job_id = uuid.uuid4().hex[:12]
-    job = Job(id=job_id, source_url=url, target_language=req.target_language)
+    job = Job(
+        id=job_id,
+        source_url=url,
+        target_language=req.target_language,
+        chain_languages=remaining,
+    )
     job.original_req = req
     JOBS[job_id] = job
 

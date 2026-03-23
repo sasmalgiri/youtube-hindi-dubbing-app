@@ -31,6 +31,7 @@ export default function HomePage() {
         audio_priority: true,
         audio_bitrate: '192k',
         encode_preset: 'veryfast',
+        dub_chain: [],
     });
     const [currentUrl, setCurrentUrl] = useState('');
     const [submitting, setSubmitting] = useState(false);

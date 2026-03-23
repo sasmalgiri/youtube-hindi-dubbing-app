@@ -38,6 +38,7 @@ export interface JobCreateRequest {
     audio_priority?: boolean;
     audio_bitrate?: string;
     encode_preset?: string;
+    dub_chain?: string[];
 }
 
 export interface JobConfig {

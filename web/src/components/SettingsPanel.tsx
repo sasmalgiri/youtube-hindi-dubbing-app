@@ -19,6 +19,7 @@ export interface DubbingSettings {
     audio_priority: boolean;
     audio_bitrate: string;
     encode_preset: string;
+    dub_chain: string[];
 }
 
 interface SettingsPanelProps {
@@ -101,6 +102,28 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                     <div className={`
                                         w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
                                         ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                </button>
+                            </div>
+
+                            {/* Chain Dub */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Chain Dub (English → Hindi)</p>
+                                    <p className="text-xs text-text-muted">Dub to English first using subs, then English to Hindi (best for non-English videos)</p>
+                                </div>
+                                <button
+                                    onClick={() => update({
+                                        dub_chain: settings.dub_chain.length > 0 ? [] : ['en', 'hi'],
+                                    })}
+                                    className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.dub_chain.length > 0 ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                >
+                                    <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.dub_chain.length > 0 ? 'translate-x-6' : 'translate-x-1'}
                                     `} />
                                 </button>
                             </div>
