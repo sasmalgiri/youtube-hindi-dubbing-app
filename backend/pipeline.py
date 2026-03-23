@@ -977,7 +977,7 @@ class Pipeline:
                     dl_cmd += ["--ffmpeg-location", str(ffmpeg_path.parent)]
                 dl_cmd += cookies_args + js_args + [src]
                 print(f"[YTDLP] cmd: {dl_cmd}", flush=True)
-                result = subprocess.run(dl_cmd, capture_output=True, text=True)
+                result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=14400)  # 4h max for very long videos
                 print(f"[YTDLP] rc={result.returncode} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}", flush=True)
                 if result.returncode != 0:
                     error_msg = (result.stderr or result.stdout or "Unknown error").strip()
@@ -1021,7 +1021,7 @@ class Pipeline:
                 [self._ffmpeg, "-y", "-i", str(video_path),
                  "-vn", "-ac", str(self.N_CHANNELS), "-ar", str(self.SAMPLE_RATE),
                  "-acodec", "pcm_s16le", str(wav)],
-                check=True, capture_output=True,
+                check=True, capture_output=True, timeout=7200,  # 2h max
             )
             return "full"
 
@@ -1030,7 +1030,7 @@ class Pipeline:
                 [self._ffmpeg, "-y", "-i", str(video_path),
                  "-vn", "-ac", "1", "-ar", "16000",
                  "-acodec", "pcm_s16le", str(wav_16k)],
-                check=True, capture_output=True,
+                check=True, capture_output=True, timeout=7200,  # 2h max
             )
             return "16k"
 
@@ -2664,50 +2664,99 @@ class Pipeline:
     def _build_timeline_no_cut(self, tts_data, total_duration, prefix=""):
         """Place TTS segments on a timeline WITHOUT cutting any audio.
 
-        If a segment overflows its slot, the full audio is still placed —
-        it may overlap into the next gap, but no speech is ever truncated.
-        The timeline is extended if necessary to fit all audio.
+        Uses FFmpeg adelay filter to place each segment at its correct time,
+        then amix to combine. Handles arbitrarily long videos without loading
+        the entire timeline into RAM (avoids OOM on 12h+ videos).
         """
-        # Calculate the required timeline length — may exceed video duration
-        max_end = total_duration
-        for seg in tts_data:
-            seg_audio_end = seg["start"] + seg["duration"]
-            if seg_audio_end > max_end:
-                max_end = seg_audio_end
-
-        total_samples = int((max_end + 0.5) * self.SAMPLE_RATE)
-        bytes_per_frame = 2 * self.N_CHANNELS
-        timeline = bytearray(total_samples * bytes_per_frame)
-
-        for seg in tts_data:
-            start_byte = int(seg["start"] * self.SAMPLE_RATE) * bytes_per_frame
-
-            with wave.open(str(seg["wav"]), 'rb') as w:
-                raw = w.readframes(w.getnframes())
-
-            # Place ALL audio — never truncate
-            end_byte = start_byte + len(raw)
-            if end_byte > len(timeline):
-                # Extend the timeline to fit
-                timeline.extend(b'\x00' * (end_byte - len(timeline)))
-            timeline[start_byte:end_byte] = raw
-
-        # Trim back to video duration (but only silence, not speech)
-        # The muxer will use video duration as the master
-        final_samples = int((total_duration + 0.5) * self.SAMPLE_RATE)
-        final_bytes = final_samples * bytes_per_frame
-        if len(timeline) > final_bytes:
-            # Keep all audio up to video end — FFmpeg will naturally end at video length
-            timeline = timeline[:final_bytes]
-
         output = self.cfg.work_dir / f"{prefix}tts_no_cut.wav"
-        with wave.open(str(output), 'wb') as w:
-            w.setnchannels(self.N_CHANNELS)
-            w.setsampwidth(2)
-            w.setframerate(self.SAMPLE_RATE)
-            w.writeframes(bytes(timeline))
+
+        if not tts_data:
+            # Generate silence for the full duration
+            subprocess.run(
+                [self._ffmpeg, "-y", "-f", "lavfi",
+                 "-i", f"anullsrc=r={self.SAMPLE_RATE}:cl=stereo",
+                 "-t", f"{total_duration:.3f}",
+                 "-acodec", "pcm_s16le", str(output)],
+                check=True, capture_output=True,
+            )
+            return output
+
+        # For very large segment counts, process in chunks to avoid hitting
+        # FFmpeg's filter complexity limits (~500 inputs max)
+        CHUNK_SIZE = 200
+        if len(tts_data) <= CHUNK_SIZE:
+            self._build_timeline_chunk(tts_data, total_duration, output)
+        else:
+            # Build chunks, then merge
+            chunk_paths = []
+            for ci in range(0, len(tts_data), CHUNK_SIZE):
+                chunk = tts_data[ci:ci + CHUNK_SIZE]
+                chunk_out = self.cfg.work_dir / f"{prefix}timeline_chunk_{ci:04d}.wav"
+                self._build_timeline_chunk(chunk, total_duration, chunk_out)
+                chunk_paths.append(chunk_out)
+                self._report("assemble",
+                             0.2 + 0.3 * ((ci + CHUNK_SIZE) / len(tts_data)),
+                             f"Built timeline chunk {len(chunk_paths)}/{math.ceil(len(tts_data)/CHUNK_SIZE)}...")
+
+            # Merge all chunks by mixing them together
+            if len(chunk_paths) == 1:
+                shutil.move(str(chunk_paths[0]), str(output))
+            else:
+                inputs = []
+                for cp in chunk_paths:
+                    inputs.extend(["-i", str(cp)])
+                subprocess.run(
+                    [self._ffmpeg, "-y"] + inputs + [
+                        "-filter_complex",
+                        f"amix=inputs={len(chunk_paths)}:duration=longest:normalize=0",
+                        "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                        "-acodec", "pcm_s16le", str(output)],
+                    check=True, capture_output=True,
+                )
+                for cp in chunk_paths:
+                    cp.unlink(missing_ok=True)
 
         return output
+
+    def _build_timeline_chunk(self, tts_data, total_duration, output: Path):
+        """Build a WAV timeline for a chunk of TTS segments using FFmpeg adelay + amix."""
+        # Build FFmpeg command with adelay filters to place each segment
+        inputs = []
+        filter_parts = []
+        for i, seg in enumerate(tts_data):
+            wav_path = seg["wav"]
+            if not Path(wav_path).exists():
+                continue
+            delay_ms = int(seg["start"] * 1000)
+            inputs.extend(["-i", str(wav_path)])
+            idx = len(inputs) // 2 - 1  # input index
+            filter_parts.append(
+                f"[{idx}:a]adelay={delay_ms}|{delay_ms},apad[d{i}]"
+            )
+
+        if not filter_parts:
+            # No valid segments — generate silence
+            subprocess.run(
+                [self._ffmpeg, "-y", "-f", "lavfi",
+                 "-i", f"anullsrc=r={self.SAMPLE_RATE}:cl=stereo",
+                 "-t", f"{total_duration:.3f}",
+                 "-acodec", "pcm_s16le", str(output)],
+                check=True, capture_output=True,
+            )
+            return
+
+        n = len(filter_parts)
+        mix_inputs = "".join(f"[d{i}]" for i in range(n))
+        filter_complex = ";".join(filter_parts) + f";{mix_inputs}amix=inputs={n}:duration=longest:normalize=0"
+
+        subprocess.run(
+            [self._ffmpeg, "-y"] + inputs + [
+                "-filter_complex", filter_complex,
+                "-t", f"{total_duration:.3f}",
+                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                "-acodec", "pcm_s16le", str(output)],
+            check=True, capture_output=True,
+        )
 
     # ── Video-adapts-to-audio assembly ──────────────────────────────────
     # Maximum video slowdown: 1.1x (setpts=1.1*PTS makes it 10% slower)
@@ -3992,40 +4041,119 @@ class Pipeline:
     # ── Audio mixing ─────────────────────────────────────────────────────
     def _separate_background(self, audio_raw: Path) -> Path:
         """Use demucs to extract instrumental/background track (no vocals).
+        For long audio (>10min), splits into chunks to avoid GPU OOM.
         Returns path to the no-vocals audio file, or audio_raw as fallback."""
         bg_path = self.cfg.work_dir / "background_music.wav"
         if bg_path.exists():
             return bg_path
+
+        total_duration = self._get_duration(audio_raw)
+        CHUNK_MINS = 10  # Process 10-minute chunks to avoid OOM
+        CHUNK_SECS = CHUNK_MINS * 60
+
         try:
             import demucs.separate
-            print("[DEMUCS] Separating vocals from background music...", flush=True)
-            demucs.separate.main([
-                "--two-stems", "vocals",
-                "-n", "htdemucs",
-                "-o", str(self.cfg.work_dir / "demucs_out"),
-                str(audio_raw),
-            ])
-            # demucs outputs: demucs_out/htdemucs/<filename>/no_vocals.wav
-            stem_name = audio_raw.stem  # "audio_raw"
-            no_vocals = self.cfg.work_dir / "demucs_out" / "htdemucs" / stem_name / "no_vocals.wav"
-            if no_vocals.exists():
-                # Convert to our standard format
+
+            if total_duration <= CHUNK_SECS:
+                # Short audio — process in one shot
+                return self._demucs_single(audio_raw, bg_path)
+
+            # Long audio — split, process chunks, concatenate
+            print(f"[DEMUCS] Audio is {total_duration/60:.0f}min, splitting into {CHUNK_MINS}min chunks...", flush=True)
+            num_chunks = math.ceil(total_duration / CHUNK_SECS)
+            chunk_bg_paths = []
+
+            for ci in range(num_chunks):
+                start = ci * CHUNK_SECS
+                chunk_audio = self.cfg.work_dir / f"demucs_chunk_{ci:03d}.wav"
+                chunk_bg = self.cfg.work_dir / f"demucs_bg_{ci:03d}.wav"
+
+                # Extract chunk
                 subprocess.run(
-                    [self._ffmpeg, "-y", "-i", str(no_vocals),
+                    [self._ffmpeg, "-y", "-i", str(audio_raw),
+                     "-ss", str(start), "-t", str(CHUNK_SECS),
                      "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                     "-acodec", "pcm_s16le", str(bg_path)],
+                     "-acodec", "pcm_s16le", str(chunk_audio)],
                     check=True, capture_output=True,
                 )
-                # Clean up demucs output folder to save space
-                import shutil
-                shutil.rmtree(self.cfg.work_dir / "demucs_out", ignore_errors=True)
-                print(f"[DEMUCS] Background track extracted: {bg_path}", flush=True)
-                return bg_path
-            else:
-                print(f"[DEMUCS] no_vocals.wav not found, falling back to raw audio", flush=True)
+
+                # Separate this chunk
+                result = self._demucs_single(chunk_audio, chunk_bg)
+                chunk_audio.unlink(missing_ok=True)
+
+                if result == chunk_bg and chunk_bg.exists():
+                    chunk_bg_paths.append(chunk_bg)
+                else:
+                    # Demucs failed for this chunk — use original audio chunk as fallback
+                    fallback = self.cfg.work_dir / f"demucs_fallback_{ci:03d}.wav"
+                    subprocess.run(
+                        [self._ffmpeg, "-y", "-i", str(audio_raw),
+                         "-ss", str(start), "-t", str(CHUNK_SECS),
+                         "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                         "-acodec", "pcm_s16le", str(fallback)],
+                        check=True, capture_output=True,
+                    )
+                    chunk_bg_paths.append(fallback)
+
+                print(f"[DEMUCS] Chunk {ci+1}/{num_chunks} done", flush=True)
+
+            # Concatenate all chunk backgrounds
+            if not chunk_bg_paths:
+                return audio_raw
+            concat_list = self.cfg.work_dir / "demucs_concat.txt"
+            concat_list.write_text(
+                "\n".join(f"file '{str(p).replace(chr(92), '/')}'" for p in chunk_bg_paths),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [self._ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list),
+                 "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                 "-acodec", "pcm_s16le", str(bg_path)],
+                check=True, capture_output=True,
+            )
+
+            # Cleanup chunks
+            for p in chunk_bg_paths:
+                p.unlink(missing_ok=True)
+            concat_list.unlink(missing_ok=True)
+
+            print(f"[DEMUCS] Background track extracted: {bg_path}", flush=True)
+            return bg_path
+
+        except ImportError:
+            print("[DEMUCS] demucs not installed, falling back to raw audio", flush=True)
         except Exception as e:
             print(f"[DEMUCS] Separation failed: {e}, falling back to raw audio", flush=True)
         return audio_raw
+
+    def _demucs_single(self, audio_path: Path, output_path: Path) -> Path:
+        """Run demucs on a single audio file and return the no-vocals track."""
+        try:
+            import demucs.separate
+            demucs_out = self.cfg.work_dir / "demucs_out"
+            print(f"[DEMUCS] Separating {audio_path.name}...", flush=True)
+            demucs.separate.main([
+                "--two-stems", "vocals",
+                "-n", "htdemucs",
+                "-o", str(demucs_out),
+                str(audio_path),
+            ])
+            stem_name = audio_path.stem
+            no_vocals = demucs_out / "htdemucs" / stem_name / "no_vocals.wav"
+            if no_vocals.exists():
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(no_vocals),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     "-acodec", "pcm_s16le", str(output_path)],
+                    check=True, capture_output=True,
+                )
+                shutil.rmtree(demucs_out, ignore_errors=True)
+                return output_path
+            print(f"[DEMUCS] no_vocals.wav not found for {audio_path.name}", flush=True)
+        except Exception as e:
+            print(f"[DEMUCS] Failed on {audio_path.name}: {e}", flush=True)
+        return audio_path
 
     def _mix_audio(self, original: Path, tts: Path, original_vol: float) -> Path:
         # Use background-only track (no vocals) instead of full original
