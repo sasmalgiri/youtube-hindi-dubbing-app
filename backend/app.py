@@ -20,6 +20,7 @@ import asyncio
 import json
 import re
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -916,6 +917,41 @@ def _save_links(links: List[Dict]):
     LINKS_FILE.write_text(json.dumps(links, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _fetch_yt_title(url: str) -> str:
+    """Fetch YouTube video title via yt-dlp. Returns empty string on failure."""
+    try:
+        ytdlp = shutil.which("yt-dlp")
+        if not ytdlp:
+            return ""
+        cmd = [ytdlp]
+        node = shutil.which("node")
+        if node:
+            cmd += ["--js-runtimes", f"node:{node}"]
+        cmd += ["--dump-single-json", "--no-download", url]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if r.returncode == 0 and r.stdout:
+            data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+            title = data.get("title", "")
+            # Sanitize: remove filesystem-unsafe chars
+            return re.sub(r'[\\/:*?"<>|]', '', title).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _bg_fetch_title(link_id: str, url: str):
+    """Background thread: fetch title and update the link in saved_links.json."""
+    title = _fetch_yt_title(url)
+    if not title:
+        return
+    links = _load_links()
+    for link in links:
+        if link["id"] == link_id:
+            link["title"] = title
+            break
+    _save_links(links)
+
+
 @app.get("/api/links")
 def get_links():
     return _load_links()
@@ -932,13 +968,17 @@ def add_link(req: LinkAdd):
     # Deduplicate by URL
     if any(l["url"] == req.url for l in links):
         return {"status": "exists", "links": links}
+    link_id = uuid.uuid4().hex[:12]
     links.append({
-        "id": uuid.uuid4().hex[:12],
+        "id": link_id,
         "url": req.url,
         "title": req.title or "",
         "added_at": time.time(),
     })
     _save_links(links)
+    # Fetch title in background if not provided
+    if not req.title:
+        threading.Thread(target=_bg_fetch_title, args=(link_id, req.url), daemon=True).start()
     return {"status": "added", "links": links}
 
 
