@@ -388,9 +388,18 @@ def _run_job(job: Job, req: JobCreateRequest):
         except Exception as desc_err:
             print(f"[WARN] Failed to generate description: {desc_err}")
 
+        # Save QA report to output folder
+        try:
+            qa_src = OUTPUTS / job.id / "work" / "qa_report.txt"
+            if qa_src.exists() and job.saved_folder:
+                shutil.copy2(str(qa_src), str(Path(job.saved_folder) / "qa_report.txt"))
+        except Exception:
+            pass
+
         job.overall_progress = 1.0
         job.state = "done"
-        job.message = "Complete"
+        qa_msg = f" (QA: {job.qa_score:.0%})" if job.qa_score is not None else ""
+        job.message = f"Complete{qa_msg}"
         job.events.append({"type": "complete", "state": "done"})
 
         # Mark this URL as completed so it won't be re-queued on restart
@@ -780,6 +789,24 @@ def get_source_srt(job_id: str):
         media_type="text/plain",
         filename=f"source_{job_id}.srt",
     )
+
+
+@app.get("/api/jobs/{job_id}/qa")
+def get_qa_report(job_id: str):
+    """Get the QA report for a job."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Try work dir first, then saved folder
+    qa_path = OUTPUTS / job_id / "work" / "qa_report.txt"
+    if not qa_path.exists() and job.saved_folder:
+        qa_path = Path(job.saved_folder) / "qa_report.txt"
+    if not qa_path.exists():
+        raise HTTPException(status_code=404, detail="QA report not available")
+
+    report = qa_path.read_text(encoding="utf-8")
+    return {"qa_score": job.qa_score, "report": report}
 
 
 def _run_resume(job: Job):

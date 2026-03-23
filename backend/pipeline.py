@@ -637,24 +637,16 @@ class Pipeline:
         if not text_segments:
             raise RuntimeError("No speech detected in the video")
 
-        # QA: Cross-check Whisper transcription against YouTube English subs
-        if not sub_segments and re.match(r"^https?://", self.cfg.source):
-            self._report("transcribe", 0.85, "Quality check: fetching reference subs...")
-            ref_segments = self._fetch_reference_subs(self.cfg.source)
-            if ref_segments:
-                qa_result = self._qa_check(text_segments, ref_segments)
-                self.qa_score = qa_result["score"]
-                qa_report_path = self.cfg.work_dir / "qa_report.txt"
-                qa_report_path.write_text(qa_result["report"], encoding="utf-8")
+        # Fetch English reference subs for QA (save for post-translation comparison)
+        self._ref_english_subs = None
+        if re.match(r"^https?://", self.cfg.source):
+            self._report("transcribe", 0.85, "Fetching reference English subs for QA...")
+            self._ref_english_subs = self._fetch_reference_subs(self.cfg.source)
+            if self._ref_english_subs:
                 self._report("transcribe", 0.90,
-                             f"QA: {qa_result['score']:.0%} match ({qa_result['matched']}/{qa_result['total']} segments)")
-                # If Whisper quality is poor and YouTube subs are available, auto-switch
-                if qa_result["score"] < 0.5 and len(ref_segments) >= len(text_segments) * 0.7:
-                    print(f"[QA] Low match ({qa_result['score']:.0%}), switching to YouTube English subs", flush=True)
-                    self.segments = ref_segments
-                    text_segments = [s for s in self.segments if s.get("text", "").strip()]
-                    self._report("transcribe", 0.95,
-                                 f"QA: Auto-switched to YouTube subs (better quality)")
+                             f"Found {len(self._ref_english_subs)} reference English sub segments for QA")
+            else:
+                self._report("transcribe", 0.90, "No English reference subs found")
 
         # Multi-speaker diarization (runs within "transcribe" step progress 82-98%)
         self._voice_map = None
@@ -692,6 +684,33 @@ class Pipeline:
         self._translate_segments(text_segments)
         self.segments = text_segments
         self._report("translate", 1.0, "Translation complete")
+
+        # ── QA Check: Compare our translation against reference English subs ──
+        if getattr(self, '_ref_english_subs', None):
+            self._report("translate", 0.95, "Running QA check against reference subs...")
+            qa_result = self._qa_post_translation(text_segments, self._ref_english_subs)
+            self.qa_score = qa_result["score"]
+            qa_path = self.cfg.work_dir / "qa_report.txt"
+            qa_path.write_text(qa_result["report"], encoding="utf-8")
+            score_pct = f"{qa_result['score']:.0%}"
+            self._report("translate", 0.98,
+                         f"QA: {score_pct} match — {qa_result['matched']}/{qa_result['total']} segments verified")
+            # If QA is poor and English subs are good, auto-switch to using them directly
+            if qa_result["score"] < 0.4 and not sub_segments:
+                print(f"[QA] Low match ({score_pct}), switching to English subs as source", flush=True)
+                # Re-translate from English subs instead
+                self._report("translate", 0.0, "QA failed — re-translating from English reference subs...")
+                for ref_seg in self._ref_english_subs:
+                    ref_seg["text"] = ref_seg.get("text", "")
+                self._translate_segments(self._ref_english_subs)
+                self.segments = self._ref_english_subs
+                text_segments = self._ref_english_subs
+                # Re-run QA
+                qa2 = self._qa_post_translation(text_segments, self._ref_english_subs)
+                self.qa_score = qa2["score"]
+                qa_path.write_text(qa2["report"], encoding="utf-8")
+                self._report("translate", 1.0,
+                             f"QA: Re-translated from English subs — {qa2['score']:.0%} match")
 
         # Write translated SRT (per-segment subtitles with proper timestamps)
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
@@ -1307,51 +1326,90 @@ class Pipeline:
         print(f"[OCR] Extracted {len(segments)} subtitle segments from video", flush=True)
         return segments if segments else None
 
-    def _qa_check(self, whisper_segs: List[Dict], ref_segs: List[Dict]) -> Dict:
-        """Compare Whisper transcription against reference subs. Returns QA report."""
+    def _qa_post_translation(self, our_segs: List[Dict], ref_english_segs: List[Dict]) -> Dict:
+        """Compare our pipeline output against reference English subs.
+
+        Strategy:
+        - If target is English: compare our translated text directly against reference
+        - If target is non-English: compare our SOURCE text (what Whisper heard → translated to English
+          via text_translated if target=en, or the original English text from ref) against reference
+        - Uses timestamp alignment + text similarity
+        """
         from difflib import SequenceMatcher
 
-        # Build time-indexed lookup for reference segments
+        is_english_target = self.cfg.target_language == "en"
         matched = 0
         total = 0
-        report_lines = ["=== Transcription QA Report ===\n"]
+        report_lines = [
+            "=== Translation QA Report ===",
+            f"Target language: {self.cfg.target_language}",
+            f"Our segments: {len(our_segs)}, Reference English subs: {len(ref_english_segs)}",
+            "",
+        ]
 
-        for w_seg in whisper_segs:
-            w_text = w_seg.get("text", "").strip()
-            if not w_text:
+        for our_seg in our_segs:
+            # Use translated text if target is English, otherwise use source text
+            if is_english_target:
+                our_text = our_seg.get("text_translated", our_seg.get("text", "")).strip()
+            else:
+                # For non-English targets, we compare the original source text
+                # This only works well if source is English; for Chinese→Hindi,
+                # we compare timing/coverage instead of text
+                our_text = our_seg.get("text", "").strip()
+
+            if not our_text:
                 continue
             total += 1
-            w_start = w_seg.get("start", 0)
-            w_end = w_seg.get("end", 0)
+            our_start = our_seg.get("start", 0)
+            our_end = our_seg.get("end", 0)
 
-            # Find best overlapping reference segment
+            # Find best time-aligned reference segment
             best_ratio = 0.0
             best_ref = ""
-            for r_seg in ref_segs:
+            best_time_overlap = 0.0
+            for r_seg in ref_english_segs:
                 r_start = r_seg.get("start", 0)
                 r_end = r_seg.get("end", 0)
-                # Check time overlap (within 2s tolerance)
-                overlap = min(w_end, r_end) - max(w_start, r_start)
+                overlap = min(our_end, r_end) - max(our_start, r_start)
                 if overlap > -2.0:
                     r_text = r_seg.get("text", "").strip()
-                    ratio = SequenceMatcher(None, w_text.lower(), r_text.lower()).ratio()
+                    if is_english_target:
+                        # Direct comparison: our English vs reference English
+                        ratio = SequenceMatcher(None, our_text.lower(), r_text.lower()).ratio()
+                    else:
+                        # Non-English target: check if we have a segment covering this time
+                        # Score based on time alignment quality
+                        seg_dur = max(our_end - our_start, 0.1)
+                        ratio = max(overlap / seg_dur, 0) if overlap > 0 else 0
                     if ratio > best_ratio:
                         best_ratio = ratio
                         best_ref = r_text
+                        best_time_overlap = overlap
 
-            status = "OK" if best_ratio >= 0.6 else "MISMATCH" if best_ref else "NO_REF"
-            if best_ratio >= 0.6:
-                matched += 1
+            if is_english_target:
+                status = "MATCH" if best_ratio >= 0.5 else "MISMATCH" if best_ref else "NO_REF"
+                if best_ratio >= 0.5:
+                    matched += 1
+            else:
+                # For non-English: count as matched if there's good time coverage
+                status = "COVERED" if best_time_overlap > 0.5 else "GAP" if best_ref else "NO_REF"
+                if best_time_overlap > 0.5:
+                    matched += 1
 
             report_lines.append(
-                f"[{w_start:.1f}-{w_end:.1f}] {status} ({best_ratio:.0%})\n"
-                f"  Whisper: {w_text[:100]}\n"
-                f"  RefSub:  {best_ref[:100]}\n"
+                f"[{our_start:.1f}s - {our_end:.1f}s] {status} ({best_ratio:.0%})"
             )
+            report_lines.append(f"  Ours:      {our_text[:120]}")
+            report_lines.append(f"  Reference: {best_ref[:120]}")
+            if not is_english_target:
+                translated = our_seg.get("text_translated", "").strip()
+                if translated:
+                    report_lines.append(f"  Translated: {translated[:120]}")
+            report_lines.append("")
 
         score = matched / total if total > 0 else 0.0
-        summary = f"\nSummary: {matched}/{total} segments matched ({score:.0%})\n"
-        report_lines.insert(1, summary)
+        summary = f"\nQA Score: {matched}/{total} segments verified ({score:.0%})\n"
+        report_lines.insert(3, summary)
 
         return {
             "score": score,

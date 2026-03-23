@@ -66,6 +66,7 @@ export interface JobStatus {
     saved_folder?: string | null;
     saved_video?: string | null;
     description?: string | null;
+    qa_score?: number | null;
 }
 
 export interface TranscriptSegment {

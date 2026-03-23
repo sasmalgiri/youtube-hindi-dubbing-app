@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useJobProgress } from '@/hooks/useJobProgress';
@@ -8,6 +8,8 @@ import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
 import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob } from '@/lib/api';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
 export default function JobPage() {
     const params = useParams();
@@ -17,6 +19,8 @@ export default function JobPage() {
     const [uploading, setUploading] = useState(false);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const [qaReport, setQaReport] = useState<string | null>(null);
+    const [qaOpen, setQaOpen] = useState(false);
 
     const handleCancel = async () => {
         if (!confirm('Cancel this dubbing job?')) return;
@@ -174,6 +178,56 @@ export default function JobPage() {
                             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">
                                 {status.config.encode_preset}
                             </span>
+                        )}
+                    </div>
+                )}
+
+                {/* QA Score Badge */}
+                {status?.qa_score != null && (
+                    <div className="glass-card p-4">
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                                <div className={`
+                                    w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold
+                                    ${status.qa_score >= 0.7 ? 'bg-green-500/20 text-green-400' :
+                                      status.qa_score >= 0.4 ? 'bg-amber-500/20 text-amber-400' :
+                                      'bg-red-500/20 text-red-400'}
+                                `}>
+                                    {Math.round(status.qa_score * 100)}%
+                                </div>
+                                <div>
+                                    <p className="text-sm font-medium text-text-primary">
+                                        Translation QA Score
+                                    </p>
+                                    <p className="text-xs text-text-muted">
+                                        {status.qa_score >= 0.7 ? 'Good match with reference subtitles' :
+                                         status.qa_score >= 0.4 ? 'Partial match — some segments may differ' :
+                                         'Low match — auto-corrected using reference subs'}
+                                    </p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={async () => {
+                                    if (!qaReport) {
+                                        try {
+                                            const res = await fetch(`${API_BASE}/api/jobs/${jobId}/qa`);
+                                            if (res.ok) {
+                                                const data = await res.json();
+                                                setQaReport(data.report);
+                                            }
+                                        } catch {}
+                                    }
+                                    setQaOpen(!qaOpen);
+                                }}
+                                className="text-xs text-primary hover:text-primary-light transition-colors"
+                            >
+                                {qaOpen ? 'Hide Report' : 'View Report'}
+                            </button>
+                        </div>
+                        {qaOpen && qaReport && (
+                            <pre className="mt-3 p-3 rounded-lg bg-black/30 text-xs text-text-secondary overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap font-mono">
+                                {qaReport}
+                            </pre>
                         )}
                     </div>
                 )}
