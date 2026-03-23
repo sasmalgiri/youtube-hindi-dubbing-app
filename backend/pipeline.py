@@ -884,13 +884,21 @@ class Pipeline:
                 return str(path)
         return None
 
+    def _get_cookies_args(self) -> list:
+        """Get yt-dlp cookie arguments: use cookies file if available, otherwise none."""
+        cookies_file = self._find_cookies_file()
+        if cookies_file:
+            return ["--cookies", cookies_file]
+        # No cookies file found — skip cookies (browser cookie extraction fails
+        # when the browser is running due to SQLite DB lock)
+        return []
+
     def _ingest_source(self, src: str) -> Path:
         if re.match(r"^https?://", src):
             out_tpl = str(self.cfg.work_dir / "source.%(ext)s")
 
-            # Check for cookies file (needed on Colab/servers)
-            cookies_file = self._find_cookies_file()
-            cookies_args = ["--cookies", cookies_file] if cookies_file else []
+            # Get cookie args (file or browser fallback)
+            cookies_args = self._get_cookies_args()
 
             # Enable Node.js runtime for YouTube extraction (required since yt-dlp 2025+)
             node_path = self._find_executable("node")
@@ -1099,8 +1107,7 @@ class Pipeline:
             return None  # Local file, no YouTube subs
 
         lang = self.cfg.source_language if self.cfg.source_language != "auto" else "en"
-        cookies_file = self._find_cookies_file()
-        cookies_args = ["--cookies", cookies_file] if cookies_file else []
+        cookies_args = self._get_cookies_args()
 
         sub_dir = self.cfg.work_dir / "subs"
         sub_dir.mkdir(exist_ok=True)
