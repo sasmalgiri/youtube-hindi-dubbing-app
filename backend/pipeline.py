@@ -3719,13 +3719,52 @@ class Pipeline:
         return adjusted
 
     # ── Audio mixing ─────────────────────────────────────────────────────
+    def _separate_background(self, audio_raw: Path) -> Path:
+        """Use demucs to extract instrumental/background track (no vocals).
+        Returns path to the no-vocals audio file, or audio_raw as fallback."""
+        bg_path = self.cfg.work_dir / "background_music.wav"
+        if bg_path.exists():
+            return bg_path
+        try:
+            import demucs.separate
+            print("[DEMUCS] Separating vocals from background music...", flush=True)
+            demucs.separate.main([
+                "--two-stems", "vocals",
+                "-n", "htdemucs",
+                "-o", str(self.cfg.work_dir / "demucs_out"),
+                str(audio_raw),
+            ])
+            # demucs outputs: demucs_out/htdemucs/<filename>/no_vocals.wav
+            stem_name = audio_raw.stem  # "audio_raw"
+            no_vocals = self.cfg.work_dir / "demucs_out" / "htdemucs" / stem_name / "no_vocals.wav"
+            if no_vocals.exists():
+                # Convert to our standard format
+                subprocess.run(
+                    [self._ffmpeg, "-y", "-i", str(no_vocals),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     "-acodec", "pcm_s16le", str(bg_path)],
+                    check=True, capture_output=True,
+                )
+                # Clean up demucs output folder to save space
+                import shutil
+                shutil.rmtree(self.cfg.work_dir / "demucs_out", ignore_errors=True)
+                print(f"[DEMUCS] Background track extracted: {bg_path}", flush=True)
+                return bg_path
+            else:
+                print(f"[DEMUCS] no_vocals.wav not found, falling back to raw audio", flush=True)
+        except Exception as e:
+            print(f"[DEMUCS] Separation failed: {e}, falling back to raw audio", flush=True)
+        return audio_raw
+
     def _mix_audio(self, original: Path, tts: Path, original_vol: float) -> Path:
+        # Use background-only track (no vocals) instead of full original
+        bg_track = self._separate_background(original)
         mixed = self.cfg.work_dir / "audio_mixed.wav"
         subprocess.run(
             [
                 self._ffmpeg, "-y",
                 "-i", str(tts),
-                "-i", str(original),
+                "-i", str(bg_track),
                 "-filter_complex",
                 f"[1:a]volume={original_vol}[orig];[0:a][orig]amix=inputs=2:duration=first:dropout_transition=2[out]",
                 "-map", "[out]",
@@ -3784,15 +3823,16 @@ class Pipeline:
         self._report("assemble", 0.2, "Placing audio segments on timeline...")
         dubbed_audio = self._build_timeline_no_cut(fitted, total_video_duration, prefix="fast_")
 
-        # Mix with original audio if requested
+        # Mix with original background music (vocals removed) if requested
         if self.cfg.mix_original and audio_raw and audio_raw.exists():
-            self._report("assemble", 0.6, "Mixing with original audio...")
+            self._report("assemble", 0.6, "Separating background music & mixing...")
+            bg_track = self._separate_background(audio_raw)
             mixed_audio = self.cfg.work_dir / "fast_mixed.wav"
             vol = self.cfg.original_volume
             subprocess.run(
                 [self._ffmpeg, "-y",
                  "-i", str(dubbed_audio),
-                 "-i", str(audio_raw),
+                 "-i", str(bg_track),
                  "-filter_complex",
                  f"[1:a]volume={vol}[bg];[0:a][bg]amix=inputs=2:duration=longest",
                  "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),

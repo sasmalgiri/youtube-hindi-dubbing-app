@@ -332,11 +332,11 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                         </div>
                     </div>
 
-                    {/* Mix Original Audio */}
+                    {/* Mix Background Music */}
                     <div className="flex items-center justify-between">
                         <div>
-                            <p className="text-sm text-text-primary">Mix Original Audio</p>
-                            <p className="text-xs text-text-muted">Blend original audio softly behind the dubbed voice</p>
+                            <p className="text-sm text-text-primary">Mix Background Music</p>
+                            <p className="text-xs text-text-muted">Keep original background music (vocals removed) behind dubbed voice</p>
                         </div>
                         <button
                             onClick={() => update({ mix_original: !settings.mix_original })}
@@ -352,11 +352,11 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                         </button>
                     </div>
 
-                    {/* Original Volume */}
+                    {/* Music Volume */}
                     {settings.mix_original && (
                         <div className="animate-slide-up">
                             <label className="label mb-2 block">
-                                Original Volume: <span className="text-primary-light">{Math.round(settings.original_volume * 100)}%</span>
+                                Music Volume: <span className="text-primary-light">{Math.round(settings.original_volume * 100)}%</span>
                             </label>
                             <input
                                 type="range"
