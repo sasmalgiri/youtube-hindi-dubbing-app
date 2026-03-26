@@ -7,7 +7,7 @@ import LanguageSelector, { LANGUAGES } from '@/components/LanguageSelector';
 import SettingsPanel, { type DubbingSettings } from '@/components/SettingsPanel';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
-import { createJob, createJobUpload, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
+import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
 
 
 export default function HomePage() {
@@ -107,6 +107,22 @@ export default function HomePage() {
         router.push('/batch');
     }, [sourceLanguage, targetLanguage, settings, router]);
 
+    const handleSrtSubmit = useCallback(async (srtFile: File, videoSource: { url?: string; file?: File }) => {
+        setSubmitting(true);
+        setError(null);
+        try {
+            const { id } = await createJobWithSrt(srtFile, {
+                source_language: sourceLanguage,
+                target_language: targetLanguage,
+                ...settings,
+            }, videoSource);
+            router.push(`/jobs/${id}`);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Failed to start SRT dubbing');
+            setSubmitting(false);
+        }
+    }, [sourceLanguage, targetLanguage, settings, router]);
+
     return (
         <div className="min-h-screen">
             {/* Hero Section */}
@@ -123,7 +139,7 @@ export default function HomePage() {
                     </div>
 
                     {/* URL Input */}
-                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} />
+                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} onSrtSubmit={handleSrtSubmit} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} />
 
                     {/* Saved Links */}
                     <div className="mt-4">

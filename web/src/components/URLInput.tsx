@@ -4,19 +4,20 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { extractYouTubeId, isValidYouTubeUrl, getThumbnailUrl } from '@/lib/utils';
 import { addLink, type LinkPreset } from '@/lib/api';
 
-type InputMode = 'url' | 'upload' | 'batch';
+type InputMode = 'url' | 'upload' | 'batch' | 'srt';
 
 interface URLInputProps {
     onSubmit: (url: string) => void;
     onFileSubmit: (file: File) => void;
     onBatchSubmit?: (urls: string[]) => void;
+    onSrtSubmit?: (srtFile: File, videoSource: { url?: string; file?: File }) => void;
     disabled?: boolean;
     url?: string;
     onUrlChange?: (url: string) => void;
     getPreset?: () => LinkPreset;
 }
 
-export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabled, url: controlledUrl, onUrlChange, getPreset }: URLInputProps) {
+export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, disabled, url: controlledUrl, onUrlChange, getPreset }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
     const [internalUrl, setInternalUrl] = useState('');
 
@@ -29,6 +30,14 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
     const [dragOver, setDragOver] = useState(false);
     const [batchText, setBatchText] = useState('');
     const fileInputRef = useRef<HTMLInputElement>(null);
+
+    // SRT mode state
+    const [srtFile, setSrtFile] = useState<File | null>(null);
+    const [srtVideoFile, setSrtVideoFile] = useState<File | null>(null);
+    const [srtVideoUrl, setSrtVideoUrl] = useState('');
+    const [srtVideoMode, setSrtVideoMode] = useState<'url' | 'file'>('url');
+    const srtFileInputRef = useRef<HTMLInputElement>(null);
+    const srtVideoFileInputRef = useRef<HTMLInputElement>(null);
 
     const videoId = extractYouTubeId(url);
     const isValid = isValidYouTubeUrl(url);
@@ -95,6 +104,22 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
         }
     }, []);
 
+    const handleSrtSubmit = useCallback(() => {
+        if (!srtFile || disabled) return;
+        const videoSource: { url?: string; file?: File } = {};
+        if (srtVideoMode === 'url' && srtVideoUrl.trim()) {
+            videoSource.url = srtVideoUrl.trim();
+        } else if (srtVideoMode === 'file' && srtVideoFile) {
+            videoSource.file = srtVideoFile;
+        }
+        if (!videoSource.url && !videoSource.file) return;
+        onSrtSubmit?.(srtFile, videoSource);
+    }, [srtFile, srtVideoMode, srtVideoUrl, srtVideoFile, disabled, onSrtSubmit]);
+
+    const srtVideoReady = srtVideoMode === 'url'
+        ? isValidYouTubeUrl(srtVideoUrl)
+        : !!srtVideoFile;
+
     const formatFileSize = (bytes: number) => {
         if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
         if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -148,6 +173,22 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
                         <path d="M10 13l-2 2 2 2" /><path d="M14 17l2-2-2-2" />
                     </svg>
                     Batch URLs
+                </button>
+                <button
+                    onClick={() => setMode('srt')}
+                    className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+                        mode === 'srt'
+                            ? 'bg-primary text-white shadow-sm'
+                            : 'text-text-secondary hover:text-text-primary'
+                    }`}
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <polyline points="14 2 14 8 20 8" />
+                        <line x1="16" y1="13" x2="8" y2="13" />
+                        <line x1="16" y1="17" x2="8" y2="17" />
+                    </svg>
+                    SRT Dub
                 </button>
             </div>
 
@@ -372,6 +413,140 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, disabl
                                     <line x1="12" y1="3" x2="12" y2="15" />
                                 </svg>
                                 Upload &amp; Start Dubbing
+                            </>
+                        )}
+                    </button>
+                </>
+            )}
+
+            {/* SRT Dub Mode */}
+            {mode === 'srt' && (
+                <>
+                    <div className="glass-card p-4 space-y-4">
+                        <p className="text-sm text-text-secondary">
+                            Upload a translated SRT file with a video source. Skips transcription &amp; translation — goes straight to voice synthesis.
+                        </p>
+
+                        {/* SRT File Upload */}
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">Translated SRT File</label>
+                            <input
+                                ref={srtFileInputRef}
+                                type="file"
+                                accept=".srt"
+                                onChange={(e) => setSrtFile(e.target.files?.[0] || null)}
+                                className="hidden"
+                            />
+                            <div
+                                onClick={() => srtFileInputRef.current?.click()}
+                                className={`cursor-pointer border-2 border-dashed rounded-xl p-4 text-center transition-all ${
+                                    srtFile
+                                        ? 'border-green-500/50 bg-green-500/5'
+                                        : 'border-border hover:border-primary/50 hover:bg-primary/5'
+                                }`}
+                            >
+                                {srtFile ? (
+                                    <div className="flex items-center justify-center gap-2">
+                                        <svg className="text-green-400" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M20 6 9 17l-5-5" />
+                                        </svg>
+                                        <span className="text-sm text-text-primary font-medium">{srtFile.name}</span>
+                                        <span className="text-xs text-text-muted">({formatFileSize(srtFile.size)})</span>
+                                    </div>
+                                ) : (
+                                    <p className="text-sm text-text-muted">Click to select .srt file</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Video Source Toggle */}
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">Video Source</label>
+                            <div className="flex gap-1 p-0.5 rounded-lg bg-background/50 border border-border mb-3">
+                                <button
+                                    onClick={() => setSrtVideoMode('url')}
+                                    className={`flex-1 py-1.5 px-3 rounded-md text-xs font-medium transition-all ${
+                                        srtVideoMode === 'url'
+                                            ? 'bg-primary/20 text-primary'
+                                            : 'text-text-secondary hover:text-text-primary'
+                                    }`}
+                                >
+                                    YouTube URL
+                                </button>
+                                <button
+                                    onClick={() => setSrtVideoMode('file')}
+                                    className={`flex-1 py-1.5 px-3 rounded-md text-xs font-medium transition-all ${
+                                        srtVideoMode === 'file'
+                                            ? 'bg-primary/20 text-primary'
+                                            : 'text-text-secondary hover:text-text-primary'
+                                    }`}
+                                >
+                                    Upload Video
+                                </button>
+                            </div>
+
+                            {srtVideoMode === 'url' ? (
+                                <input
+                                    type="text"
+                                    value={srtVideoUrl}
+                                    onChange={(e) => setSrtVideoUrl(e.target.value)}
+                                    placeholder="Paste YouTube URL..."
+                                    className="input-field w-full px-4 py-3 text-sm"
+                                    disabled={disabled}
+                                />
+                            ) : (
+                                <>
+                                    <input
+                                        ref={srtVideoFileInputRef}
+                                        type="file"
+                                        accept="video/*"
+                                        onChange={(e) => setSrtVideoFile(e.target.files?.[0] || null)}
+                                        className="hidden"
+                                    />
+                                    <div
+                                        onClick={() => srtVideoFileInputRef.current?.click()}
+                                        className={`cursor-pointer border-2 border-dashed rounded-xl p-4 text-center transition-all ${
+                                            srtVideoFile
+                                                ? 'border-green-500/50 bg-green-500/5'
+                                                : 'border-border hover:border-primary/50 hover:bg-primary/5'
+                                        }`}
+                                    >
+                                        {srtVideoFile ? (
+                                            <div className="flex items-center justify-center gap-2">
+                                                <svg className="text-green-400" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                    <path d="M20 6 9 17l-5-5" />
+                                                </svg>
+                                                <span className="text-sm text-text-primary font-medium">{srtVideoFile.name}</span>
+                                                <span className="text-xs text-text-muted">({formatFileSize(srtVideoFile.size)})</span>
+                                            </div>
+                                        ) : (
+                                            <p className="text-sm text-text-muted">Click to select video file</p>
+                                        )}
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+
+                    <button
+                        onClick={handleSrtSubmit}
+                        disabled={!srtFile || !srtVideoReady || disabled}
+                        className="btn-primary w-full py-4 text-base font-semibold flex items-center justify-center gap-2"
+                    >
+                        {disabled ? (
+                            <>
+                                <svg className="animate-spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                                </svg>
+                                Processing...
+                            </>
+                        ) : (
+                            <>
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="m5 8 6 4-6 4V8Z" />
+                                    <path d="m13 8 6 4-6 4V8Z" />
+                                </svg>
+                                Start SRT Dubbing
                             </>
                         )}
                     </button>

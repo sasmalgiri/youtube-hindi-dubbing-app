@@ -760,6 +760,14 @@ class Pipeline:
                          f"Transcription complete — {len(text_segments)} segments{speaker_note}. Download SRT to translate.")
             return
 
+        # Save source SRT for training data collection
+        from srt_utils import write_srt as _write_srt_src
+        source_srt = self.cfg.work_dir / "transcript_source.srt"
+        if not source_srt.exists():
+            has_speakers = any("speaker_id" in s for s in text_segments)
+            _write_srt_src(text_segments, source_srt, text_key="text",
+                           include_speaker=has_speakers)
+
         self._check_cancelled()
 
         # Step 4: Translate — cache: _cache_translate.json exists
@@ -885,6 +893,35 @@ class Pipeline:
         shutil.copy2(srt_translated, out_srt)
 
         self._report("assemble", 1.0, "Done!")
+
+    def download_and_extract(self):
+        """Run only the download + audio extraction steps (steps 1-2).
+        Sets self.video_title. Used when an external SRT is provided."""
+        self._ensure_ffmpeg()
+
+        # Step 1: Download / ingest
+        video_path = self._find_cached_video()
+        if video_path:
+            self._report("download", 1.0, f"[cached] Using existing: {video_path.name}")
+            if not self.video_title:
+                self.video_title = video_path.stem
+        else:
+            self._report("download", 0.0, "Downloading video...")
+            video_path = self._ingest_source(self.cfg.source)
+            self._report("download", 1.0, f"Downloaded: {video_path.name}")
+
+        self._check_cancelled()
+
+        # Step 2: Extract audio
+        audio_raw = self.cfg.work_dir / "audio_raw.wav"
+        if audio_raw.exists() and audio_raw.stat().st_size > 0:
+            self._report("extract", 1.0, "[cached] Audio already extracted")
+        else:
+            self._report("extract", 0.0, "Extracting audio...")
+            self._extract_audio(video_path)
+            self._report("extract", 1.0, "Audio extracted")
+
+        self._check_cancelled()
 
     def run_from_srt(self, translated_srt_path: Path):
         """Resume pipeline from an uploaded translated SRT — runs TTS + assembly only."""
@@ -2298,6 +2335,10 @@ class Pipeline:
             self._report("translate", 0.05, "Using Ollama (local LLM) for translation...")
             self._translate_segments_ollama(segments)
             return
+        elif engine == "google_polish":
+            self._report("translate", 0.02, "Using Google Translate + LLM Polish...")
+            self._translate_segments_google_polish(segments)
+            return
         elif engine == "google":
             self._report("translate", 0.1, "Using Google Translate...")
             self._translate_segments_google(segments)
@@ -2672,6 +2713,165 @@ class Pipeline:
             seg["text_translated"] = self._translate_single_fallback(seg["text"])
             self._report("translate", 0.1 + 0.9 * ((i + 1) / len(segments)),
                          f"Translated {i + 1}/{len(segments)} segments")
+
+    def _translate_segments_google_polish(self, segments):
+        """Two-stage translation: Google Translate (fast) → LLM polish (natural).
+
+        Stage 1: Google Translate for all segments (fast, free, reliable)
+        Stage 2: LLM (Groq/Gemini/SambaNova) polishes into natural spoken Hindi
+        """
+        from deep_translator import GoogleTranslator
+
+        total = len(segments)
+        target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+
+        # ── Stage 1: Google Translate (fast bulk) ─────────────────────────
+        self._report("translate", 0.02, f"Stage 1/2: Google Translate → {target_name} ({total} segments)...")
+        src = self.cfg.source_language if self.cfg.source_language != "auto" else "auto"
+        translator = GoogleTranslator(source=src, target=self.cfg.target_language)
+
+        for i, seg in enumerate(segments):
+            try:
+                seg["text_translated"] = translator.translate(seg["text"]) or seg["text"]
+            except Exception:
+                seg["text_translated"] = seg["text"]
+            if (i + 1) % 20 == 0 or i == total - 1:
+                self._report("translate", 0.02 + 0.38 * ((i + 1) / total),
+                             f"Stage 1/2: Google Translate {i + 1}/{total}")
+
+        self._report("translate", 0.40, "Stage 1 complete. Starting LLM polish...")
+
+        # ── Stage 2: LLM Polish ──────────────────────────────────────────
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+        sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
+        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+        is_hindi = self.cfg.target_language in ("hi", "hi-IN")
+
+        if is_hindi:
+            polish_system = (
+                "You are a Hindi dubbing polish expert. You receive Google-translated Hindi text that is "
+                "grammatically correct but sounds robotic and formal.\n\n"
+                "Your job: REWRITE each line to sound like NATURAL, daily-spoken, punchy Hindi narration.\n\n"
+                "RULES:\n"
+                "1. Keep the SAME meaning — don't add or remove information\n"
+                "2. Make it sound like a Hindi YouTuber narrating a story — dramatic, gripping, engaging\n"
+                "3. Replace formal/textbook Hindi with colloquial spoken Hindi\n"
+                "4. Use contractions: नहीं→नी, कुछ नहीं→कुछ नी\n"
+                "5. Use तू/तुम, not आप (unless showing respect to elders)\n"
+                "6. Keep English words Indians naturally use: phone, plan, delete, hospital, police, driver\n"
+                "7. Add punch: 'और बस... यहीं से खेल शुरू हुआ' not 'और इसी स्थान से'\n"
+                "8. BANNED words: अतः, किन्तु, तथापि, उक्त, यद्यपि, एवं, आवश्यकता, विक्षिप्त, उत्साहित (use excited)\n"
+                "9. Emotional connectors where natural: 'और भाई सुनो', 'अब यहाँ twist आता है'\n"
+                "10. Output ONLY numbered polished lines. No notes, no explanations.\n"
+            )
+            polish_prefix = (
+                "Polish these Google-translated Hindi lines into natural spoken Hindi narration. "
+                "Each line must sound like it was WRITTEN in Hindi, not translated. "
+                "Keep same meaning, just make it punchy and natural.\n\n"
+                "GOOGLE TRANSLATED:\n"
+            )
+        else:
+            polish_system = (
+                f"You are a {target_name} language polishing expert. You receive Google-translated "
+                f"{target_name} text that is correct but sounds unnatural.\n\n"
+                f"Your job: REWRITE each line to sound like a NATIVE {target_name} speaker talking naturally.\n"
+                f"Keep the SAME meaning. Make it conversational, not formal.\n"
+                f"Output ONLY numbered polished lines. No notes."
+            )
+            polish_prefix = (
+                f"Polish these Google-translated {target_name} lines into natural spoken {target_name}. "
+                f"Same meaning, just more natural and conversational.\n\n"
+                f"GOOGLE TRANSLATED:\n"
+            )
+
+        # Try engines in order: Groq (fastest) → SambaNova → Gemini
+        engine_order = []
+        if groq_key:
+            engine_order.append(("Groq", groq_key))
+        if sambanova_key:
+            engine_order.append(("SambaNova", sambanova_key))
+        if gemini_key:
+            engine_order.append(("Gemini", gemini_key))
+
+        if not engine_order:
+            self._report("translate", 0.95,
+                         "No LLM API keys for polish — using Google Translate as-is")
+            return
+
+        # Polish in batches
+        batch_size = 40
+        total_batches = (total + batch_size - 1) // batch_size
+        engine_idx = 0
+
+        for batch_idx in range(total_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, total)
+            batch = segments[start:end]
+
+            # Build numbered list of Google-translated text
+            lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
+            user_msg = polish_prefix + "\n".join(lines)
+
+            polished = None
+            # Try each engine until one succeeds
+            for attempt in range(len(engine_order)):
+                eidx = (engine_idx + attempt) % len(engine_order)
+                name, key = engine_order[eidx]
+
+                self._report("translate", 0.40 + 0.55 * (batch_idx / total_batches),
+                             f"Stage 2/2: {name} polish — batch {batch_idx + 1}/{total_batches}")
+
+                if name == "Gemini":
+                    try:
+                        from google import genai
+                        client = genai.Client(api_key=key)
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash-preview-05-20",
+                            contents=polish_system + "\n\n" + user_msg)
+                        polished = self._parse_numbered_translations(response.text, len(batch))
+                    except Exception:
+                        continue
+                else:
+                    api_url, model = self.TURBO_ENGINE_CONFIG.get(name, (None, None))
+                    if not api_url:
+                        continue
+                    try:
+                        import requests as _requests
+                        resp = _requests.post(
+                            api_url,
+                            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                            json={
+                                "model": model,
+                                "messages": [
+                                    {"role": "system", "content": polish_system},
+                                    {"role": "user", "content": user_msg},
+                                ],
+                                "temperature": 0.7,
+                                "max_tokens": 8192,
+                            },
+                            timeout=60,
+                        )
+                        resp.raise_for_status()
+                        polished = self._parse_numbered_translations(
+                            resp.json()["choices"][0]["message"]["content"], len(batch))
+                    except Exception:
+                        continue
+
+                if polished:
+                    engine_idx = eidx  # Stick with working engine
+                    break
+
+            if polished:
+                for i, seg in enumerate(batch):
+                    if polished[i]:
+                        seg["text_translated"] = polished[i]
+            # If all engines fail, keep Google Translate output (already set)
+
+            self._report("translate", 0.40 + 0.55 * ((batch_idx + 1) / total_batches),
+                         f"Stage 2/2: Polished batch {batch_idx + 1}/{total_batches}")
+
+        self._report("translate", 0.98, "Google Translate + LLM polish complete!")
 
     def _translate_single_fallback(self, text: str) -> str:
         """Smart fallback: try Ollama (GPU) first, then Google Translate."""

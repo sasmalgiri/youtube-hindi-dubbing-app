@@ -44,6 +44,16 @@ if %errorlevel% neq 0 (
 set PYTHONIOENCODING=utf-8
 chcp 65001 >nul 2>&1
 
+:: Start Hinglish AI Trainer (if project exists)
+set HINGLISH_DIR=%~dp0..\hinglish-ai-model
+if exist "%HINGLISH_DIR%\app.py" (
+    echo  Starting Hinglish AI trainer on http://localhost:8100 ...
+    start "Hinglish AI Trainer" /min cmd /k "cd /d "%HINGLISH_DIR%" && %PYTHON% app.py"
+    echo  [OK] Hinglish AI Trainer starting
+) else (
+    echo  [SKIP] Hinglish AI trainer not found at %HINGLISH_DIR%
+)
+
 :: Start Backend (cmd /k keeps window open if server crashes so you can see the error)
 echo.
 echo  Starting backend server on http://localhost:8000 ...
@@ -69,7 +79,9 @@ echo.
 echo  ============================================
 echo   VoiceDub is running!
 echo.
-echo   Open: http://localhost:3000
+echo   App:      http://localhost:3000
+echo   Backend:  http://localhost:8000
+echo   Trainer:  http://localhost:8100
 echo.
 echo   Close this window to stop all servers.
 echo  ============================================
@@ -83,6 +95,7 @@ echo  Press any key to stop servers...
 pause >nul
 
 :: Cleanup - kill the server windows
+taskkill /fi "WINDOWTITLE eq Hinglish AI Trainer" /f >nul 2>&1
 taskkill /fi "WINDOWTITLE eq VoiceDub Backend" /f >nul 2>&1
 taskkill /fi "WINDOWTITLE eq VoiceDub Frontend" /f >nul 2>&1
 echo  Servers stopped. Goodbye!

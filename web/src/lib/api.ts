@@ -144,6 +144,41 @@ export async function createJobUpload(
     return res.json();
 }
 
+export async function createJobWithSrt(
+    srtFile: File,
+    settings: Omit<JobCreateRequest, 'url'>,
+    videoSource?: { url?: string; file?: File },
+): Promise<{ id: string }> {
+    const form = new FormData();
+    form.append('srt_file', srtFile);
+    if (videoSource?.file) {
+        form.append('video_file', videoSource.file);
+    }
+    if (videoSource?.url) {
+        form.append('url', videoSource.url);
+    }
+    Object.entries(settings).forEach(([key, val]) => {
+        if (val === undefined || val === null) return;
+        if (typeof val === 'boolean') {
+            if (val) form.append(key, 'true');
+            return;
+        }
+        if (Array.isArray(val)) return;
+        form.append(key, String(val));
+    });
+
+    const res = await fetch(`${API_BASE}/api/jobs/with-srt`, {
+        method: 'POST',
+        headers: { ...EXTRA_HEADERS },
+        body: form,
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
+        throw new Error(err.detail || 'Failed to create job with SRT');
+    }
+    return res.json();
+}
+
 export async function getJob(id: string): Promise<JobStatus> {
     const res = await fetch(`${API_BASE}/api/jobs/${id}`, {
         headers: { ...EXTRA_HEADERS },

@@ -37,6 +37,55 @@ from sse_starlette.sse import EventSourceResponse
 
 from pipeline import Pipeline, PipelineConfig, list_voices, DEFAULT_VOICES
 
+# ── Hinglish AI Training Hook ────────────────────────────────────────────────
+HINGLISH_TRAINER_URL = os.environ.get("HINGLISH_TRAINER_URL", "http://localhost:8100")
+
+
+def _send_training_data(source_srt_path: Path, translated_srt_path: Path, source_lang: str = "en"):
+    """Send SRT pair to hinglish-ai-model trainer (fire-and-forget)."""
+    def _send():
+        try:
+            import urllib.request
+            import urllib.error
+            boundary = "----HinglishTrainerBoundary"
+            parts = []
+            for field_name, filepath in [("source_srt", source_srt_path), ("translated_srt", translated_srt_path)]:
+                content = filepath.read_bytes()
+                parts.append(
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="{field_name}"; filename="{filepath.name}"\r\n'
+                    f"Content-Type: application/octet-stream\r\n\r\n"
+                )
+                parts.append(content)
+                parts.append(b"\r\n")
+            # Add source_language field
+            parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="source_language"\r\n\r\n'
+                f"{source_lang}\r\n"
+                f"--{boundary}--\r\n"
+            )
+            body = b""
+            for p in parts:
+                body += p.encode("utf-8") if isinstance(p, str) else p
+
+            req = urllib.request.Request(
+                f"{HINGLISH_TRAINER_URL}/api/upload-translated-srt",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            result = json.loads(resp.read())
+            print(f"[TRAINING] Sent {result.get('extracted', 0)} pairs to trainer "
+                  f"({result.get('total', '?')} total)", flush=True)
+        except Exception as e:
+            # Silently fail — trainer might not be running
+            print(f"[TRAINING] Could not send to trainer: {e}", flush=True)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # ── Types ────────────────────────────────────────────────────────────────────
 
 JobState = Literal["queued", "running", "done", "error", "waiting_for_srt"]
@@ -407,6 +456,22 @@ def _run_job(job: Job, req: JobCreateRequest):
         except Exception as desc_err:
             print(f"[WARN] Failed to generate description: {desc_err}")
 
+        # Send completed translation to hinglish-ai trainer
+        try:
+            work_dir = OUTPUTS / job.id / "work"
+            src_srt = work_dir / "transcript_source.srt"
+            tr_srt = work_dir / f"transcript_{req.target_language}.srt"
+            if not src_srt.exists():
+                # Fallback: look for any cached transcription SRT
+                for f in work_dir.glob("transcript_*.srt"):
+                    if req.target_language not in f.name:
+                        src_srt = f
+                        break
+            if src_srt.exists() and tr_srt.exists():
+                _send_training_data(src_srt, tr_srt, source_lang=req.source_language)
+        except Exception:
+            pass
+
         job.overall_progress = 1.0
         job.state = "done"
         qa_msg = f" (QA: {job.qa_score:.0%})" if job.qa_score is not None else ""
@@ -653,6 +718,198 @@ async def create_job_upload(
     return {"id": job_id}
 
 
+def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
+    """Download/extract the video, then run TTS+assembly from the provided SRT."""
+    job.message = "Waiting in queue..."
+    _pipeline_semaphore.acquire()
+    try:
+        job.state = "running"
+        job.message = "Starting (SRT provided, skipping transcription)..."
+
+        job_dir = OUTPUTS / job.id
+        work_dir = job_dir / "work"
+        out_path = job_dir / "dubbed.mp4"
+
+        voice = req.voice
+        if not voice or voice == "hi-IN-SwaraNeural":
+            voice = DEFAULT_VOICES.get(req.target_language, req.voice)
+
+        cfg = PipelineConfig(
+            source=req.url,
+            work_dir=work_dir,
+            output_path=out_path,
+            source_language=req.source_language,
+            target_language=req.target_language,
+            tts_voice=voice,
+            tts_rate=req.tts_rate,
+            mix_original=req.mix_original,
+            original_volume=req.original_volume,
+            use_chatterbox=req.use_chatterbox,
+            use_elevenlabs=req.use_elevenlabs,
+            use_google_tts=req.use_google_tts,
+            use_coqui_xtts=req.use_coqui_xtts,
+            use_edge_tts=req.use_edge_tts,
+            multi_speaker=req.multi_speaker,
+            audio_priority=req.audio_priority,
+            audio_bitrate=req.audio_bitrate,
+            encode_preset=req.encode_preset,
+        )
+
+        pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
+                           cancel_check=job.cancel_event.is_set)
+
+        # Step 1-2: Download + extract audio (pipeline handles this)
+        pipeline.download_and_extract()
+
+        job.video_title = pipeline.video_title or "Untitled"
+
+        # Step 3-6: Skip transcribe/translate, run TTS + assembly from SRT
+        pipeline.run_from_srt(srt_path)
+
+        if not out_path.exists():
+            raise RuntimeError("Pipeline finished but output file not found")
+
+        job.result_path = out_path
+        job.segments = pipeline.segments
+
+        # Auto-save to titled folder
+        try:
+            _save_to_titled_folder(job)
+        except Exception as save_err:
+            print(f"[WARN] Failed to save to titled folder: {save_err}")
+
+        # Generate YouTube description
+        try:
+            job.description = _generate_youtube_description(job)
+            if job.saved_folder:
+                desc_path = Path(job.saved_folder) / "description.txt"
+                desc_path.write_text(job.description, encoding="utf-8")
+        except Exception:
+            pass
+
+        job.overall_progress = 1.0
+        job.state = "done"
+        job.message = "Complete"
+        job.events.append({"type": "complete", "state": "done"})
+
+        if job.source_url:
+            _mark_url_completed(job.source_url)
+
+    except Exception as e:
+        import traceback
+        try:
+            (OUTPUTS / job.id / "error.log").write_text(
+                f"[SRT-JOB ERROR] {e}\n{traceback.format_exc()}", encoding="utf-8"
+            )
+        except OSError:
+            pass
+        try:
+            job_dir = OUTPUTS / job.id
+            if job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
+        job.state = "error"
+        job.error = str(e)
+        job.message = f"Error: {e}"
+        job.events.append({"type": "complete", "state": "error", "error": str(e)})
+    finally:
+        _pipeline_semaphore.release()
+
+
+@app.post("/api/jobs/with-srt")
+async def create_job_with_srt(
+    srt_file: UploadFile = File(...),
+    url: str = Form(""),
+    video_file: Optional[UploadFile] = File(None),
+    source_language: str = Form("auto"),
+    target_language: str = Form("hi"),
+    asr_model: str = Form("large-v3"),
+    translation_engine: str = Form("auto"),
+    tts_rate: str = Form("+0%"),
+    mix_original: bool = Form(False),
+    original_volume: float = Form(0.10),
+    use_chatterbox: bool = Form(True),
+    use_elevenlabs: bool = Form(False),
+    use_google_tts: bool = Form(False),
+    use_coqui_xtts: bool = Form(False),
+    use_edge_tts: bool = Form(False),
+    multi_speaker: bool = Form(False),
+    audio_priority: bool = Form(True),
+    audio_bitrate: str = Form("192k"),
+    encode_preset: str = Form("veryfast"),
+    voice: str = Form("hi-IN-SwaraNeural"),
+):
+    """Create a dubbing job from a video (URL or file) + pre-translated SRT file.
+    Skips transcription and translation — goes straight to TTS + assembly."""
+    _cleanup_old_jobs()
+
+    if not url and (not video_file or not video_file.filename):
+        raise HTTPException(status_code=400, detail="Provide either a URL or a video file")
+    if not srt_file.filename:
+        raise HTTPException(status_code=400, detail="SRT file is required")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = OUTPUTS / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = job_dir / "work"
+    work_dir.mkdir(exist_ok=True)
+
+    # Determine video source
+    source_url = url.strip()
+    if video_file and video_file.filename:
+        # Save uploaded video
+        ext = Path(video_file.filename).suffix or ".mp4"
+        saved_video_path = work_dir / f"source{ext}"
+        with open(saved_video_path, "wb") as f:
+            while chunk := await video_file.read(1024 * 1024):
+                f.write(chunk)
+        source_url = str(saved_video_path)
+        display_source = f"upload:{video_file.filename}"
+    else:
+        display_source = source_url
+
+    # Save uploaded SRT
+    srt_path = work_dir / "translated_upload.srt"
+    with open(srt_path, "wb") as f:
+        while chunk := await srt_file.read(1024 * 1024):
+            f.write(chunk)
+
+    try:
+        req = JobCreateRequest(
+            url=source_url,
+            source_language=source_language,
+            target_language=target_language,
+            voice=voice,
+            asr_model=asr_model,
+            translation_engine=translation_engine,
+            tts_rate=tts_rate,
+            mix_original=mix_original,
+            original_volume=original_volume,
+            use_chatterbox=use_chatterbox,
+            use_elevenlabs=use_elevenlabs,
+            use_google_tts=use_google_tts,
+            use_coqui_xtts=use_coqui_xtts,
+            use_edge_tts=use_edge_tts,
+            multi_speaker=multi_speaker,
+            audio_priority=audio_priority,
+            audio_bitrate=audio_bitrate,
+            encode_preset=encode_preset,
+        )
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
+    job = Job(id=job_id, source_url=display_source, target_language=target_language)
+    job.original_req = req
+    JOBS[job_id] = job
+
+    t = threading.Thread(target=_run_job_with_srt, args=(job, req, srt_path), daemon=True)
+    t.start()
+
+    return {"id": job_id}
+
+
 def _job_config(job: Job) -> Dict[str, Any]:
     """Extract the config/settings used for this job."""
     req = job.original_req
@@ -672,7 +929,7 @@ def _job_config(job: Job) -> Dict[str, Any]:
         tts = "Edge-TTS"
     engine_labels = {
         "auto": "Auto", "turbo": "Turbo (Groq+SambaNova)", "gemini": "Gemini",
-        "groq": "Groq", "sambanova": "SambaNova",
+        "groq": "Groq", "sambanova": "SambaNova", "google_polish": "Google+LLM Polish",
         "ollama": "Ollama", "google": "Google Translate", "hinglish": "Hinglish AI",
     }
     return {
@@ -720,7 +977,7 @@ async def job_events(job_id: str):
     async def event_generator():
         last_index = 0
         sse_start = time.time()
-        max_sse_secs = 14400  # 4h max SSE connection
+        max_sse_secs = 1440000  # 400h max SSE connection
         while True:
             if time.time() - sse_start > max_sse_secs:
                 yield {"data": json.dumps({"type": "complete", "state": "error", "error": "SSE timeout"})}
@@ -939,6 +1196,12 @@ async def resume_with_srt(job_id: str, file: UploadFile = File(...)):
     except Exception:
         job.state = "waiting_for_srt"  # Revert so user can retry
         raise
+
+    # Send SRT pair to hinglish-ai trainer (fire-and-forget)
+    source_srt = work_dir / "transcript_source.srt"
+    if source_srt.exists():
+        src_lang = job.original_req.source_language if job.original_req else "en"
+        _send_training_data(source_srt, srt_path, source_lang=src_lang)
 
     t = threading.Thread(target=_run_resume, args=(job,), daemon=True)
     t.start()

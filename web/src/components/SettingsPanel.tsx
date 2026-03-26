@@ -177,8 +177,9 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                 </button>
                             ))}
                         </div>
-                        <div className="grid grid-cols-3 gap-2">
+                        <div className="grid grid-cols-4 gap-2">
                             {[
+                                { value: 'google_polish', label: 'Google+Polish', desc: 'Fast Google → LLM polish' },
                                 { value: 'ollama', label: 'Ollama', desc: 'Local LLM (GPU)' },
                                 { value: 'hinglish', label: 'Hinglish AI', desc: 'Custom Hindi model' },
                                 { value: 'google', label: 'Google', desc: 'Free, basic' },
