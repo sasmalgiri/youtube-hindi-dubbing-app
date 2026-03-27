@@ -2545,14 +2545,20 @@ class Pipeline:
             return
 
         # Auto mode: pick best available engine by quality
-        # Quality order: IndicTrans2+Polish > Turbo > GPT-4o > Groq > SambaNova > Gemini
-        #                > Google+Polish > Ollama > IndicTrans2 > Google
+        # Priority: IndicTrans2 → Groq+SambaNova turbo rewrite → Rules  (always when LLM available)
+        #           > Turbo (raw)  > GPT-4o  > Groq  > SambaNova  > Gemini  > Ollama  > IndicTrans2  > Google
         any_llm = groq_key or sambanova_key or gemini_key
         is_hindi = self.cfg.target_language in ("hi", "hi-IN")
 
-        if is_hindi and any_llm:
-            # Best for Hindi: IndicTrans2 meaning model + LLM dubbing rewrite + rules
-            self._report("translate", 0.02, "Auto: IndicTrans2 → LLM → Rules (best Hindi quality)...")
+        if any_llm:
+            # Best quality for any language: IndicTrans2 meaning → LLM turbo rewrite → (Hindi: rules)
+            turbo_label = (
+                " + ".join([n for n, _ in [("Groq", groq_key), ("SambaNova", sambanova_key)] if _])
+                + (" + Gemini" if gemini_key else "")
+            )
+            self._report("translate", 0.02,
+                         f"Auto: IndicTrans2 → {turbo_label} rewrite"
+                         + (" → Rules" if is_hindi else "") + " (best quality)...")
             self._translate_segments_nllb_polish(segments)
         elif len(turbo_engines) >= 2:
             names = " + ".join(e[0] for e in turbo_engines)
@@ -3284,59 +3290,61 @@ class Pipeline:
             )
             polish_prefix = f"Rewrite into natural spoken {target_name}:\n\n"
 
-        engine_order = []
+        llm_engines = []
         if groq_key:
-            engine_order.append(("Groq", groq_key))
+            llm_engines.append(("Groq", groq_key))
         if sambanova_key:
-            engine_order.append(("SambaNova", sambanova_key))
+            llm_engines.append(("SambaNova", sambanova_key))
         if gemini_key:
-            engine_order.append(("Gemini", gemini_key))
+            llm_engines.append(("Gemini", gemini_key))
 
-        if engine_order:
+        if llm_engines:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             batch_size = 40
-            total_batches = (total + batch_size - 1) // batch_size
-            engine_idx = 0
+            batches = []
+            for bi in range(0, total, batch_size):
+                batches.append(segments[bi: bi + batch_size])
+            total_batches = len(batches)
 
-            for batch_idx in range(total_batches):
-                start = batch_idx * batch_size
-                end = min(start + batch_size, total)
-                batch = segments[start:end]
+            engine_label = (
+                " + ".join(n for n, _ in llm_engines[:2]) + " turbo"
+                if len(llm_engines) >= 2 else llm_engines[0][0]
+            )
+            self._report("translate", 0.35,
+                         f"Stage 2/3: {engine_label} dubbing rewrite ({total_batches} batches)...")
 
+            def _polish_one_batch(batch, batch_idx):
+                """Send batch to ALL available engines simultaneously, return first good result."""
                 lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
                 user_msg = polish_prefix + "\n".join(lines)
 
-                polished = None
-                for attempt in range(len(engine_order)):
-                    eidx = (engine_idx + attempt) % len(engine_order)
-                    name, key = engine_order[eidx]
-
-                    self._report("translate", 0.35 + 0.50 * (batch_idx / total_batches),
-                                 f"Stage 2/3: {name} dubbing rewrite — batch {batch_idx + 1}/{total_batches}")
-
+                def _call_llm(name, key):
                     if name == "Gemini":
                         try:
                             from google import genai
                             client = genai.Client(api_key=key)
-                            response = client.models.generate_content(
+                            r = client.models.generate_content(
                                 model="gemini-2.5-flash-preview-05-20",
                                 contents=polish_system + "\n\n" + user_msg)
-                            polished = self._parse_numbered_translations(response.text, len(batch))
+                            return self._parse_numbered_translations(r.text, len(batch))
                         except Exception:
-                            continue
+                            return None
                     else:
                         api_url, model = self.TURBO_ENGINE_CONFIG.get(name, (None, None))
                         if not api_url:
-                            continue
+                            return None
                         try:
-                            import requests as _requests
-                            resp = _requests.post(
+                            import requests as _req
+                            resp = _req.post(
                                 api_url,
-                                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                headers={"Authorization": f"Bearer {key}",
+                                         "Content-Type": "application/json"},
                                 json={
                                     "model": model,
                                     "messages": [
                                         {"role": "system", "content": polish_system},
-                                        {"role": "user", "content": user_msg},
+                                        {"role": "user",   "content": user_msg},
                                     ],
                                     "temperature": 0.7,
                                     "max_tokens": 8192,
@@ -3344,22 +3352,38 @@ class Pipeline:
                                 timeout=60,
                             )
                             resp.raise_for_status()
-                            polished = self._parse_numbered_translations(
+                            return self._parse_numbered_translations(
                                 resp.json()["choices"][0]["message"]["content"], len(batch))
                         except Exception:
-                            continue
+                            return None
 
+                # Race all engines — take whichever responds first with a valid result
+                with ThreadPoolExecutor(max_workers=len(llm_engines)) as inner_pool:
+                    futs = {inner_pool.submit(_call_llm, n, k): n for n, k in llm_engines}
+                    for fut in as_completed(futs):
+                        result = fut.result()
+                        if result:
+                            return result, futs[fut]
+                return None, None
+
+            # Process all batches in parallel (one worker per engine count)
+            completed = 0
+            with ThreadPoolExecutor(max_workers=max(2, len(llm_engines))) as outer_pool:
+                batch_futures = {
+                    outer_pool.submit(_polish_one_batch, batch, bi): (bi, batch)
+                    for bi, batch in enumerate(batches)
+                }
+                for fut in as_completed(batch_futures):
+                    bi, batch = batch_futures[fut]
+                    polished, winner = fut.result()
                     if polished:
-                        engine_idx = eidx
-                        break
-
-                if polished:
-                    for i, seg in enumerate(batch):
-                        if polished[i]:
-                            seg["text_translated"] = polished[i]
-
-                self._report("translate", 0.35 + 0.50 * ((batch_idx + 1) / total_batches),
-                             f"Stage 2/3: Rewritten batch {batch_idx + 1}/{total_batches}")
+                        for i, seg in enumerate(batch):
+                            if polished[i]:
+                                seg["text_translated"] = polished[i]
+                    completed += 1
+                    self._report("translate", 0.35 + 0.50 * (completed / total_batches),
+                                 f"Stage 2/3: {completed}/{total_batches} batches rewritten"
+                                 + (f" ({winner})" if winner else ""))
         else:
             self._report("translate", 0.85, "No LLM API keys — skipping dubbing rewrite")
 
