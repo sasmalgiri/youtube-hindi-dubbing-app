@@ -44,6 +44,7 @@ export interface JobCreateRequest {
     fast_assemble?: boolean;
     dub_chain?: string[];
     enable_manual_review?: boolean;
+    use_whisperx?: boolean;
 }
 
 export interface JobConfig {
@@ -72,6 +73,8 @@ export interface JobStatus {
     saved_video?: string | null;
     description?: string | null;
     qa_score?: number | null;
+    chain_languages?: string[];
+    chain_parent_id?: string | null;
 }
 
 export interface TranscriptSegment {
@@ -272,6 +275,7 @@ export interface LinkPreset {
     fast_assemble?: boolean;
     dub_chain?: string[];
     enable_manual_review?: boolean;
+    use_whisperx?: boolean;
 }
 
 export interface SavedLink {

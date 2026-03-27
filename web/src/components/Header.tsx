@@ -12,7 +12,7 @@ export default function Header() {
                     </svg>
                 </div>
                 <h1 className="text-lg font-semibold text-text-primary">
-                    Voice<span className="text-primary">Dub</span>
+                    Hindi<span className="text-primary">Dub</span>
                 </h1>
             </div>
             <div className="ml-auto flex items-center gap-4">

@@ -36,6 +36,7 @@ export interface BatchSettings {
     tts_rate?: string;
     mix_original?: boolean;
     original_volume?: number;
+    use_cosyvoice?: boolean;
     use_chatterbox?: boolean;
     use_elevenlabs?: boolean;
     use_google_tts?: boolean;
@@ -45,8 +46,14 @@ export interface BatchSettings {
     audio_bitrate?: string;
     encode_preset?: string;
     prefer_youtube_subs?: boolean;
+    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
+    fast_assemble?: boolean;
+    split_duration?: number;
+    dub_chain?: string[];
+    enable_manual_review?: boolean;
+    use_whisperx?: boolean;
 }
 
 interface UseBatchManagerReturn {
@@ -222,6 +229,7 @@ export function useBatchManager(): UseBatchManagerReturn {
                     tts_rate: settings.tts_rate,
                     mix_original: settings.mix_original,
                     original_volume: settings.original_volume,
+                    use_cosyvoice: settings.use_cosyvoice,
                     use_chatterbox: settings.use_chatterbox,
                     use_elevenlabs: settings.use_elevenlabs,
                     use_google_tts: settings.use_google_tts,
@@ -231,8 +239,14 @@ export function useBatchManager(): UseBatchManagerReturn {
                     audio_bitrate: settings.audio_bitrate,
                     encode_preset: settings.encode_preset,
                     prefer_youtube_subs: settings.prefer_youtube_subs,
+                    use_yt_translate: settings.use_yt_translate,
                     multi_speaker: settings.multi_speaker,
                     transcribe_only: settings.transcribe_only,
+                    fast_assemble: settings.fast_assemble,
+                    split_duration: settings.split_duration,
+                    dub_chain: settings.dub_chain,
+                    enable_manual_review: settings.enable_manual_review,
+                    use_whisperx: settings.use_whisperx,
                 };
 
                 const { id } = isRemoteBackend

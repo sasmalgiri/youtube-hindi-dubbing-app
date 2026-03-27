@@ -65,3 +65,7 @@ Thumbs.db
 
 # Whisper models (large files)
 *.bin
+backend/dubbed_outputs/
+backend/cache/
+backend/work/
+backend/jobs.db

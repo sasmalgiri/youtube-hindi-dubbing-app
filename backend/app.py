@@ -148,6 +148,7 @@ class JobCreateRequest(BaseModel):
     fast_assemble: bool = True  # True = instant in-memory, False = ffmpeg (preserves overlaps)
     dub_chain: List[str] = []  # e.g. ["en", "hi"] — dub through languages sequentially
     enable_manual_review: bool = True  # Save manual_review_queue.json for failed segments
+    use_whisperx: bool = False         # WhisperX forced alignment for tighter word timestamps
 
     @validator("target_language", "source_language")
     def validate_language(cls, v):
@@ -490,6 +491,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             split_duration=req.split_duration,
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
+            use_whisperx=req.use_whisperx,
         )
 
         get_metrics().record_job_start(job.id, req.url, {
@@ -705,11 +707,24 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             audio_bitrate=req.audio_bitrate, encode_preset=req.encode_preset,
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
+            use_whisperx=req.use_whisperx,
         )
         p = Pipeline(cfg, on_progress=callback, cancel_check=job.cancel_event.is_set)
         p.video_title = job.video_title
         p.run()
         job.result_path = out_path
+        job.segments = p.segments
+        job.video_title = p.video_title or job.video_title
+        job.qa_score = p.qa_score
+        job.overall_progress = 1.0
+        job.state = "done"
+        job.message = "Complete"
+        job.events.append({"type": "complete", "state": "done"})
+        try:
+            _save_to_titled_folder(job)
+        except Exception:
+            pass
+        _store.save(job)
         return
 
     # Step 3: Process each part
@@ -1122,6 +1137,7 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             encode_preset=req.encode_preset,
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
+            use_whisperx=req.use_whisperx,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -1514,6 +1530,7 @@ def _run_resume(job: Job):
             fast_assemble=req.fast_assemble if req else True,
             multi_speaker=req.multi_speaker if req else False,
             enable_manual_review=req.enable_manual_review if req else True,
+            use_whisperx=req.use_whisperx if req else False,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -1701,6 +1718,7 @@ def delete_job(job_id: str):
         job.error = "Cancelled by user"
         job.message = "Cancelled"
         job.events.append({"type": "complete", "state": "error", "error": "Cancelled by user"})
+        _store.save(job)
         # Clean up work directory
         job_dir = OUTPUTS / job_id
         if job_dir.exists():

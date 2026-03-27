@@ -119,11 +119,21 @@ class JobStore:
         for job_id, state, payload_json in rows:
             try:
                 data = json.loads(payload_json)
+                # Normalise state: treat null/unknown values as error
+                effective_state = data.get("state") or state or "error"
+                if effective_state not in ("queued", "running", "done", "error", "waiting_for_srt"):
+                    effective_state = "error"
+                data["state"] = effective_state
                 # Jobs that were 'running' when the server died → mark as error
-                if state == "running":
+                if effective_state == "running":
                     data["state"] = "error"
                     data["message"] = "Server restarted while job was running"
                     data["error"] = "Server restarted"
+                # Ensure list fields default correctly when missing from old DB rows
+                if not isinstance(data.get("chain_languages"), list):
+                    data["chain_languages"] = []
+                if not isinstance(data.get("segments"), list):
+                    data["segments"] = []
                 job = _dict_to_job(data)
                 jobs_dict[job_id] = job
                 loaded += 1
