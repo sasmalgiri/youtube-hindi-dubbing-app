@@ -139,6 +139,7 @@ class JobCreateRequest(BaseModel):
     audio_priority: bool = True
     audio_bitrate: str = "192k"
     encode_preset: str = "veryfast"
+    split_duration: int = 0     # 0 = no split, 30/40 = split every N minutes
     dub_chain: List[str] = []  # e.g. ["en", "hi"] — dub through languages sequentially
 
     @validator("target_language", "source_language")
@@ -343,6 +344,54 @@ def _generate_youtube_description(job: Job) -> str:
     )
 
 
+def _get_video_duration(ffmpeg_path: str, video_path: Path) -> float:
+    """Get video duration in seconds using ffprobe."""
+    ffprobe = str(Path(ffmpeg_path).parent / "ffprobe") if Path(ffmpeg_path).is_absolute() else "ffprobe"
+    if sys.platform == "win32" and not ffprobe.endswith(".exe"):
+        ffprobe += ".exe"
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _split_video(ffmpeg_path: str, video_path: Path, split_mins: int, output_dir: Path) -> List[Path]:
+    """Split a video into parts of split_mins duration each. Returns list of part paths."""
+    duration = _get_video_duration(ffmpeg_path, video_path)
+    if duration <= 0:
+        return [video_path]
+
+    split_secs = split_mins * 60
+    num_parts = math.ceil(duration / split_secs)
+
+    if num_parts <= 1:
+        return [video_path]
+
+    parts = []
+    for i in range(num_parts):
+        start = i * split_secs
+        part_path = output_dir / f"part_{i+1:02d}.mp4"
+        cmd = [
+            ffmpeg_path, "-y",
+            "-ss", f"{start:.3f}",
+            "-i", str(video_path),
+            "-t", f"{split_secs:.3f}",
+            "-c", "copy",  # stream copy = instant, no re-encode
+            "-avoid_negative_ts", "make_zero",
+            str(part_path),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        if part_path.exists() and part_path.stat().st_size > 0:
+            parts.append(part_path)
+
+    return parts
+
+
 def _make_progress_callback(job: Job):
     """Create a progress callback that updates the job and appends events."""
     def callback(step: str, progress: float, message: str):
@@ -379,6 +428,11 @@ def _run_job(job: Job, req: JobCreateRequest):
         if not voice or voice == "hi-IN-SwaraNeural":
             voice = DEFAULT_VOICES.get(req.target_language, req.voice)
 
+        # ── SPLIT MODE: Split video into parts and dub each ──────────
+        if req.split_duration > 0:
+            _run_job_split(job, req, voice)
+            return
+
         cfg = PipelineConfig(
             source=req.url,
             work_dir=work_dir,
@@ -403,6 +457,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             audio_priority=req.audio_priority,
             audio_bitrate=req.audio_bitrate,
             encode_preset=req.encode_preset,
+            split_duration=req.split_duration,
         )
 
         pipeline = Pipeline(cfg, on_progress=_make_progress_callback(job),
@@ -505,6 +560,169 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.events.append({"type": "complete", "state": "error", "error": str(e)})
     finally:
         _pipeline_semaphore.release()
+
+
+def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
+    """Split a long video into parts and dub each one separately.
+    Called from within _run_job when split_duration > 0."""
+    import math as _math
+
+    job_dir = OUTPUTS / job.id
+    work_dir = job_dir / "work"
+    work_dir.mkdir(exist_ok=True)
+    split_dir = work_dir / "splits"
+    split_dir.mkdir(exist_ok=True)
+
+    callback = _make_progress_callback(job)
+
+    # Step 1: Download the video first
+    callback("download", 0.0, "Downloading video for splitting...")
+    dl_cfg = PipelineConfig(
+        source=req.url,
+        work_dir=work_dir,
+        output_path=job_dir / "dubbed.mp4",
+        source_language=req.source_language,
+        target_language=req.target_language,
+    )
+    dl_pipeline = Pipeline(dl_cfg, on_progress=callback, cancel_check=job.cancel_event.is_set)
+    dl_pipeline._ensure_ffmpeg()
+    video_path = dl_pipeline._ingest_source(req.url)
+    job.video_title = dl_pipeline.video_title or "Untitled"
+    callback("download", 1.0, f"Downloaded: {video_path.name}")
+
+    if job.cancel_event.is_set():
+        raise RuntimeError("Job cancelled")
+
+    # Step 2: Split the video
+    callback("extract", 0.0, f"Splitting video into {req.split_duration}-min parts...")
+    ffmpeg_path = dl_pipeline._ffmpeg
+    parts = _split_video(ffmpeg_path, video_path, req.split_duration, split_dir)
+    num_parts = len(parts)
+    callback("extract", 1.0, f"Split into {num_parts} parts")
+
+    if num_parts <= 1:
+        # Video is shorter than split duration — run normally
+        callback("extract", 1.0, "Video is shorter than split duration, running as single part...")
+        out_path = job_dir / "dubbed.mp4"
+        cfg = PipelineConfig(
+            source=str(video_path), work_dir=work_dir, output_path=out_path,
+            source_language=req.source_language, target_language=req.target_language,
+            asr_model=req.asr_model, translation_engine=req.translation_engine,
+            tts_voice=voice, tts_rate=req.tts_rate,
+            mix_original=req.mix_original, original_volume=req.original_volume,
+            use_chatterbox=req.use_chatterbox, use_elevenlabs=req.use_elevenlabs,
+            use_google_tts=req.use_google_tts, use_coqui_xtts=req.use_coqui_xtts,
+            use_edge_tts=req.use_edge_tts, prefer_youtube_subs=False,
+            multi_speaker=req.multi_speaker, audio_priority=req.audio_priority,
+            audio_bitrate=req.audio_bitrate, encode_preset=req.encode_preset,
+        )
+        p = Pipeline(cfg, on_progress=callback, cancel_check=job.cancel_event.is_set)
+        p.video_title = job.video_title
+        p.run()
+        job.result_path = out_path
+        return
+
+    # Step 3: Process each part
+    output_parts = []
+    for part_idx, part_path in enumerate(parts):
+        part_num = part_idx + 1
+        part_label = f"Part {part_num}/{num_parts}"
+
+        if job.cancel_event.is_set():
+            raise RuntimeError("Job cancelled")
+
+        # Create work dir for this part
+        part_work = work_dir / f"part_{part_num:02d}"
+        part_work.mkdir(exist_ok=True)
+        part_out = job_dir / f"dubbed_part{part_num:02d}.mp4"
+
+        # Progress callback that scales to this part's position in overall progress
+        # Parts share transcribe (25%), translate (15%), synthesize (30%), assemble (10%) = 80%
+        # Download (15%) + extract (5%) already done = 20%
+        part_base = 0.20 + 0.80 * (part_idx / num_parts)
+        part_range = 0.80 / num_parts
+
+        def _part_callback(step, progress, message, _base=part_base, _range=part_range, _label=part_label):
+            step_w = STEP_WEIGHTS.get(step, 0.1)
+            step_idx = STEP_ORDER.index(step) if step in STEP_ORDER else 0
+            # Map step progress to overall part progress
+            step_offset = sum(STEP_WEIGHTS.get(s, 0) for s in STEP_ORDER[:step_idx])
+            overall = _base + _range * (step_offset + step_w * progress) / 0.80
+            job.current_step = step
+            job.step_progress = progress
+            job.overall_progress = min(overall, 0.99)
+            job.message = f"[{_label}] {message}"
+            job.events.append({
+                "step": step,
+                "progress": round(progress, 3),
+                "overall": round(job.overall_progress, 3),
+                "message": f"[{_label}] {message}",
+            })
+
+        _part_callback("transcribe", 0.0, f"Starting {part_label}...")
+
+        cfg = PipelineConfig(
+            source=str(part_path),
+            work_dir=part_work,
+            output_path=part_out,
+            source_language=req.source_language,
+            target_language=req.target_language,
+            asr_model=req.asr_model,
+            translation_engine=req.translation_engine,
+            tts_voice=voice,
+            tts_rate=req.tts_rate,
+            mix_original=req.mix_original,
+            original_volume=req.original_volume,
+            use_chatterbox=req.use_chatterbox,
+            use_elevenlabs=req.use_elevenlabs,
+            use_google_tts=req.use_google_tts,
+            use_coqui_xtts=req.use_coqui_xtts,
+            use_edge_tts=req.use_edge_tts,
+            prefer_youtube_subs=False,
+            multi_speaker=req.multi_speaker,
+            audio_priority=req.audio_priority,
+            audio_bitrate=req.audio_bitrate,
+            encode_preset=req.encode_preset,
+        )
+
+        pipeline = Pipeline(cfg, on_progress=_part_callback,
+                           cancel_check=job.cancel_event.is_set)
+        pipeline.video_title = f"{job.video_title} - Part {part_num}"
+        pipeline.run()
+
+        if part_out.exists():
+            output_parts.append((part_num, part_out))
+            print(f"[SPLIT] Part {part_num}/{num_parts} complete: {part_out}", flush=True)
+
+    if not output_parts:
+        raise RuntimeError("No parts were produced")
+
+    # Save all parts to titled folders
+    base_title = job.video_title
+    saved_parts = []
+    for part_num, part_out in output_parts:
+        part_title = f"{base_title} - Part {part_num}"
+        dest_dir = SAVED_DIR / part_title
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / f"{part_title}.mp4"
+        shutil.copy2(part_out, dest_path)
+        saved_parts.append(str(dest_path))
+        print(f"[SPLIT] Saved: {dest_path}", flush=True)
+
+    job.result_path = output_parts[0][1]  # First part for preview
+    job.saved_folder = str(SAVED_DIR / base_title) if len(output_parts) == 1 else str(SAVED_DIR)
+    job.saved_video = saved_parts[0] if saved_parts else None
+    job.overall_progress = 1.0
+    job.state = "done"
+    job.message = f"Complete — {len(output_parts)} parts dubbed!"
+    job.events.append({"type": "complete", "state": "done",
+                       "parts": len(output_parts)})
+
+    # Cleanup work directory
+    try:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _queue_chain_next(parent_job: Job):
@@ -647,19 +865,20 @@ async def create_job_upload(
     asr_model: str = Form("large-v3"),
     translation_engine: str = Form("auto"),
     tts_rate: str = Form("+0%"),
-    mix_original: bool = Form(False),
+    mix_original: str = Form("false"),
     original_volume: float = Form(0.10),
-    use_chatterbox: bool = Form(True),
-    use_elevenlabs: bool = Form(False),
-    use_google_tts: bool = Form(False),
-    use_coqui_xtts: bool = Form(False),
-    use_edge_tts: bool = Form(False),
-    prefer_youtube_subs: bool = Form(False),
-    multi_speaker: bool = Form(False),
-    transcribe_only: bool = Form(False),
-    audio_priority: bool = Form(True),
+    use_chatterbox: str = Form("true"),
+    use_elevenlabs: str = Form("false"),
+    use_google_tts: str = Form("false"),
+    use_coqui_xtts: str = Form("false"),
+    use_edge_tts: str = Form("false"),
+    prefer_youtube_subs: str = Form("false"),
+    multi_speaker: str = Form("false"),
+    transcribe_only: str = Form("false"),
+    audio_priority: str = Form("true"),
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
+    split_duration: int = Form(0),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from an uploaded video file."""
@@ -681,6 +900,9 @@ async def create_job_upload(
             f.write(chunk)
 
     # Validate via Pydantic BEFORE adding to JOBS to prevent zombie entries
+    def _bool(v) -> bool:
+        return str(v).lower() in ("true", "1", "yes")
+
     try:
         req = JobCreateRequest(
             url=str(saved_path),
@@ -690,19 +912,20 @@ async def create_job_upload(
             asr_model=asr_model,
             translation_engine=translation_engine,
             tts_rate=tts_rate,
-            mix_original=mix_original,
+            mix_original=_bool(mix_original),
             original_volume=original_volume,
-            use_chatterbox=use_chatterbox,
-            use_elevenlabs=use_elevenlabs,
-            use_google_tts=use_google_tts,
-            use_coqui_xtts=use_coqui_xtts,
-            use_edge_tts=use_edge_tts,
-            prefer_youtube_subs=prefer_youtube_subs,
-            multi_speaker=multi_speaker,
-            transcribe_only=transcribe_only,
-            audio_priority=audio_priority,
+            use_chatterbox=_bool(use_chatterbox),
+            use_elevenlabs=_bool(use_elevenlabs),
+            use_google_tts=_bool(use_google_tts),
+            use_coqui_xtts=_bool(use_coqui_xtts),
+            use_edge_tts=_bool(use_edge_tts),
+            prefer_youtube_subs=_bool(prefer_youtube_subs),
+            multi_speaker=_bool(multi_speaker),
+            transcribe_only=_bool(transcribe_only),
+            audio_priority=_bool(audio_priority),
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
+            split_duration=split_duration,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -827,17 +1050,18 @@ async def create_job_with_srt(
     asr_model: str = Form("large-v3"),
     translation_engine: str = Form("auto"),
     tts_rate: str = Form("+0%"),
-    mix_original: bool = Form(False),
+    mix_original: str = Form("false"),
     original_volume: float = Form(0.10),
-    use_chatterbox: bool = Form(True),
-    use_elevenlabs: bool = Form(False),
-    use_google_tts: bool = Form(False),
-    use_coqui_xtts: bool = Form(False),
-    use_edge_tts: bool = Form(False),
-    multi_speaker: bool = Form(False),
-    audio_priority: bool = Form(True),
+    use_chatterbox: str = Form("true"),
+    use_elevenlabs: str = Form("false"),
+    use_google_tts: str = Form("false"),
+    use_coqui_xtts: str = Form("false"),
+    use_edge_tts: str = Form("false"),
+    multi_speaker: str = Form("false"),
+    audio_priority: str = Form("true"),
     audio_bitrate: str = Form("192k"),
     encode_preset: str = Form("veryfast"),
+    split_duration: int = Form(0),
     voice: str = Form("hi-IN-SwaraNeural"),
 ):
     """Create a dubbing job from a video (URL or file) + pre-translated SRT file.
@@ -875,6 +1099,9 @@ async def create_job_with_srt(
         while chunk := await srt_file.read(1024 * 1024):
             f.write(chunk)
 
+    def _bool(v) -> bool:
+        return str(v).lower() in ("true", "1", "yes")
+
     try:
         req = JobCreateRequest(
             url=source_url,
@@ -884,17 +1111,18 @@ async def create_job_with_srt(
             asr_model=asr_model,
             translation_engine=translation_engine,
             tts_rate=tts_rate,
-            mix_original=mix_original,
+            mix_original=_bool(mix_original),
             original_volume=original_volume,
-            use_chatterbox=use_chatterbox,
-            use_elevenlabs=use_elevenlabs,
-            use_google_tts=use_google_tts,
-            use_coqui_xtts=use_coqui_xtts,
-            use_edge_tts=use_edge_tts,
-            multi_speaker=multi_speaker,
-            audio_priority=audio_priority,
+            use_chatterbox=_bool(use_chatterbox),
+            use_elevenlabs=_bool(use_elevenlabs),
+            use_google_tts=_bool(use_google_tts),
+            use_coqui_xtts=_bool(use_coqui_xtts),
+            use_edge_tts=_bool(use_edge_tts),
+            multi_speaker=_bool(multi_speaker),
+            audio_priority=_bool(audio_priority),
             audio_bitrate=audio_bitrate,
             encode_preset=encode_preset,
+            split_duration=split_duration,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)

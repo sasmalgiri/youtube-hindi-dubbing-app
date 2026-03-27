@@ -24,6 +24,174 @@ from typing import Callable, Dict, List, Optional
 from srt_utils import write_srt
 
 
+# ── IndicTrans2 / NLLB Singleton (Stage A: Meaning Model) ────────────────────
+_meaning_model = None
+_meaning_tokenizer = None
+_meaning_processor = None  # IndicProcessor for IndicTrans2
+_meaning_engine = None     # "indictrans2" or "nllb"
+_meaning_lock = __import__("threading").Lock()
+
+
+def _get_meaning_model():
+    """Lazy-load the meaning model on GPU (singleton).
+    Tries IndicTrans2 first (better quality), falls back to NLLB-1.3B (ungated).
+    """
+    global _meaning_model, _meaning_tokenizer, _meaning_processor, _meaning_engine
+    if _meaning_model is not None:
+        return _meaning_model, _meaning_tokenizer, _meaning_processor, _meaning_engine
+    with _meaning_lock:
+        if _meaning_model is not None:
+            return _meaning_model, _meaning_tokenizer, _meaning_processor, _meaning_engine
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Try IndicTrans2 first
+        try:
+            from IndicTransToolkit.processor import IndicProcessor
+            model_name = "ai4bharat/indictrans2-en-indic-1B"
+            print(f"[MeaningModel] Loading {model_name}...", flush=True)
+            _meaning_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            _meaning_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, trust_remote_code=True, torch_dtype=torch.float16
+            ).to(device)
+            _meaning_model.eval()
+            _meaning_processor = IndicProcessor(inference=True)
+            _meaning_engine = "indictrans2"
+            vram = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+            print(f"[MeaningModel] IndicTrans2 loaded. VRAM: {vram:.0f} MB", flush=True)
+        except Exception as e:
+            # Fallback to NLLB
+            print(f"[MeaningModel] IndicTrans2 unavailable ({e}), falling back to NLLB...", flush=True)
+            model_name = "facebook/nllb-200-1.3B"
+            _meaning_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            _meaning_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, torch_dtype=torch.float16
+            ).to(device)
+            _meaning_model.eval()
+            _meaning_processor = None
+            _meaning_engine = "nllb"
+            vram = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+            print(f"[MeaningModel] NLLB-1.3B loaded. VRAM: {vram:.0f} MB", flush=True)
+
+        return _meaning_model, _meaning_tokenizer, _meaning_processor, _meaning_engine
+
+
+# Language code mapping (ISO 639-1 → FLORES-200 / IndicTrans2)
+_LANG_MAP = {
+    "hi": "hin_Deva", "hi-IN": "hin_Deva",
+    "bn": "ben_Beng", "ta": "tam_Taml", "te": "tel_Telu",
+    "mr": "mar_Deva", "gu": "guj_Gujr", "kn": "kan_Knda",
+    "ml": "mal_Mlym", "pa": "pan_Guru", "ur": "urd_Arab",
+    "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn",
+    "de": "deu_Latn", "ja": "jpn_Jpan", "ko": "kor_Hang",
+    "zh": "zho_Hans", "ar": "arb_Arab", "pt": "por_Latn",
+    "ru": "rus_Cyrl", "it": "ita_Latn",
+}
+
+
+# ── Hindi Dubbing Rule Engine v1 ────────────────────────────────────────────
+class HindiRuleEngine:
+    """Post-processing rules for Hindi dubbing output."""
+
+    # Formal/bookish words to flag or replace
+    BANNED_FORMAL = {
+        "अतः", "किन्तु", "तथापि", "उक्त", "यद्यपि", "एवं",
+        "आवश्यकता", "विक्षिप्त", "अथवा", "तत्पश्चात", "अतएव",
+        "निश्चितरूपेण", "सर्वप्रथम", "तदुपरांत", "यथा", "किंचित",
+        "प्रतीत", "उपरोक्त", "निम्नलिखित", "संदर्भ",
+    }
+
+    # Replacements: formal → spoken
+    FORMAL_TO_SPOKEN = {
+        "किन्तु": "लेकिन",
+        "परन्तु": "लेकिन",
+        "अतः": "इसलिए",
+        "एवं": "और",
+        "अथवा": "या",
+        "तथा": "और",
+        "यद्यपि": "भले ही",
+        "तथापि": "फिर भी",
+        "आवश्यकता": "ज़रूरत",
+        "सम्पूर्ण": "पूरा",
+        "अत्यंत": "बहुत",
+        "अत्यधिक": "बहुत ज़्यादा",
+        "प्रारम्भ": "शुरू",
+        "समाप्त": "खत्म",
+        "उत्तर": "जवाब",
+        "प्रश्न": "सवाल",
+        "विद्यमान": "मौजूद",
+        "कदापि": "कभी",
+        "सर्वदा": "हमेशा",
+    }
+
+    # Protected terms (names, brands, powers) — user can extend
+    _glossary: dict  # english_term -> hindi_term (or keep as-is)
+
+    def __init__(self, glossary: dict = None):
+        self._glossary = glossary or {}
+
+    def apply(self, text: str, max_chars: int = 0) -> str:
+        """Apply all rules to a translated Hindi line."""
+        text = self._replace_formal(text)
+        text = self._apply_glossary(text)
+        text = self._normalize_punctuation(text)
+        if max_chars > 0:
+            text = self._compress(text, max_chars)
+        return text.strip()
+
+    def _replace_formal(self, text: str) -> str:
+        for formal, spoken in self.FORMAL_TO_SPOKEN.items():
+            text = text.replace(formal, spoken)
+        return text
+
+    def _apply_glossary(self, text: str) -> str:
+        for eng, hi in self._glossary.items():
+            text = text.replace(eng, hi)
+        return text
+
+    def _normalize_punctuation(self, text: str) -> str:
+        # Normalize Hindi punctuation
+        text = text.replace("।।", "।")
+        text = text.replace("  ", " ")
+        # Remove trailing spaces before punctuation
+        text = re.sub(r'\s+([।!?,])', r'\1', text)
+        return text
+
+    def _compress(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        # Simple compression: remove filler words
+        fillers = ["बस ", "तो ", "ना ", "जो कि ", "असल में ", "वास्तव में "]
+        for filler in fillers:
+            if len(text) <= max_chars:
+                break
+            text = text.replace(filler, "", 1)
+        return text
+
+    def count_formal_words(self, text: str) -> list:
+        """Return list of banned formal words found in text."""
+        return [w for w in self.BANNED_FORMAL if w in text]
+
+    def score_naturalness(self, text: str) -> float:
+        """Score 0-1 how natural/spoken the Hindi is (1=very natural)."""
+        score = 1.0
+        formal_count = len(self.count_formal_words(text))
+        score -= formal_count * 0.15
+        # Long sentences are harder to speak
+        if len(text) > 200:
+            score -= 0.1
+        # Very long words suggest Sanskrit compounds
+        words = text.split()
+        long_words = [w for w in words if len(w) > 15]
+        score -= len(long_words) * 0.05
+        return max(0.0, min(1.0, score))
+
+
+# Global rule engine instance
+_hindi_rules = HindiRuleEngine()
+
+
 # ── Types ────────────────────────────────────────────────────────────────────
 ProgressCallback = Callable[[str, float, str], None]
 
@@ -208,7 +376,7 @@ class PipelineConfig:
     source_language: str = "auto"
     target_language: str = "hi"
     asr_model: str = "large-v3"
-    translation_engine: str = "auto"   # auto, gemini, groq, ollama, google, hinglish
+    translation_engine: str = "auto"   # auto, gemini, groq, ollama, google, hinglish, nllb, nllb_polish, google_polish
     tts_voice: str = "hi-IN-SwaraNeural"
     tts_rate: str = "+0%"
     mix_original: bool = False
@@ -228,6 +396,8 @@ class PipelineConfig:
     audio_bitrate: str = "192k"
     # Video encode speed: ultrafast (fastest), veryfast, fast, medium (best quality)
     encode_preset: str = "veryfast"
+    # Split long videos into parts (0 = no split, 30/40 = split every N minutes)
+    split_duration: int = 0
 
 
 class Pipeline:
@@ -881,8 +1051,11 @@ class Pipeline:
         if video_duration <= 0:
             raise RuntimeError(f"Could not determine video duration for {video_path.name}")
 
-        if self.cfg.audio_priority:
-            self._report("assemble", 0.05, "Fast assembly: audio priority mode (stream copy)...")
+        use_fast = self.cfg.audio_priority or len(tts_data) > 1000
+
+        if use_fast:
+            reason = "audio priority mode" if self.cfg.audio_priority else f"fast mode ({len(tts_data)} segments)"
+            self._report("assemble", 0.05, f"Fast assembly: {reason} (stream copy)...")
             self._assemble_fast_mux(video_path, audio_raw, tts_data, video_duration)
         else:
             self._report("assemble", 0.1, "Assembling: video will adapt to match natural audio...")
@@ -1032,8 +1205,13 @@ class Pipeline:
         if video_duration <= 0:
             raise RuntimeError(f"Could not determine video duration for {video_path.name}")
 
-        if self.cfg.audio_priority:
-            self._report("assemble", 0.05, "Fast assembly: audio priority mode (stream copy)...")
+        # For very large segment counts (1000+), always use fast mux to avoid
+        # creating thousands of individual video clips which is slow and error-prone
+        use_fast = self.cfg.audio_priority or len(tts_data) > 1000
+
+        if use_fast:
+            reason = "audio priority mode" if self.cfg.audio_priority else f"fast mode ({len(tts_data)} segments)"
+            self._report("assemble", 0.05, f"Fast assembly: {reason} (stream copy)...")
             self._assemble_fast_mux(video_path, audio_raw, tts_data, video_duration)
         else:
             self._report("assemble", 0.1, "Assembling: video will adapt to match natural audio...")
@@ -2335,6 +2513,14 @@ class Pipeline:
             self._report("translate", 0.05, "Using Ollama (local LLM) for translation...")
             self._translate_segments_ollama(segments)
             return
+        elif engine == "nllb_polish":
+            self._report("translate", 0.02, "Using NLLB → LLM → Rules pipeline...")
+            self._translate_segments_nllb_polish(segments)
+            return
+        elif engine == "nllb":
+            self._report("translate", 0.02, "Using NLLB-200 (local meaning model)...")
+            self._translate_segments_nllb(segments)
+            return
         elif engine == "google_polish":
             self._report("translate", 0.02, "Using Google Translate + LLM Polish...")
             self._translate_segments_google_polish(segments)
@@ -2873,6 +3059,187 @@ class Pipeline:
 
         self._report("translate", 0.98, "Google Translate + LLM polish complete!")
 
+    def _translate_segments_nllb(self, segments):
+        """Translate segments using local meaning model (IndicTrans2 or NLLB fallback)."""
+        import torch
+        model, tokenizer, processor, engine = _get_meaning_model()
+        tgt_code = _LANG_MAP.get(self.cfg.target_language, "hin_Deva")
+
+        total = len(segments)
+        batch_size = 16
+
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch = segments[batch_start:batch_end]
+            texts = [seg["text"].strip() for seg in batch]
+
+            if engine == "indictrans2" and processor is not None:
+                # IndicTrans2: use IndicProcessor for pre/post processing
+                processed = processor.preprocess_batch(texts, src_lang="eng_Latn", tgt_lang=tgt_code)
+                inputs = tokenizer(processed, truncation=True, padding="longest",
+                                   return_tensors="pt", max_length=512)
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    out = model.generate(**inputs, max_length=512, num_beams=5)
+                raw = tokenizer.batch_decode(out, skip_special_tokens=True)
+                translations = processor.postprocess_batch(raw, lang=tgt_code)
+            else:
+                # NLLB: direct tokenize with forced BOS token
+                tgt_token_id = tokenizer.convert_tokens_to_ids(tgt_code)
+                tokenizer.src_lang = "eng_Latn"
+                inputs = tokenizer(texts, return_tensors="pt", padding=True,
+                                   truncation=True, max_length=512)
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    out = model.generate(**inputs, forced_bos_token_id=tgt_token_id, max_length=512)
+                translations = tokenizer.batch_decode(out, skip_special_tokens=True)
+
+            for seg, trans in zip(batch, translations):
+                seg["text_translated"] = trans.strip()
+
+            engine_label = "IndicTrans2" if engine == "indictrans2" else "NLLB"
+            self._report("translate", 0.1 + 0.8 * (batch_end / total),
+                         f"{engine_label} translated {batch_end}/{total} segments")
+
+    def _translate_segments_nllb_polish(self, segments):
+        """Two-stage pipeline: NLLB (meaning) → LLM (dubbing rewrite) → Rules.
+
+        Stage A: NLLB-200-1.3B for faithful meaning transfer (local GPU)
+        Stage B: LLM (Groq/SambaNova/Gemini) for dubbing-style rewrite
+        Stage C: Rule engine for cleanup (formal→spoken, glossary, compression)
+        """
+        total = len(segments)
+
+        # ── Stage A: NLLB meaning translation ────────────────────────────
+        self._report("translate", 0.02, f"Stage 1/3: NLLB meaning transfer ({total} segments)...")
+        self._translate_segments_nllb(segments)
+        self._report("translate", 0.35, "Stage 1/3 complete. Starting dubbing rewrite...")
+
+        # ── Stage B: LLM dubbing polish ──────────────────────────────────
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+        sambanova_key = os.environ.get("SAMBANOVA_API_KEY", "").strip()
+        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+        is_hindi = self.cfg.target_language in ("hi", "hi-IN")
+
+        if is_hindi:
+            polish_system = (
+                "You are a Hindi DUBBING REWRITER. You receive literal machine-translated Hindi.\n\n"
+                "Your job: REWRITE each line into NATURAL, daily-spoken, PUNCHY Hindi dubbing lines.\n\n"
+                "RULES:\n"
+                "1. Keep the EXACT SAME meaning — don't add/remove information\n"
+                "2. Make it sound like a Hindi YouTuber narrating — dramatic, gripping\n"
+                "3. Replace ALL formal/bookish Hindi with spoken Hindi\n"
+                "4. Use contractions: नहीं→नी, कुछ नहीं→कुछ नी, मुझे→मुझे/मुझको\n"
+                "5. Use तू/तुम for peers/enemies, आप only for elders\n"
+                "6. Keep English words Indians use: phone, plan, delete, hospital, police, power\n"
+                "7. Add punch: 'और बस... यहीं से खेल शुरू हुआ' not 'और इसी स्थान से'\n"
+                "8. BANNED: अतः, किन्तु, तथापि, उक्त, यद्यपि, एवं, आवश्यकता, विक्षिप्त\n"
+                "9. Lines must be EASY TO SAY ALOUD — short breaths, natural rhythm\n"
+                "10. Output ONLY numbered rewritten lines. No notes.\n"
+            )
+            polish_prefix = (
+                "REWRITE these literal Hindi translations into natural spoken Hindi dubbing lines. "
+                "Same meaning, but punchy, emotional, speakable.\n\n"
+                "LITERAL HINDI:\n"
+            )
+        else:
+            target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+            polish_system = (
+                f"You are a {target_name} dubbing rewriter. Rewrite literal translations into "
+                f"natural, conversational {target_name}. Keep meaning, improve flow.\n"
+                f"Output ONLY numbered rewritten lines."
+            )
+            polish_prefix = f"Rewrite into natural spoken {target_name}:\n\n"
+
+        engine_order = []
+        if groq_key:
+            engine_order.append(("Groq", groq_key))
+        if sambanova_key:
+            engine_order.append(("SambaNova", sambanova_key))
+        if gemini_key:
+            engine_order.append(("Gemini", gemini_key))
+
+        if engine_order:
+            batch_size = 40
+            total_batches = (total + batch_size - 1) // batch_size
+            engine_idx = 0
+
+            for batch_idx in range(total_batches):
+                start = batch_idx * batch_size
+                end = min(start + batch_size, total)
+                batch = segments[start:end]
+
+                lines = [f"{i+1}. {seg['text_translated']}" for i, seg in enumerate(batch)]
+                user_msg = polish_prefix + "\n".join(lines)
+
+                polished = None
+                for attempt in range(len(engine_order)):
+                    eidx = (engine_idx + attempt) % len(engine_order)
+                    name, key = engine_order[eidx]
+
+                    self._report("translate", 0.35 + 0.50 * (batch_idx / total_batches),
+                                 f"Stage 2/3: {name} dubbing rewrite — batch {batch_idx + 1}/{total_batches}")
+
+                    if name == "Gemini":
+                        try:
+                            from google import genai
+                            client = genai.Client(api_key=key)
+                            response = client.models.generate_content(
+                                model="gemini-2.5-flash-preview-05-20",
+                                contents=polish_system + "\n\n" + user_msg)
+                            polished = self._parse_numbered_translations(response.text, len(batch))
+                        except Exception:
+                            continue
+                    else:
+                        api_url, model = self.TURBO_ENGINE_CONFIG.get(name, (None, None))
+                        if not api_url:
+                            continue
+                        try:
+                            import requests as _requests
+                            resp = _requests.post(
+                                api_url,
+                                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                json={
+                                    "model": model,
+                                    "messages": [
+                                        {"role": "system", "content": polish_system},
+                                        {"role": "user", "content": user_msg},
+                                    ],
+                                    "temperature": 0.7,
+                                    "max_tokens": 8192,
+                                },
+                                timeout=60,
+                            )
+                            resp.raise_for_status()
+                            polished = self._parse_numbered_translations(
+                                resp.json()["choices"][0]["message"]["content"], len(batch))
+                        except Exception:
+                            continue
+
+                    if polished:
+                        engine_idx = eidx
+                        break
+
+                if polished:
+                    for i, seg in enumerate(batch):
+                        if polished[i]:
+                            seg["text_translated"] = polished[i]
+
+                self._report("translate", 0.35 + 0.50 * ((batch_idx + 1) / total_batches),
+                             f"Stage 2/3: Rewritten batch {batch_idx + 1}/{total_batches}")
+        else:
+            self._report("translate", 0.85, "No LLM API keys — skipping dubbing rewrite")
+
+        # ── Stage C: Rule engine cleanup ─────────────────────────────────
+        if is_hindi:
+            self._report("translate", 0.90, "Stage 3/3: Rule engine cleanup...")
+            for seg in segments:
+                seg["text_translated"] = _hindi_rules.apply(seg["text_translated"])
+            self._report("translate", 0.95, "Stage 3/3: Rules applied")
+
+        self._report("translate", 0.98, "NLLB → LLM → Rules pipeline complete!")
+
     def _translate_single_fallback(self, text: str) -> str:
         """Smart fallback: try Ollama (GPU) first, then Google Translate."""
         if self._ollama_available():
@@ -3035,13 +3402,23 @@ class Pipeline:
         timeline = bytearray(total_samples * bytes_per_frame)
 
         for seg in tts_data:
+            wav_path = seg.get("wav")
+            if not wav_path or not Path(wav_path).exists():
+                continue
             start_byte = int(seg["start"] * self.SAMPLE_RATE) * bytes_per_frame
+            if start_byte < 0:
+                start_byte = 0
+            if start_byte >= len(timeline):
+                continue  # segment starts after timeline end
 
-            with wave.open(str(seg["wav"]), 'rb') as w:
-                # Validate format matches timeline expectations
-                if w.getnchannels() != self.N_CHANNELS or w.getsampwidth() != 2:
-                    continue  # Skip mismatched format to avoid corrupted audio
-                raw = w.readframes(w.getnframes())
+            try:
+                with wave.open(str(wav_path), 'rb') as w:
+                    # Validate format matches timeline expectations
+                    if w.getnchannels() != self.N_CHANNELS or w.getsampwidth() != 2:
+                        continue  # Skip mismatched format to avoid corrupted audio
+                    raw = w.readframes(w.getnframes())
+            except Exception:
+                continue  # Skip unreadable WAV files
 
             end_byte = min(start_byte + len(raw), len(timeline))
             copy_len = end_byte - start_byte
@@ -3182,10 +3559,10 @@ class Pipeline:
         filter_parts = []
         valid_idx = 0
         for seg in tts_data:
-            wav_path = seg["wav"]
-            if not Path(wav_path).exists():
+            wav_path = seg.get("wav")
+            if not wav_path or not Path(wav_path).exists():
                 continue
-            delay_ms = int(seg["start"] * 1000)
+            delay_ms = max(0, int(seg["start"] * 1000))
             inputs.extend(["-i", str(wav_path)])
             idx = len(inputs) // 2 - 1  # input index
             filter_parts.append(

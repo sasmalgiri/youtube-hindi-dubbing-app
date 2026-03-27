@@ -20,6 +20,7 @@ export interface DubbingSettings {
     audio_priority: boolean;
     audio_bitrate: string;
     encode_preset: string;
+    split_duration: number;
     dub_chain: string[];
 }
 
@@ -179,7 +180,9 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                         </div>
                         <div className="grid grid-cols-4 gap-2">
                             {[
+                                { value: 'nllb_polish', label: 'NLLB+Polish', desc: 'NLLB → LLM → Rules' },
                                 { value: 'google_polish', label: 'Google+Polish', desc: 'Fast Google → LLM polish' },
+                                { value: 'nllb', label: 'NLLB', desc: 'Local meaning model' },
                                 { value: 'ollama', label: 'Ollama', desc: 'Local LLM (GPU)' },
                                 { value: 'hinglish', label: 'Hinglish AI', desc: 'Custom Hindi model' },
                                 { value: 'google', label: 'Google', desc: 'Free, basic' },
@@ -495,6 +498,33 @@ export default function SettingsPanel({ settings, onChange }: SettingsPanelProps
                                         </button>
                                     ))}
                                 </div>
+                            </div>
+                        </div>
+
+                        {/* Split Long Videos */}
+                        <div>
+                            <p className="text-xs text-text-muted mb-1.5">Split Long Videos</p>
+                            <div className="grid grid-cols-4 gap-2">
+                                {[
+                                    { value: 0, label: 'Off', desc: 'No splitting' },
+                                    { value: 30, label: '30 min', desc: 'Split every 30m' },
+                                    { value: 40, label: '40 min', desc: 'Split every 40m' },
+                                    { value: 60, label: '60 min', desc: 'Split every 1h' },
+                                ].map((m) => (
+                                    <button
+                                        key={m.value}
+                                        onClick={() => update({ split_duration: m.value })}
+                                        className={`
+                                            px-3 py-2 rounded-lg text-xs text-center transition-all border
+                                            ${settings.split_duration === m.value
+                                                ? 'bg-primary/20 border-primary text-primary-light'
+                                                : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                        `}
+                                    >
+                                        <div className="font-medium">{m.label}</div>
+                                        <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                    </button>
+                                ))}
                             </div>
                         </div>
                     </div>

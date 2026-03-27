@@ -39,6 +39,7 @@ export interface JobCreateRequest {
     audio_priority?: boolean;
     audio_bitrate?: string;
     encode_preset?: string;
+    split_duration?: number;
     dub_chain?: string[];
 }
 
@@ -122,9 +123,8 @@ export async function createJobUpload(
     form.append('file', file);
     Object.entries(settings).forEach(([key, val]) => {
         if (val === undefined || val === null) return;
-        // Skip false booleans — FastAPI parses non-empty strings as True
         if (typeof val === 'boolean') {
-            if (val) form.append(key, 'true');
+            form.append(key, val ? 'true' : 'false');
             return;
         }
         // Skip arrays (dub_chain) — not supported by upload endpoint
@@ -160,7 +160,7 @@ export async function createJobWithSrt(
     Object.entries(settings).forEach(([key, val]) => {
         if (val === undefined || val === null) return;
         if (typeof val === 'boolean') {
-            if (val) form.append(key, 'true');
+            form.append(key, val ? 'true' : 'false');
             return;
         }
         if (Array.isArray(val)) return;
