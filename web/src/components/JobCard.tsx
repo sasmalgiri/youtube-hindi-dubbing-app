@@ -64,7 +64,7 @@ export default function JobCard({ job, onDelete }: JobCardProps) {
                 {job.state === 'running' && (
                     <div>
                         <div className="flex items-center justify-between mb-1">
-                            <span className="text-[10px] text-text-muted capitalize">{job.current_step}</span>
+                            <span className="text-[10px] text-text-muted capitalize">{job.current_step || 'Starting...'}</span>
                             <span className="text-[10px] text-text-muted">{Math.round(job.overall_progress * 100)}%</span>
                         </div>
                         <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">

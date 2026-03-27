@@ -832,6 +832,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
                        "parts": len(output_parts)})
     _store.save(job)
 
+    if job.source_url:
+        _mark_url_completed(job.source_url)
+
     # Cleanup work directory
     try:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1444,6 +1447,8 @@ def get_result(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     if job.state != "done" or not job.result_path:
         raise HTTPException(status_code=409, detail="Job not complete")
+    if not job.result_path.exists():
+        raise HTTPException(status_code=404, detail="Result file not found (cleaned up)")
 
     title = _sanitize_filename(job.video_title) if job.video_title else f"dubbed_{job_id}"
     return FileResponse(
@@ -1780,18 +1785,21 @@ def _load_completed_urls() -> List[str]:
     if COMPLETED_FILE.exists():
         try:
             return json.loads(COMPLETED_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        except Exception as e:
+            print(f"[WARN] Failed to load completed URLs: {e}", flush=True)
     return []
 
 
 def _mark_url_completed(url: str):
     """Add a URL to the completed list (persisted to disk)."""
     with _links_lock:
-        urls = _load_completed_urls()
-        if url not in urls:
-            urls.append(url)
-            COMPLETED_FILE.write_text(json.dumps(urls, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            urls = _load_completed_urls()
+            if url not in urls:
+                urls.append(url)
+                COMPLETED_FILE.write_text(json.dumps(urls, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"[WARN] Failed to mark URL completed: {e}", flush=True)
 
 
 def _fetch_yt_title(url: str) -> str:

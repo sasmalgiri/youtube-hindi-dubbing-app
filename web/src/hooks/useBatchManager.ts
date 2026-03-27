@@ -184,9 +184,18 @@ export function useBatchManager(): UseBatchManagerReturn {
         if (!autoDownload) return;
         const toDownload = items.filter((item) => item.state === 'done' && !item.downloaded && item.jobId && item.step !== 'Awaiting SRT');
         if (toDownload.length === 0) return;
-        toDownload.forEach((item) => triggerDownload(item.jobId!, item.videoTitle));
+        const triggered: string[] = [];
+        toDownload.forEach((item) => {
+            try {
+                triggerDownload(item.jobId!, item.videoTitle);
+                triggered.push(item.jobId!);
+            } catch {
+                // Download trigger failed (e.g. popup blocked) — will retry next cycle
+            }
+        });
+        if (triggered.length === 0) return;
         setItems((prev) => {
-            const downloadedIds = new Set(toDownload.map((i) => i.jobId));
+            const downloadedIds = new Set(triggered);
             return prev.map((item) =>
                 downloadedIds.has(item.jobId) ? { ...item, downloaded: true } : item
             );
