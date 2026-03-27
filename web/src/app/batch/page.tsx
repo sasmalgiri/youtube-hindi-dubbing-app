@@ -23,10 +23,10 @@ export default function BatchPage() {
         const stored = sessionStorage.getItem('batch_pending');
         if (!stored) return;
 
+        sessionStorage.removeItem('batch_pending');
         try {
             const { urls, settings } = JSON.parse(stored);
             if (urls?.length > 0) {
-                sessionStorage.removeItem('batch_pending');
                 start(urls, settings);
             }
         } catch {}

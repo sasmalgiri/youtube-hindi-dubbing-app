@@ -2006,9 +2006,10 @@ class Pipeline:
             )
             refined = result.get("segments", segments)
             # Normalise to our segment dict format (ensure start/end/text present)
+            # Preserve all original fields (e.g. speaker_id for multi-speaker mode)
             out = []
             for seg in refined:
-                entry = {
+                entry = {**seg,  # Preserve original fields first
                     "start": float(seg.get("start", 0)),
                     "end":   float(seg.get("end", 0)),
                     "text":  seg.get("text", "").strip(),
@@ -2206,6 +2207,9 @@ class Pipeline:
         """Join all speech into one narrative, translate as a whole."""
         # Combine all transcribed text into one continuous story
         full_text = " ".join(s.get("text", "").strip() for s in text_segments if s.get("text", "").strip())
+        if not full_text.strip():
+            self._report("translate", 1.0, "No text to translate (empty segments)")
+            return "", ""
         self._report("translate", 0.2, f"Translating {len(full_text)} characters...")
 
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
