@@ -3549,21 +3549,41 @@ class Pipeline:
                              0.2 + 0.3 * ((ci + CHUNK_SIZE) / len(tts_data)),
                              f"Built timeline chunk {len(chunk_paths)}/{math.ceil(len(tts_data)/CHUNK_SIZE)}...")
 
-            # Merge all chunks by mixing them together
+            # Merge chunks — ffmpeg amix can only handle ~10 inputs at a time on Windows
             if len(chunk_paths) == 1:
                 shutil.move(str(chunk_paths[0]), str(output))
             else:
-                inputs = []
-                for cp in chunk_paths:
-                    inputs.extend(["-i", str(cp)])
-                subprocess.run(
-                    [self._ffmpeg, "-y"] + inputs + [
-                        "-filter_complex",
-                        f"amix=inputs={len(chunk_paths)}:duration=longest:normalize=0",
-                        "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                        "-acodec", "pcm_s16le", str(output)],
-                    check=True, capture_output=True,
-                )
+                # Merge in batches of 10 to avoid ffmpeg input limits
+                MERGE_BATCH = 10
+                current_paths = list(chunk_paths)
+                merge_round = 0
+                while len(current_paths) > 1:
+                    next_paths = []
+                    for bi in range(0, len(current_paths), MERGE_BATCH):
+                        batch = current_paths[bi:bi + MERGE_BATCH]
+                        if len(batch) == 1:
+                            next_paths.append(batch[0])
+                            continue
+                        merge_out = self.cfg.work_dir / f"{prefix}merge_r{merge_round}_{bi:04d}.wav"
+                        inputs = []
+                        for cp in batch:
+                            inputs.extend(["-i", str(cp)])
+                        subprocess.run(
+                            [self._ffmpeg, "-y"] + inputs + [
+                                "-filter_complex",
+                                f"amix=inputs={len(batch)}:duration=longest:normalize=0",
+                                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                                "-acodec", "pcm_s16le", str(merge_out)],
+                            check=True, capture_output=True,
+                        )
+                        next_paths.append(merge_out)
+                        # Clean up merged inputs (but not original chunks on first round)
+                        if merge_round > 0:
+                            for cp in batch:
+                                cp.unlink(missing_ok=True)
+                    current_paths = next_paths
+                    merge_round += 1
+                shutil.move(str(current_paths[0]), str(output))
                 for cp in chunk_paths:
                     cp.unlink(missing_ok=True)
 
