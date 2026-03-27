@@ -2530,8 +2530,17 @@ class Pipeline:
             self._translate_segments_google(segments)
             return
 
-        # Auto mode: turbo if 2+ engines, else best single
-        if len(turbo_engines) >= 2:
+        # Auto mode: pick best available engine by quality
+        # Quality order: IndicTrans2+Polish > Turbo > GPT-4o > Groq > SambaNova > Gemini
+        #                > Google+Polish > Ollama > IndicTrans2 > Google
+        any_llm = groq_key or sambanova_key or gemini_key
+        is_hindi = self.cfg.target_language in ("hi", "hi-IN")
+
+        if is_hindi and any_llm:
+            # Best for Hindi: IndicTrans2 meaning model + LLM dubbing rewrite + rules
+            self._report("translate", 0.02, "Auto: IndicTrans2 → LLM → Rules (best Hindi quality)...")
+            self._translate_segments_nllb_polish(segments)
+        elif len(turbo_engines) >= 2:
             names = " + ".join(e[0] for e in turbo_engines)
             self._report("translate", 0.05, f"TURBO: {names} parallel translation ({len(turbo_engines)} engines)...")
             self._translate_segments_turbo(segments, turbo_engines)
@@ -2551,8 +2560,14 @@ class Pipeline:
             self._report("translate", 0.05, "Using Ollama (local LLM) for translation...")
             self._translate_segments_ollama(segments)
         else:
-            self._report("translate", 0.1, "No API keys found, using Google Translate...")
-            self._translate_segments_google(segments)
+            # No API keys, no Ollama — try IndicTrans2 alone, fallback to Google
+            try:
+                _get_meaning_model()
+                self._report("translate", 0.02, "Auto: Using IndicTrans2 (local, offline)...")
+                self._translate_segments_nllb(segments)
+            except Exception:
+                self._report("translate", 0.1, "No engines available, using Google Translate...")
+                self._translate_segments_google(segments)
 
     def _translate_segments_gemini(self, segments, api_key):
         """Translate segments in numbered batches using Gemini for context-aware output."""
