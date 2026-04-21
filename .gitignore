@@ -83,6 +83,13 @@ CosyVoice/
 backend/completed_urls.json
 backend/saved_links.json
 backend/translation_glossary.json
+backend/google_tts_usage.json
 backend/logs/
 backend/fish-speech/
 .next/
+
+# Google Cloud service-account JSONs — these are credentials, never commit
+backend/creds/
+backend/credentials/
+*-service-account*.json
+*-gcp-key*.json

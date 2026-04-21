@@ -9928,13 +9928,21 @@ class Pipeline:
     def _tts_google_cloud(self, segments):
         """Generate TTS using Google Cloud Text-to-Speech (WaveNet/Neural2).
 
-        Free tier: 1M characters/month (WaveNet) or 1M chars (Neural2).
-        Requires GOOGLE_APPLICATION_CREDENTIALS env var pointing to service account JSON,
-        or running on a Google Cloud instance with default credentials.
+        Free tier: 1M characters/month per billing account. Pool rotates across
+        multiple service-account JSONs so multiple billing accounts can be used
+        together — see backend/dubbing/google_tts_pool.py for env config.
         """
         from google.cloud import texttospeech
+        from dubbing.google_tts_pool import load_pool_from_env
 
-        client = texttospeech.TextToSpeechClient()
+        usage_file = Path(__file__).resolve().parent / "google_tts_usage.json"
+        pool = load_pool_from_env(usage_file)
+        if pool is None:
+            raise RuntimeError(
+                "Google TTS enabled but no credentials found. Set "
+                "GOOGLE_TTS_CREDENTIALS_DIR, GOOGLE_TTS_CREDENTIAL_1..N, "
+                "GOOGLE_TTS_CREDENTIALS, or GOOGLE_APPLICATION_CREDENTIALS."
+            )
         target = self.cfg.target_language
 
         # Map target language to Google Cloud voice config
@@ -9984,10 +9992,7 @@ class Pipeline:
             wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
 
             try:
-                synthesis_input = texttospeech.SynthesisInput(text=text)
-                response = client.synthesize_speech(
-                    input=synthesis_input, voice=voice_params, audio_config=audio_config
-                )
+                response = pool.synthesize(text, voice_params, audio_config)
                 with open(wav_path, "wb") as f:
                     f.write(response.audio_content)
 
