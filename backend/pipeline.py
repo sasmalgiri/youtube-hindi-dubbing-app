@@ -8683,7 +8683,7 @@ class Pipeline:
                 engines.append("Edge (fallback)")
                 self._report("synthesize", 0.02,
                              f"PARALLEL TTS: {' + '.join(engines)}...")
-                return self._tts_triple_parallel(segments)
+                return self._salvage_with_sarvam(segments, self._tts_triple_parallel(segments))
             except Exception as e:
                 self._report("synthesize", 0.05,
                              f"Parallel TTS failed ({e}) — falling back to single engine...")
@@ -8695,7 +8695,7 @@ class Pipeline:
                 if not torch.cuda.is_available():
                     raise RuntimeError("No CUDA GPU available")
                 self._report("synthesize", 0.05, "Using CosyVoice 2 standalone (GPU, all segments)...")
-                return self._tts_cosyvoice2(segments)
+                return self._salvage_with_sarvam(segments, self._tts_cosyvoice2(segments))
             except Exception as e:
                 self._report("synthesize", 0.05,
                              f"CosyVoice 2 failed ({e}) — falling back...")
@@ -8707,7 +8707,7 @@ class Pipeline:
                     if not torch.cuda.is_available():
                         raise RuntimeError("No CUDA GPU available")
                     self._report("synthesize", 0.05, "Using Chatterbox Multilingual (GPU, voice cloning)...")
-                    return self._tts_chatterbox_multilingual(segments)
+                    return self._salvage_with_sarvam(segments, self._tts_chatterbox_multilingual(segments))
                 except Exception as e:
                     self._report("synthesize", 0.05,
                                  f"Chatterbox Multilingual failed ({e}) — falling back...")
@@ -8739,7 +8739,7 @@ class Pipeline:
             elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
             if elevenlabs_key:
                 self._report("synthesize", 0.05, "Using ElevenLabs for human-like voice...")
-                return self._tts_elevenlabs(segments, elevenlabs_key)
+                return self._salvage_with_sarvam(segments, self._tts_elevenlabs(segments, elevenlabs_key))
             if not self.cfg.use_chatterbox:
                 raise RuntimeError("ElevenLabs enabled but ELEVENLABS_API_KEY not set in .env")
 
@@ -8750,7 +8750,7 @@ class Pipeline:
                 if torch.cuda.is_available():
                     self._report("synthesize", 0.05,
                                  "HYBRID: Coqui XTTS (GPU) + Edge-TTS (cloud) in parallel...")
-                    return self._tts_hybrid_coqui_edge(segments)
+                    return self._salvage_with_sarvam(segments, self._tts_hybrid_coqui_edge(segments))
             except ImportError:
                 pass
             except Exception as e:
@@ -8763,7 +8763,7 @@ class Pipeline:
                 if not torch.cuda.is_available():
                     raise RuntimeError("No CUDA GPU available for XTTS")
                 self._report("synthesize", 0.05, "Using Coqui XTTS v2 (GPU, voice cloning)...")
-                return self._tts_coqui_xtts(segments)
+                return self._salvage_with_sarvam(segments, self._tts_coqui_xtts(segments))
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -8775,7 +8775,7 @@ class Pipeline:
             if google_creds or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip():
                 self._report("synthesize", 0.05, "Using Google Cloud TTS (WaveNet/Neural2)...")
                 try:
-                    return self._tts_google_cloud(segments)
+                    return self._salvage_with_sarvam(segments, self._tts_google_cloud(segments))
                 except Exception as e:
                     self._report("synthesize", 0.05,
                                  f"Google Cloud TTS failed ({e}) — falling back to Edge-TTS...")
@@ -8792,7 +8792,7 @@ class Pipeline:
                          f"Using Edge-TTS with {voices_used} distinct voices for {target_name}...")
         else:
             self._report("synthesize", 0.05, f"Using Edge-TTS ({voice}) for {target_name}...")
-        return self._tts_edge(segments, voice_map=self._voice_map)
+        return self._salvage_with_sarvam(segments, self._tts_edge(segments, voice_map=self._voice_map))
 
     def _generate_tts_english(self, segments):
         """Zero-spend English dubbing TTS stack.
@@ -9564,6 +9564,60 @@ class Pipeline:
         "od": "od-IN", "pa": "pa-IN", "en": "en-IN",
     }
     SARVAM_SUPPORTED_LANGS = set(SARVAM_LANG_MAP.keys())
+
+    def _salvage_with_sarvam(self, segments, tts_data):
+        """Retry segments missing from tts_data via Sarvam Bulbul v3.
+
+        A segment is 'missing' if it has text but no matching (start, end)
+        entry in tts_data. Safe no-op when Sarvam has no API key, the target
+        language isn't supported, or there's nothing to salvage.
+
+        Salvage output goes to work_dir/salvage_sarvam/ so files don't collide
+        with whatever the primary engine produced.
+        """
+        if not segments:
+            return tts_data
+        done = {(round(float(e.get("start", 0)), 3), round(float(e.get("end", 0)), 3))
+                for e in (tts_data or [])}
+        failed = [
+            s for s in segments
+            if (round(float(s.get("start", 0)), 3), round(float(s.get("end", 0)), 3)) not in done
+            and (s.get("text_translated") or s.get("text", "")).strip()
+        ]
+        if not failed:
+            return tts_data
+
+        target_base = self.cfg.target_language.split("-")[0]
+        if target_base not in self.SARVAM_SUPPORTED_LANGS:
+            return tts_data
+        if not get_sarvam_key():
+            self._report("synthesize", 0.99,
+                         f"[Salvage] {len(failed)} segment(s) failed primary TTS — "
+                         f"Sarvam not configured (SARVAM_API_KEY), skipping retry")
+            return tts_data
+
+        self._report("synthesize", 0.99,
+                     f"[Salvage] retrying {len(failed)} failed segment(s) with Sarvam Bulbul v3...")
+
+        salvage_dir = self.cfg.work_dir / "salvage_sarvam"
+        salvage_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            salvaged = self._tts_sarvam_bulbul(failed, work_dir=salvage_dir)
+        except Exception as e:
+            self._report("synthesize", 0.99,
+                         f"[Salvage] Sarvam retry failed ({e}) — continuing with primary output only")
+            return tts_data
+
+        if not salvaged:
+            self._report("synthesize", 1.0,
+                         f"[Salvage] Sarvam produced no additional segments — {len(failed)} still missing")
+            return tts_data
+
+        merged = list(tts_data or []) + list(salvaged)
+        merged.sort(key=lambda x: float(x.get("start", 0)))
+        self._report("synthesize", 1.0,
+                     f"[Salvage] recovered {len(salvaged)}/{len(failed)} segment(s) via Sarvam Bulbul")
+        return merged
 
     def _tts_sarvam_bulbul(self, segments, work_dir=None):
         """Generate TTS using Sarvam AI Bulbul v3 — best Hindi quality, cloud API.
