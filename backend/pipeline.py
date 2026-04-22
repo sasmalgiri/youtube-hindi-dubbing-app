@@ -14538,8 +14538,21 @@ class Pipeline:
                     self._report("lipsync", 0.0,
                                  f"Wav2Lip requested but unavailable — {availability_reason()}. "
                                  f"Keeping original video.")
+                elif audio_dur > video_dur + 1.0:
+                    # Freeze-pad case: the mux looped the last video frame to cover
+                    # overflow audio. Running Wav2Lip on those looped frames would
+                    # make lips flicker across identical frames with different audio.
+                    # Skip and preserve the freeze-padded video instead.
+                    self._report("lipsync", 0.0,
+                                 f"Wav2Lip skipped: audio ({audio_dur:.1f}s) extends past "
+                                 f"video ({video_dur:.1f}s). Running on freeze-padded frames "
+                                 f"would cause visible lip flicker on the loop. Consider "
+                                 f"enabling video_slow_to_match to avoid this.")
                 else:
-                    lipsync_tmp = self.cfg.work_dir / "lipsync_output.mp4"
+                    # Write the temp in output_path's parent so the final swap is
+                    # an atomic same-volume os.replace — no half-written state if
+                    # the process is killed mid-rename.
+                    lipsync_tmp = output_path.parent / (output_path.stem + ".lipsync.tmp.mp4")
                     ok = apply_lipsync(
                         video_path=output_path,
                         audio_path=audio_path,
@@ -14548,7 +14561,14 @@ class Pipeline:
                         report=self._report,
                     )
                     if ok and lipsync_tmp.exists() and lipsync_tmp.stat().st_size > 0:
-                        shutil.move(str(lipsync_tmp), str(output_path))
+                        os.replace(str(lipsync_tmp), str(output_path))
+                    else:
+                        # Failure already logged inside apply_lipsync. Clean up stragglers.
+                        try:
+                            if lipsync_tmp.exists():
+                                lipsync_tmp.unlink()
+                        except Exception:
+                            pass
             except Exception as e:
                 self._report("lipsync", 1.0,
                              f"Wav2Lip hook failed: {e} — keeping original video")

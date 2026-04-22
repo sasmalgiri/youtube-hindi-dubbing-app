@@ -17,10 +17,16 @@ Wav2Lip performs best on:
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
+
+# Match tqdm-style "NN%" inside a Wav2Lip inference.py progress line.
+# Wav2Lip uses two tqdm bars: face detection pass, then frame generation pass.
+_TQDM_PCT = re.compile(r"(\d{1,3})%\|")
 
 _WAV2LIP_REPO_DIR = Path(__file__).resolve().parent.parent / "wav2lip"
 _CHECKPOINT_DIR = _WAV2LIP_REPO_DIR / "checkpoints"
@@ -127,6 +133,7 @@ def apply_lipsync(
 
     cmd = [
         sys.executable,
+        "-u",  # unbuffered stdout so tqdm lines reach us in real time
         str(_WAV2LIP_REPO_DIR / "inference.py"),
         "--checkpoint_path", str(ckpt),
         "--face", str(video_path),
@@ -137,18 +144,15 @@ def apply_lipsync(
         cmd.append("--nosmooth")
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(_WAV2LIP_REPO_DIR),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # tqdm writes to stderr — merge into one stream
             text=True,
-            timeout=timeout_seconds,
+            bufsize=1,
+            universal_newlines=True,
         )
-    except subprocess.TimeoutExpired:
-        if report:
-            report("lipsync", 1.0,
-                   f"Wav2Lip timed out after {timeout_seconds // 60} min — keeping original video")
-        return False
     except FileNotFoundError as e:
         if report:
             report("lipsync", 1.0, f"Wav2Lip subprocess not launchable: {e}")
@@ -158,8 +162,61 @@ def apply_lipsync(
             report("lipsync", 1.0, f"Wav2Lip subprocess error: {e}")
         return False
 
+    # Wav2Lip runs two tqdm phases in order: face detection, then generation.
+    # We track phase transitions by watching for percent resets (e.g., 100→0).
+    deadline = time.time() + timeout_seconds
+    phase = 0          # 0 = face detection, 1 = lip generation
+    last_reported = -1 # last percent we forwarded (throttle)
+    last_line = ""
+    # Collect last ~40 lines for the failure tail (bounded — no memory runaway).
+    tail: list[str] = []
+
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            if line:
+                last_line = line
+                tail.append(line)
+                if len(tail) > 40:
+                    tail.pop(0)
+            m = _TQDM_PCT.search(line)
+            if m:
+                pct = int(m.group(1))
+                # Detect phase flip: percent dropped by > 30 after being near 100
+                if last_reported > 70 and pct < 30:
+                    phase = min(phase + 1, 1)
+                    last_reported = -1
+                # Throttle to ~5% granularity so we don't spam the UI
+                if pct // 5 != last_reported // 5 and report:
+                    last_reported = pct
+                    phase_weight = 0.30 if phase == 0 else 0.60
+                    phase_base = 0.10 if phase == 0 else 0.40
+                    overall = phase_base + phase_weight * (pct / 100.0)
+                    label = "face detection" if phase == 0 else "lip generation"
+                    report("lipsync", overall, f"Wav2Lip {label}: {pct}%")
+            if time.time() > deadline:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                if report:
+                    report("lipsync", 1.0,
+                           f"Wav2Lip timed out after {timeout_seconds // 60} min — "
+                           f"keeping original video")
+                return False
+        proc.wait(timeout=30)
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        if report:
+            report("lipsync", 1.0, f"Wav2Lip stream error: {e}. Last line: {last_line}")
+        return False
+
     if proc.returncode != 0:
-        err_tail = (proc.stderr or proc.stdout or "")[-500:]
+        err_tail = "\n".join(tail[-8:])
         if report:
             report("lipsync", 1.0,
                    f"Wav2Lip exited with code {proc.returncode}. Tail: {err_tail.strip()}")
