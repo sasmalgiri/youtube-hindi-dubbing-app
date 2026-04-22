@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -45,21 +45,44 @@ class GoogleTTSPool:
 
     @staticmethod
     def _current_month() -> str:
-        return datetime.utcnow().strftime("%Y-%m")
+        return datetime.now(timezone.utc).strftime("%Y-%m")
 
     def _load_usage(self) -> dict:
-        if self.usage_file.exists():
-            try:
-                return json.loads(self.usage_file.read_text(encoding="utf-8"))
-            except Exception:
-                return {}
+        """Read the usage file; if it was truncated by a crash mid-write, try
+        the *.bak fallback before giving up. Losing the counter means the pool
+        starts over-spending the free tier, so the fallback is load-bearing."""
+        for candidate in (self.usage_file, self.usage_file.with_suffix(self.usage_file.suffix + ".bak")):
+            if candidate.exists():
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    continue
         return {}
 
     def _save_usage(self) -> None:
+        """Atomic write: dump to a sibling temp, fsync, rename into place.
+        Keeps the previous successful write as a *.bak so a crashed rename
+        never loses the counter. Without this, a kill between open+write was
+        enough to zero out the quota tracking for the month."""
         self.usage_file.parent.mkdir(parents=True, exist_ok=True)
-        self.usage_file.write_text(
-            json.dumps(self._usage, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        tmp_path = self.usage_file.with_suffix(self.usage_file.suffix + ".tmp")
+        bak_path = self.usage_file.with_suffix(self.usage_file.suffix + ".bak")
+        payload = json.dumps(self._usage, indent=2, ensure_ascii=False)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # some filesystems / Windows edge cases don't support fsync on files
+        if self.usage_file.exists():
+            try:
+                os.replace(str(self.usage_file), str(bak_path))
+            except OSError:
+                pass
+        os.replace(str(tmp_path), str(self.usage_file))
 
     def _month_usage(self) -> dict:
         return self._usage.setdefault(self._current_month(), {})

@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -164,12 +164,29 @@ def apply_lipsync(
 
     # Wav2Lip runs two tqdm phases in order: face detection, then generation.
     # We track phase transitions by watching for percent resets (e.g., 100→0).
-    deadline = time.time() + timeout_seconds
     phase = 0          # 0 = face detection, 1 = lip generation
     last_reported = -1 # last percent we forwarded (throttle)
     last_line = ""
     # Collect last ~40 lines for the failure tail (bounded — no memory runaway).
     tail: list[str] = []
+
+    # Watchdog: `for raw in proc.stdout` is blocking I/O. If Wav2Lip stalls
+    # silently (GPU driver hang, stuck face detector) no new line arrives and
+    # an inline deadline check would never fire. A timer thread kills the
+    # process at the deadline, which closes stdout and lets the for-loop exit
+    # naturally. Set a flag so we can distinguish timeout from other failures.
+    timed_out = {"hit": False}
+
+    def _kill_on_deadline() -> None:
+        timed_out["hit"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout_seconds, _kill_on_deadline)
+    watchdog.daemon = True
+    watchdog.start()
 
     try:
         assert proc.stdout is not None
@@ -195,16 +212,6 @@ def apply_lipsync(
                     overall = phase_base + phase_weight * (pct / 100.0)
                     label = "face detection" if phase == 0 else "lip generation"
                     report("lipsync", overall, f"Wav2Lip {label}: {pct}%")
-            if time.time() > deadline:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                if report:
-                    report("lipsync", 1.0,
-                           f"Wav2Lip timed out after {timeout_seconds // 60} min — "
-                           f"keeping original video")
-                return False
         proc.wait(timeout=30)
     except Exception as e:
         try:
@@ -213,6 +220,15 @@ def apply_lipsync(
             pass
         if report:
             report("lipsync", 1.0, f"Wav2Lip stream error: {e}. Last line: {last_line}")
+        return False
+    finally:
+        watchdog.cancel()
+
+    if timed_out["hit"]:
+        if report:
+            report("lipsync", 1.0,
+                   f"Wav2Lip timed out after {timeout_seconds // 60} min — "
+                   f"keeping original video")
         return False
 
     if proc.returncode != 0:
