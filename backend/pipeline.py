@@ -14554,6 +14554,15 @@ class Pipeline:
         self._run_proc(cmd, check=True, capture_output=True)
 
         # Wav2Lip lip-sync post-process — opt-in, graceful skip when not set up.
+        #
+        # Per-cue stretching in _assemble_video_adapts_to_audio already guarantees
+        # each cue's output video duration equals its TTS audio duration, so the
+        # mux freeze-pad branch above should almost never fire in PURE STRETCH
+        # mode (tts_no_time_pressure=True, default). If it DOES fire (tiny
+        # rounding drift, legacy modes), letting Wav2Lip run on the 1-2s looped
+        # tail produces a brief flicker that's acceptable — better than losing
+        # lip sync on the entire video. The earlier hard skip on freeze-pad was
+        # over-defensive; removed per user request.
         if getattr(self.cfg, "use_wav2lip", False):
             try:
                 from dubbing.wav2lip import apply_lipsync, is_available, availability_reason
@@ -14561,16 +14570,6 @@ class Pipeline:
                     self._report("lipsync", 0.0,
                                  f"Wav2Lip requested but unavailable — {availability_reason()}. "
                                  f"Keeping original video.")
-                elif audio_dur > video_dur + 1.0:
-                    # Freeze-pad case: the mux looped the last video frame to cover
-                    # overflow audio. Running Wav2Lip on those looped frames would
-                    # make lips flicker across identical frames with different audio.
-                    # Skip and preserve the freeze-padded video instead.
-                    self._report("lipsync", 0.0,
-                                 f"Wav2Lip skipped: audio ({audio_dur:.1f}s) extends past "
-                                 f"video ({video_dur:.1f}s). Running on freeze-padded frames "
-                                 f"would cause visible lip flicker on the loop. Consider "
-                                 f"enabling video_slow_to_match to avoid this.")
                 else:
                     # Write the temp in output_path's parent so the final swap is
                     # an atomic same-volume os.replace — no half-written state if

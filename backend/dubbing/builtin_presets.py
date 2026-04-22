@@ -227,10 +227,13 @@ _HINDI_REVOICE_CLONE = {
     "description": (
         "Re-dub an existing Hindi video with a clone of the original speaker. "
         "Whisper transcribes Hindi → translation skipped (same language) → "
-        "Coqui XTTS v2 re-speaks in the cloned voice → Wav2Lip re-syncs lips "
-        "to the new audio so video and audio match. To use a different voice "
-        "instead of cloning, switch the TTS engine in Advanced Settings — "
-        "Sarvam Bulbul v3 and Google Neural2 both support Hindi natively."
+        "Coqui XTTS v2 re-speaks in the cloned voice → per-cue video stretch "
+        "(audio drives, video scales to fit each cue's ffmpeg setpts) → "
+        "Wav2Lip re-syncs lips to the new audio. Audio and video match by "
+        "construction: every cue's video slice is stretched to equal its "
+        "TTS audio duration. To use a different voice instead of cloning, "
+        "switch the TTS engine in Advanced Settings — Sarvam Bulbul v3 and "
+        "Google Neural2 both support Hindi natively."
     ),
     "settings": {
         "source_language": "hi",
