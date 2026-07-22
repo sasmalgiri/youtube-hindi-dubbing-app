@@ -1344,9 +1344,14 @@ class Pipeline:
                 text = text.replace(src, entries[src])
         return text
 
-    @staticmethod
-    def _find_executable(name: str) -> str:
-        """Find an executable by checking venv, PATH, WinGet packages, and system PATH."""
+    def _find_executable(self, name: str) -> str:
+        """Find an executable by checking venv, PATH, WinGet packages, and system PATH.
+
+        NOTE: must be an instance method (not @staticmethod) — the inner _works()
+        helper calls self._run_proc to verify a candidate actually runs. As a
+        staticmethod that raised NameError('self'), so _works() always returned
+        False and this fell through to the bare name — which left node unresolved
+        and yt-dlp's --js-runtimes empty (breaking newer YouTube downloads)."""
         ext = ".exe" if sys.platform == "win32" else ""
         full_name = name + ext
 

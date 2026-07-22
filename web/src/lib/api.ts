@@ -56,6 +56,10 @@ export interface JobCreateRequest {
     use_whisperx?: boolean;
     whisper_gpu_fallback?: boolean;
     whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     step_by_step?: boolean;
     use_new_pipeline?: boolean;
@@ -129,6 +133,10 @@ export interface JobConfig {
     use_whisperx?: boolean;
     whisper_gpu_fallback?: boolean;
     whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     enable_manual_review?: boolean;
     transcribe_only?: boolean;
@@ -435,6 +443,10 @@ export interface LinkPreset {
     use_whisperx?: boolean;
     whisper_gpu_fallback?: boolean;
     whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     step_by_step?: boolean;
     use_new_pipeline?: boolean;

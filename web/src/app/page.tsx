@@ -58,6 +58,10 @@ export default function HomePage() {
         use_whisperx: true,
         whisper_gpu_fallback: true,          // local Whisper on GPU if WhisperX not proper
         whisper_fallback_model: 'large-v3',  // large-v3 | medium
+        visual_transforms: true,             // Content-ID / duplicate evasion (classic mode)
+        vx_hflip: false,                     // mirror (flips on-screen text) — opt-in
+        vx_hue: 4.0,                         // hue shift degrees (imperceptible)
+        vx_zoom: 1.04,                       // zoom + crop back
         simplify_english: false,             // OFF: translation 35% word cap handles it
         step_by_step: false,
         use_new_pipeline: false,

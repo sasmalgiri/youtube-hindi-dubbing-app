@@ -39,6 +39,10 @@ export interface DubbingSettings {
     use_whisperx: boolean;
     whisper_gpu_fallback: boolean;     // local Whisper GPU fallback when WhisperX is "not proper"
     whisper_fallback_model: string;    // "large-v3" | "medium"
+    visual_transforms: boolean;        // Content-ID / duplicate evasion (classic mode)
+    vx_hflip: boolean;                 // horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: number;                    // hue shift degrees
+    vx_zoom: number;                   // zoom + crop back (1.0 = off)
     simplify_english: boolean;
     step_by_step: boolean;
     use_new_pipeline: boolean;
@@ -1774,6 +1778,58 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     <p className="text-xs text-green-400 font-medium">Assembly: Per-segment NVENC (4x parallel)</p>
                                     <p className="text-[10px] text-green-400/70">Audio priority — video adapts per sentence. GPU-accelerated encoding.</p>
                                 </div>
+                            </div>
+                        </CollapsibleGroup>
+
+                        {/* ── GROUP 5b — Visual Transforms (Content-ID evasion, master toggle) ── */}
+                        <CollapsibleGroup
+                            title="Visual Transforms"
+                            subtitle="Content-ID / duplicate evasion (classic mode)"
+                            master={settings.visual_transforms}
+                            onMaster={(v) => update({ visual_transforms: v })}
+                        >
+                            <p className="text-[11px] text-text-muted">
+                                Applied once at the final mux (hue shift + slight zoom + metadata strip) to break the
+                                video fingerprint. Imperceptible.
+                                <span className="text-yellow-400"> Only for content you have the right to dub.</span>
+                            </p>
+
+                            {/* Mirror (hflip) */}
+                            <div className="flex items-center justify-between">
+                                <div className="pr-3">
+                                    <p className="text-sm text-text-primary">Mirror (horizontal flip)</p>
+                                    <p className="text-[11px] text-text-muted">Strongest break — but flips any on-screen text/logos. Off by default.</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle Mirror" onClick={() => update({ vx_hflip: !settings.vx_hflip })}
+                                    className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${settings.vx_hflip ? 'bg-primary' : 'bg-white/10'}`}
+                                >
+                                    <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.vx_hflip ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+
+                            {/* Hue shift */}
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <p className="text-sm text-text-primary">Hue shift</p>
+                                    <span className="text-xs text-text-muted">{settings.vx_hue}°</span>
+                                </div>
+                                <input type="range" min={0} max={15} step={1} value={settings.vx_hue}
+                                    onChange={e => update({ vx_hue: parseFloat(e.target.value) })}
+                                    className="w-full accent-primary" />
+                                <p className="text-[10px] text-text-muted">0 = off · 4° recommended (imperceptible)</p>
+                            </div>
+
+                            {/* Zoom */}
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <p className="text-sm text-text-primary">Zoom + crop</p>
+                                    <span className="text-xs text-text-muted">{settings.vx_zoom.toFixed(2)}×</span>
+                                </div>
+                                <input type="range" min={1.0} max={1.1} step={0.01} value={settings.vx_zoom}
+                                    onChange={e => update({ vx_zoom: parseFloat(e.target.value) })}
+                                    className="w-full accent-primary" />
+                                <p className="text-[10px] text-text-muted">1.00 = off · 1.04 recommended (zoom in, crop back)</p>
                             </div>
                         </CollapsibleGroup>
 

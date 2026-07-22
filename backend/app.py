@@ -290,6 +290,11 @@ class JobCreateRequest(BaseModel):
     use_whisperx: bool = True          # WhisperX forced alignment for tighter word timestamps (on by default; whisperx installed)
     whisper_gpu_fallback: bool = True  # local Whisper GPU fallback when WhisperX is 'not proper'
     whisper_fallback_model: str = "large-v3"   # fallback model: large-v3 | medium
+    # ── Visual transforms (Content-ID / duplicate evasion) — classic mode ──
+    visual_transforms: bool = True
+    vx_hflip: bool = False              # horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: float = 4.0                 # hue shift degrees (imperceptible)
+    vx_zoom: float = 1.04               # zoom + crop back (1.0 = off)
     simplify_english: bool = False     # OFF: translation 35% word cap handles it
     enable_tts_verify_retry: bool = False  # OFF: 70% false-positive rate on Hindi turns 5s cleanup into 2h bottleneck
     # Inline TTS truncation guard: catches Edge-TTS WebSocket drops that
@@ -907,6 +912,10 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_whisperx=req.use_whisperx,
             whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
             whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1550,6 +1559,10 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_whisperx=req.use_whisperx,
             whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
             whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1682,6 +1695,10 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_whisperx=req.use_whisperx,
             whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
             whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -2481,6 +2498,10 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             use_whisperx=req.use_whisperx,
             whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
             whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
