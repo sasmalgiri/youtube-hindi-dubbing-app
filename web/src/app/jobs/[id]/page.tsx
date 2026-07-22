@@ -206,8 +206,6 @@ export default function JobPage() {
                                             {BoolPill('Fast Assemble', c.fast_assemble)}
                                             {BoolPill('Sentence Gap', c.enable_sentence_gap)}
                                             {BoolPill('Duration Fit', c.enable_duration_fit)}
-                                            {BoolPill('YT Subs', c.prefer_youtube_subs)}
-                                            {BoolPill('YT Translate', c.use_yt_translate)}
                                             {BoolPill('WhisperX', c.use_whisperx)}
                                             {BoolPill('Simplify EN', c.simplify_english)}
                                             {BoolPill('Manual Review', c.enable_manual_review)}

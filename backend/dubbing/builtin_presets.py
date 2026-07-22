@@ -56,8 +56,6 @@ _STUDIO_QUALITY = {
         "audio_quality_mode": "quality",
         # ASR: best
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -95,8 +93,6 @@ _BALANCED = {
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -129,37 +125,6 @@ _FAST_PREVIEW = {
         "audio_bitrate": "128k",
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
-        "use_whisperx": False,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
-    },
-}
-
-
-_YOUTUBE_PASSTHROUGH = {
-    "slug": "youtube-hindi-passthrough",
-    "name": "YouTube Hindi Pass-through",
-    "description": (
-        "Uses YouTube's own captions (or auto-translated Hindi) directly — "
-        "skips Whisper entirely. WordChunk mode, fast, good when YouTube already has decent subs."
-    ),
-    "settings": {
-        "pipeline_mode": "wordchunk",
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
-        "yt_transcript_mode": "yt_timeline",
-        "use_edge_tts": True,
-        "use_google_tts": False,
-        "use_sarvam_bulbul": False,
-        "simplify_english": False,
-        "keep_subject_english": False,
-        "slot_verify": "off",
-        "audio_priority": True,
-        "video_slow_to_match": True,
-        "tts_rate_mode": "auto",
-        "tts_rate_ceiling": "+35%",
-        "tts_word_match_verify": False,
-        "audio_bitrate": "192k",
         "use_whisperx": False,
     },
 }
@@ -264,11 +229,6 @@ _HINDI_REVOICE_CLONE = {
         # Hindi source — don't touch English-source-specific flags.
         "simplify_english": False,
         "keep_subject_english": False,
-        # Force Whisper transcription of the actual Hindi audio. Skipping
-        # YouTube subs here because captions are often edited/mistimed vs
-        # the real speech we need to re-voice.
-        "prefer_youtube_subs": False,
-        "use_yt_translate": False,
         "use_whisperx": True,
         "audio_bitrate": "256k",
     },
@@ -304,8 +264,6 @@ _BUDGET = {
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -314,7 +272,6 @@ _BUILTIN_PRESETS: List[Dict] = [
     _BALANCED,
     _STUDIO_QUALITY,
     _FAST_PREVIEW,
-    _YOUTUBE_PASSTHROUGH,
     _SRT_DIRECT,
     _VOICE_CLONE_SAME,
     _HINDI_REVOICE_CLONE,

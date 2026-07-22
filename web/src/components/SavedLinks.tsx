@@ -50,8 +50,6 @@ const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 't
     { key: 'use_edge_tts', label: 'Edge TTS', type: 'toggle' },
     { key: 'use_coqui_xtts', label: 'Coqui XTTS', type: 'toggle' },
     { key: 'mix_original', label: 'Mix BG Music', type: 'toggle' },
-    { key: 'prefer_youtube_subs', label: 'YT Subs', type: 'toggle' },
-    { key: 'use_yt_translate', label: 'YT Translate', type: 'toggle' },
     { key: 'audio_priority', label: 'Audio Priority', type: 'toggle' },
     { key: 'enable_manual_review', label: 'Manual Review', type: 'toggle' },
     { key: 'use_whisperx', label: 'WhisperX Align', type: 'toggle' },
@@ -67,8 +65,6 @@ function PresetSummary({ preset }: { preset?: LinkPreset }) {
     if (preset.use_edge_tts) parts.push('Edge');
     if (preset.use_coqui_xtts) parts.push('XTTS');
     if (preset.mix_original) parts.push('BG');
-    if (preset.prefer_youtube_subs) parts.push('YTSub');
-    if (preset.use_yt_translate) parts.push('YT-TR');
     if (preset.use_whisperx) parts.push('WhisperX');
     return <span className="text-primary-light">{parts.join(' · ') || 'Default'}</span>;
 }

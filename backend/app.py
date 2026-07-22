@@ -267,8 +267,6 @@ class JobCreateRequest(BaseModel):
     use_google_tts: bool = False
     use_coqui_xtts: bool = False
     use_edge_tts: bool = True
-    prefer_youtube_subs: bool = True
-    use_yt_translate: bool = True   # ON: try YouTube Hindi auto-translate first (best quality)
     multi_speaker: bool = False
     transcribe_only: bool = False
     audio_priority: bool = True
@@ -290,6 +288,8 @@ class JobCreateRequest(BaseModel):
     dub_chain: List[str] = []
     enable_manual_review: bool = False
     use_whisperx: bool = True          # WhisperX forced alignment for tighter word timestamps (on by default; whisperx installed)
+    whisper_gpu_fallback: bool = True  # local Whisper GPU fallback when WhisperX is 'not proper'
+    whisper_fallback_model: str = "large-v3"   # fallback model: large-v3 | medium
     simplify_english: bool = False     # OFF: translation 35% word cap handles it
     enable_tts_verify_retry: bool = False  # OFF: 70% false-positive rate on Hindi turns 5s cleanup into 2h bottleneck
     # Inline TTS truncation guard: catches Edge-TTS WebSocket drops that
@@ -330,11 +330,7 @@ class JobCreateRequest(BaseModel):
     purge_on_new_url: bool = False     # When True: delete prior job's work_dir + caches when a different URL is submitted
     step_by_step: bool = False         # Pause after transcription & translation for review
     use_new_pipeline: bool = False     # Use new modular pipeline (experimental)
-    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "wordchunk" | "srtdub"
-    # ── WordChunk mode options ──
-    wc_chunk_size: int = 8              # 4 | 8 | 12 words per TTS chunk
-    wc_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown
-    wc_transcript: str = ""             # Optional user-pasted transcript — bypasses YouTube subs fetch
+    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "srtdub"
     # ── SRT Direct mode options ──
     sd_srt_content: str = ""            # Full SRT content (cues verbatim) — required for srtdub mode
     sd_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown; freeze-pads if still short
@@ -357,27 +353,6 @@ class JobCreateRequest(BaseModel):
     segmenter: str = "dp"                # "dp" | "sentence"
     segmenter_buffer_pct: float = 0.20   # Hindi expansion buffer
     max_sentences_per_cue: int = 2       # max sentences per segment
-    # ── YouTube Transcript Mode ──
-    # How YouTube subs are structured before feeding to the proven pipeline:
-    #   "yt_timeline"      — Option 1: YouTube text + YouTube's own timelines.
-    #                        Merge into sentences, group 2 per segment, redistribute
-    #                        slots proportionally by word count. Fast (no Whisper).
-    #   "whisper_timeline" — Option 2: YouTube text + Whisper timestamps.
-    #                        Run Whisper for precise speech timelines, replace its
-    #                        text with YouTube's (better quality). Slower but exact.
-    yt_transcript_mode: str = "yt_timeline"
-    # Segment split mode for YouTube subs:
-    #   "sentence"  — group 2 complete sentences per segment (needs punctuation)
-    #   "wordcount" — split by ~20 words per segment (uniform, no punctuation needed)
-    yt_segment_mode: str = "sentence"
-    # Use YouTube subs as reference to correct Whisper transcription text.
-    # Whisper keeps its precise timestamps, only the TEXT is replaced with
-    # YouTube's (higher quality). The proven pipeline flow stays identical.
-    yt_text_correction: bool = True
-    # How to replace Whisper text with YouTube subs:
-    #   "full" — total replacement (all words from YouTube)
-    #   "diff" — word-level diff, only swap words that differ (keeps Whisper punctuation)
-    yt_replace_mode: str = "diff"
     # TTS chunk size: split translated text into N-word chunks before TTS.
     # 0 = off (use full segments as-is, best prosody).
     # 4/8/12 = chunk size (smaller = no truncation but choppier sound).
@@ -877,9 +852,9 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         # ── SPLIT MODE: Split video into parts and dub each ──────────
         # SKIP split mode for pipelines that have their own single-pass
-        # assembly: oneflow, wordchunk, and srtdub all manage video/audio
+        # assembly: oneflow and srtdub both manage video/audio
         # themselves and don't want the classic Pipeline invoked per-part.
-        _split_skipped_for = ("oneflow", "wordchunk", "srtdub")
+        _split_skipped_for = ("oneflow", "srtdub")
         _current_mode = getattr(req, 'pipeline_mode', 'classic')
         if req.split_duration > 0 and _current_mode not in _split_skipped_for:
             _setup_status(f"Split mode: video will be processed in "
@@ -913,8 +888,6 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=req.prefer_youtube_subs,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -932,6 +905,8 @@ def _run_job(job: Job, req: JobCreateRequest):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -963,10 +938,6 @@ def _run_job(job: Job, req: JobCreateRequest):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1052,45 +1023,10 @@ def _run_job(job: Job, req: JobCreateRequest):
                 raise RuntimeError(f"SrtDub failed: {e}")
             job.segments = []
 
-        elif pipeline_mode == "wordchunk":
-            # ═══ WORDCHUNK: YouTube Hindi VTT → N-word TTS chunks → super-stretch ═══
-            from dubbing.wordchunk import run_wordchunk
-            try:
-                run_wordchunk(
-                    source_url=req.url,
-                    work_dir=OUTPUTS / job.id / "work",
-                    output_path=out_path,
-                    target_language=req.target_language,
-                    source_language=req.source_language or "en",
-                    tts_voice=req.voice,
-                    tts_rate=req.tts_rate,
-                    audio_bitrate=req.audio_bitrate,
-                    chunk_size=int(getattr(req, "wc_chunk_size", 8) or 8),
-                    max_stretch=float(getattr(req, "wc_max_stretch", 20.0) or 20.0),
-                    transcript_override=getattr(req, "wc_transcript", "") or "",
-                    dub_duration_min=int(getattr(req, "dub_duration", 0) or 0),
-                    on_progress=progress_cb,
-                    cancel_check=job.cancel_event.is_set,
-                )
-                job.result_path = out_path
-                job.video_title = req.url.split("/")[-1]
-            except Exception as e:
-                raise RuntimeError(f"WordChunk failed: {e}")
-            job.segments = []
-
         elif pipeline_mode == "new":
             # The new DP pipeline has some options it can't consume. Normalize.
-            #
-            # IMPORTANT (2026-04-12): prefer_youtube_subs is NO LONGER disabled
-            # for the new pipeline. YouTube's transcript has proper sentence
-            # boundaries, punctuation, and capitalization — it's BETTER input
-            # than any ASR (Whisper, Parakeet, Google ASR). Using YouTube subs
-            # eliminates the fragment-merging problem entirely because the
-            # sentences come pre-segmented correctly from YouTube.
             if (req.asr_model or "").lower() == "groq-whisper":
                 req.asr_model = "parakeet"
-            # req.prefer_youtube_subs — LEFT ALONE (user's choice flows through)
-            # req.use_yt_translate — LEFT ALONE (user's choice flows through)
             req.transcribe_only = False
             req.multi_speaker = False
             req.step_by_step = False
@@ -1127,13 +1063,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             # pieces, destroying the sentence scope. By falling through to
             # Pipeline.run(), we get: merge → translate → TTS → assembly
             # with auto rate, proportional balancing, micro-gaps — all proven.
-            import re as _yt_re
-            _is_url = bool(_yt_re.match(r"^https?://", req.url or ""))
-            _use_classic_for_yt = (
-                _is_url
-                and (req.use_yt_translate or req.prefer_youtube_subs
-                     or getattr(req, 'yt_text_correction', False))
-            )
+            _use_classic_for_yt = False  # YouTube subs removed — always Whisper
 
             if _use_classic_for_yt:
                 # Let Pipeline.run() handle EVERYTHING — it has the YouTube
@@ -1360,7 +1290,7 @@ def _run_job(job: Job, req: JobCreateRequest):
                 raise RuntimeError(f"audio_raw.wav not found: {audio_raw_path}")
             pipeline._run_tts_and_assembly(text_segments, audio_raw_path)
 
-        elif pipeline_mode not in ("oneflow", "wordchunk", "srtdub"):
+        elif pipeline_mode not in ("oneflow", "srtdub"):
             # ═══ CLASSIC MONOLITH PIPELINE ═══
             pipeline = Pipeline(cfg, on_progress=progress_cb,
                                 cancel_check=job.cancel_event.is_set,
@@ -1378,7 +1308,7 @@ def _run_job(job: Job, req: JobCreateRequest):
                 pipeline.run()
 
         # OneFlow / WordChunk set their own job data — skip pipeline access
-        if pipeline_mode not in ("oneflow", "wordchunk", "srtdub"):
+        if pipeline_mode not in ("oneflow", "srtdub"):
             job.video_title = pipeline.video_title or "Untitled"
             job.segments = pipeline.segments
             job.qa_score = pipeline.qa_score
@@ -1461,7 +1391,7 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         # Record job metrics to Supabase (fire-and-forget)
         _render_time = time.time() - _t_start
-        _pipeline_exists = pipeline_mode not in ("oneflow", "wordchunk", "srtdub") and 'pipeline' in locals()
+        _pipeline_exists = pipeline_mode not in ("oneflow", "srtdub") and 'pipeline' in locals()
         _segs = (pipeline.segments if _pipeline_exists else job.segments) or []
         # Read manual review queue to count segments that needed review
         _mrq_path = OUTPUTS / job.id / "manual_review_queue.json"
@@ -1602,8 +1532,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=False,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -1620,6 +1548,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1650,10 +1580,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1738,8 +1664,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=False,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -1756,6 +1680,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1786,10 +1712,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1873,7 +1795,6 @@ def _queue_chain_next(parent_job: Job):
         url=input_path,
         source_language=parent_job.target_language,  # Previous output language
         target_language=next_lang,
-        prefer_youtube_subs=False,  # No YouTube subs for local file
         asr_model=_orig.asr_model if _orig else "large-v3",
         translation_engine=_orig.translation_engine if _orig else "auto",
         tts_rate=_orig.tts_rate if _orig else "+0%",
@@ -1921,8 +1842,6 @@ def _queue_chain_next(parent_job: Job):
         keep_subject_english=getattr(_orig, 'keep_subject_english', False) if _orig else False,
         gap_mode=getattr(_orig, 'gap_mode', 'micro') if _orig else 'micro',
         tts_chunk_words=getattr(_orig, 'tts_chunk_words', 0) if _orig else 0,
-        yt_text_correction=getattr(_orig, 'yt_text_correction', True) if _orig else True,
-        yt_replace_mode=getattr(_orig, 'yt_replace_mode', 'diff') if _orig else 'diff',
     )
 
     job = Job(
@@ -2324,9 +2243,6 @@ def create_job(req: JobCreateRequest):
         first_lang = req.dub_chain[0]
         remaining = req.dub_chain[1:]
         req.target_language = first_lang
-        # Force YouTube subs for first step (use existing English subs)
-        if first_lang == "en":
-            req.prefer_youtube_subs = True
     else:
         remaining = []
 
@@ -2366,8 +2282,6 @@ async def create_job_upload(
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
     use_edge_tts: str = Form("true"),
-    prefer_youtube_subs: str = Form("true"),
-    use_yt_translate: str = Form("false"),
     multi_speaker: str = Form("false"),
     transcribe_only: str = Form("false"),
     audio_priority: str = Form("true"),
@@ -2396,18 +2310,11 @@ async def create_job_upload(
     segmenter: str = Form("dp"),
     segmenter_buffer_pct: float = Form(0.20),
     max_sentences_per_cue: int = Form(2),
-    yt_transcript_mode: str = Form("yt_timeline"),
-    yt_segment_mode: str = Form("sentence"),
-    yt_text_correction: str = Form("true"),
-    yt_replace_mode: str = Form("diff"),
     tts_chunk_words: int = Form(0),
     gap_mode: str = Form("micro"),
     preset_name: str = Form(""),
-    # Pipeline mode + mode-specific fields (WordChunk + SRT Direct)
+    # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
-    wc_chunk_size: int = Form(8),
-    wc_max_stretch: float = Form(20.0),
-    wc_transcript: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -2452,8 +2359,6 @@ async def create_job_upload(
             use_coqui_xtts=_bool(use_coqui_xtts),
             use_fish_speech=False,
             use_edge_tts=_bool(use_edge_tts),
-            prefer_youtube_subs=_bool(prefer_youtube_subs),
-            use_yt_translate=_bool(use_yt_translate),
             multi_speaker=_bool(multi_speaker),
             transcribe_only=_bool(transcribe_only),
             audio_priority=_bool(audio_priority),
@@ -2483,17 +2388,10 @@ async def create_job_upload(
             segmenter=segmenter,
             segmenter_buffer_pct=segmenter_buffer_pct,
             max_sentences_per_cue=max_sentences_per_cue,
-            yt_transcript_mode=yt_transcript_mode,
-            yt_segment_mode=yt_segment_mode,
-            yt_text_correction=_bool(yt_text_correction),
-            yt_replace_mode=yt_replace_mode,
             tts_chunk_words=tts_chunk_words,
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
-            wc_chunk_size=wc_chunk_size,
-            wc_max_stretch=wc_max_stretch,
-            wc_transcript=wc_transcript,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -2565,8 +2463,6 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=req.prefer_youtube_subs,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -2583,6 +2479,8 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -2614,10 +2512,6 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -2726,8 +2620,6 @@ async def create_job_with_srt(
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
     use_edge_tts: str = Form("true"),
-    prefer_youtube_subs: str = Form("true"),
-    use_yt_translate: str = Form("false"),
     multi_speaker: str = Form("false"),
     audio_priority: str = Form("true"),
     audio_untouchable: str = Form("false"),
@@ -2756,18 +2648,11 @@ async def create_job_with_srt(
     segmenter: str = Form("dp"),
     segmenter_buffer_pct: float = Form(0.20),
     max_sentences_per_cue: int = Form(2),
-    yt_transcript_mode: str = Form("yt_timeline"),
-    yt_segment_mode: str = Form("sentence"),
-    yt_text_correction: str = Form("true"),
-    yt_replace_mode: str = Form("diff"),
     tts_chunk_words: int = Form(0),
     gap_mode: str = Form("micro"),
     preset_name: str = Form(""),
-    # Pipeline mode + mode-specific fields (WordChunk + SRT Direct)
+    # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
-    wc_chunk_size: int = Form(8),
-    wc_max_stretch: float = Form(20.0),
-    wc_transcript: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -2830,8 +2715,6 @@ async def create_job_with_srt(
             use_coqui_xtts=_bool(use_coqui_xtts),
             use_fish_speech=False,
             use_edge_tts=_bool(use_edge_tts),
-            prefer_youtube_subs=_bool(prefer_youtube_subs),
-            use_yt_translate=_bool(use_yt_translate),
             multi_speaker=_bool(multi_speaker),
             audio_priority=_bool(audio_priority),
             audio_untouchable=_bool(audio_untouchable),
@@ -2860,17 +2743,10 @@ async def create_job_with_srt(
             segmenter=segmenter,
             segmenter_buffer_pct=segmenter_buffer_pct,
             max_sentences_per_cue=max_sentences_per_cue,
-            yt_transcript_mode=yt_transcript_mode,
-            yt_segment_mode=yt_segment_mode,
-            yt_text_correction=_bool(yt_text_correction),
-            yt_replace_mode=yt_replace_mode,
             tts_chunk_words=tts_chunk_words,
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
-            wc_chunk_size=wc_chunk_size,
-            wc_max_stretch=wc_max_stretch,
-            wc_transcript=wc_transcript,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -2948,10 +2824,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         else:
             # Whisper-only run at the size the user picked.
             asr_label = f"Whisper {_asr} + DP Cues"
-    elif getattr(req, "use_yt_translate", False):
-        asr_label = "YouTube Auto-Translate"
-    elif getattr(req, "prefer_youtube_subs", False):
-        asr_label = "YouTube Subtitles"
     elif pipeline_mode == "hybrid":
         asr_label = f"Whisper {getattr(req, 'asr_model', 'large-v3')} + DP Cues"
     else:
@@ -2984,8 +2856,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "fast_assemble": getattr(req, "fast_assemble", False),
         "enable_sentence_gap": getattr(req, "enable_sentence_gap", True),
         "enable_duration_fit": getattr(req, "enable_duration_fit", True),
-        "prefer_youtube_subs": getattr(req, "prefer_youtube_subs", False),
-        "use_yt_translate": getattr(req, "use_yt_translate", False),
         "use_whisperx": getattr(req, "use_whisperx", False),
         "simplify_english": getattr(req, "simplify_english", True),
         "enable_manual_review": getattr(req, "enable_manual_review", True),
@@ -3020,10 +2890,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "segmenter": getattr(req, "segmenter", "dp"),
         "segmenter_buffer_pct": getattr(req, "segmenter_buffer_pct", 0.20),
         "max_sentences_per_cue": getattr(req, "max_sentences_per_cue", 2),
-        "yt_transcript_mode": getattr(req, "yt_transcript_mode", "yt_timeline"),
-        "yt_segment_mode": getattr(req, "yt_segment_mode", "sentence"),
-        "yt_text_correction": getattr(req, "yt_text_correction", True),
-        "yt_replace_mode": getattr(req, "yt_replace_mode", "diff"),
         "tts_chunk_words": getattr(req, "tts_chunk_words", 0),
         "gap_mode": getattr(req, "gap_mode", "micro"),
     }

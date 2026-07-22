@@ -20,8 +20,6 @@ export interface DubbingSettings {
     use_coqui_xtts: boolean;
     use_fish_speech: boolean;
     use_edge_tts: boolean;
-    prefer_youtube_subs: boolean;
-    use_yt_translate: boolean;
     multi_speaker: boolean;
     transcribe_only: boolean;
     audio_priority: boolean;
@@ -39,6 +37,8 @@ export interface DubbingSettings {
     dub_chain: string[];
     enable_manual_review: boolean;
     use_whisperx: boolean;
+    whisper_gpu_fallback: boolean;     // local Whisper GPU fallback when WhisperX is "not proper"
+    whisper_fallback_model: string;    // "large-v3" | "medium"
     simplify_english: boolean;
     step_by_step: boolean;
     use_new_pipeline: boolean;
@@ -76,17 +76,8 @@ export interface DubbingSettings {
     segmenter: string;               // "dp" | "sentence"
     segmenter_buffer_pct: number;    // Hindi expansion buffer (default 0.20)
     max_sentences_per_cue: number;   // max sentences per segment (default 2)
-    // ── YouTube Transcript Mode ──
-    yt_transcript_mode: string;      // "yt_timeline" | "whisper_timeline"
-    yt_segment_mode: string;         // "sentence" | "wordcount"
-    yt_text_correction: boolean;     // correct Whisper text using YouTube subs
-    yt_replace_mode: string;         // "full" | "diff"
     tts_chunk_words: number;         // 0=off, 4/8/12=chunk size for TTS
     gap_mode: string;                // "none" | "micro" | "full"
-    // ── WordChunk mode ──
-    wc_chunk_size?: number;          // 4 | 8 | 12
-    wc_max_stretch?: number;         // 1.0 – 20.0
-    wc_transcript?: string;          // optional pasted transcript override
     // ── SRT Direct mode ──
     sd_srt_content?: string;         // full SRT content (required for srtdub mode)
     sd_max_stretch?: number;         // 1.0 – 20.0
@@ -216,11 +207,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [settings.pipeline_mode, settings.asr_model]);
 
-    // SRT Direct and WordChunk have REQUIRED inputs inside the advanced panel
-    // (the SRT textarea / transcript). Auto-expand so users don't think the
-    // tab did nothing.
+    // SRT Direct has a REQUIRED input inside the advanced panel (the SRT
+    // textarea). Auto-expand so users don't think the tab did nothing.
     useEffect(() => {
-        if (settings.pipeline_mode === 'srtdub' || settings.pipeline_mode === 'wordchunk') {
+        if (settings.pipeline_mode === 'srtdub') {
             setOpen(true);
         }
     }, [settings.pipeline_mode]);
@@ -253,22 +243,14 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                 const isHybrid = mode === 'hybrid';
                 const isNew = mode === 'new';
                 const isOneFlow = mode === 'oneflow';
-                const isWordChunk = mode === 'wordchunk';
                 const isSrtDub = mode === 'srtdub';
                 const isSrtMode = settings._input_mode === 'srt';
 
                 // ── Dependency flags ──
                 const isVoiceClone = settings.audio_untouchable && settings.use_coqui_xtts && !settings.use_edge_tts;
-                const ytTranslateOn = settings.use_yt_translate;
-                const ytSubsOn = settings.prefer_youtube_subs;
-                const transcribeOnly = settings.transcribe_only;
-                // Whisper disabled when YouTube provides subs, New pipeline, OneFlow, WordChunk, SrtDub, or SRT mode
-                const whisperDisabled = ytTranslateOn || ytSubsOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
-                const whisperxDisabled = whisperDisabled;
-                // Translation disabled when YT gives Hindi directly, or in TTS-only modes
-                const translationDisabled = ytTranslateOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
-                // Simplify disabled when no English source or in TTS-only modes
-                const simplifyDisabled = ytTranslateOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
+                const whisperDisabled = isOneFlow || isSrtDub || isSrtMode;
+                const translationDisabled = isOneFlow || isSrtDub || isSrtMode;
+                const simplifyDisabled = isOneFlow || isSrtDub || isSrtMode;
 
                 return (<div className="px-5 pb-5 space-y-5 animate-slide-up border-t border-border pt-4">
                     {/* ── Quick Start Tip — always visible at top of advanced ── */}
@@ -276,7 +258,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         <p className="text-xs font-medium text-blue-400 mb-1">Quick Start — defaults are good for most videos</p>
                         <ul className="text-[11px] text-text-muted space-y-0.5 list-disc list-inside">
                             <li><b className="text-text-secondary">Hindi dubbing</b>: leave everything default → paste URL → submit</li>
-                            <li><b className="text-text-secondary">Long video (1h+)</b>: turn on <i>Use YouTube Transcript</i> → skips slow Whisper step</li>
                             <li><b className="text-text-secondary">Best Hindi voice</b>: enable <i>CosyVoice 2</i> or <i>Sarvam Bulbul v3</i></li>
                             <li><b className="text-text-secondary">Already have a translated SRT</b>: switch input mode to <i>SRT</i> → upload it</li>
                         </ul>
@@ -284,7 +265,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                     {/* ── Pipeline Mode Banner ── */}
                     <div className={`rounded-lg p-3 text-xs ${isSrtDub ? 'bg-teal-500/10 border border-teal-500/30 text-teal-400' :
-                        isWordChunk ? 'bg-purple-500/10 border border-purple-500/30 text-purple-400' :
                             isOneFlow ? 'bg-red-500/10 border border-red-500/30 text-red-400' :
                                 isNew ? 'bg-green-500/10 border border-green-500/30 text-green-400' :
                                     isHybrid ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400' :
@@ -292,7 +272,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         }`}>
                         <p className="font-medium mb-1">
                             {isSrtDub ? 'SRT Direct (Your SRT → TTS → Stretch)' :
-                                isWordChunk ? 'WordChunk (YouTube + Super-Stretch)' :
                                     isOneFlow ? 'OneFlow (Fastest)' :
                                         isNew ? 'New Pipeline (Experimental)' :
                                             isHybrid ? 'Hybrid Pipeline (Recommended)' :
@@ -300,7 +279,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </p>
                         <p className="text-[10px] opacity-80">
                             {isSrtDub ? 'You provide a perfect translated SRT. We TTS each cue verbatim → concatenate back-to-back with zero gap → stretch video 1-10× to match audio. If audio still overflows after max stretch, we freeze-pad the last frame. Audio is NEVER trimmed.' :
-                                isWordChunk ? 'YouTube English subs → split by sentence → Google Translate each → Edge-TTS each → concatenate → video stretched 1-5× to match audio. No Whisper.' :
                                     isOneFlow ? 'Groq Whisper → Google Translate (100 workers) → Edge-TTS (150 workers) → fixed 1.15x → video adapts. No LLM, no cue rebuild, just speed.' :
                                         isNew ? 'Parakeet ASR + WhisperX timing + DP cue builder + glossary lock. All new modular code.' :
                                             isHybrid ? 'Whisper ASR (all options) + DP cue builder + glossary + Hindi fitting + QC gates. Best quality + proven infrastructure.' :
@@ -609,73 +587,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </div>
                     )}
 
-                    {/* ── WordChunk-specific controls ── */}
-                    {isWordChunk && (
-                        <div className="rounded-lg p-4 bg-purple-500/5 border border-purple-500/20 space-y-4">
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Chunk size (words per TTS clip)
-                                </label>
-                                <div className="flex gap-2">
-                                    {[4, 8, 12].map(n => (
-                                        <button
-                                            key={n}
-                                            type="button"
-                                            onClick={() => onChange({ ...settings, wc_chunk_size: n } as any)}
-                                            className={`px-4 py-2 text-xs rounded border transition-colors ${((settings as any).wc_chunk_size ?? 8) === n
-                                                ? 'bg-purple-500 text-white border-purple-500'
-                                                : 'bg-white/5 text-text-muted border-border hover:bg-white/10'
-                                                }`}
-                                        >
-                                            {n} words
-                                        </button>
-                                    ))}
-                                </div>
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    Smaller = tighter sync; larger = smoother prosody.
-                                </p>
-                            </div>
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Max video stretch: {((settings as any).wc_max_stretch ?? 20.0).toFixed(1)}×
-                                </label>
-                                <input
-                                    type="range"
-                                    min="1"
-                                    max="20"
-                                    step="0.5"
-                                    aria-label="Maximum video stretch multiplier"
-                                    title="Maximum video stretch multiplier"
-                                    value={(settings as any).wc_max_stretch ?? 20.0}
-                                    onChange={e => onChange({ ...settings, wc_max_stretch: parseFloat(e.target.value) } as any)}
-                                    className="w-full accent-purple-500"
-                                />
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    Cap for slowing video to match audio. Video never speeds up.
-                                </p>
-                            </div>
-
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Transcript override (optional)
-                                </label>
-                                <textarea
-                                    rows={6}
-                                    placeholder="Paste the English transcript here to skip YouTube subs fetch. Leave blank to auto-download subs. Copy from YouTube's transcript panel or any other source — timestamps and speaker labels are stripped automatically."
-                                    aria-label="Pasted English transcript override"
-                                    value={(settings as any).wc_transcript ?? ""}
-                                    onChange={e => onChange({ ...settings, wc_transcript: e.target.value } as any)}
-                                    className="w-full bg-white/5 border border-border rounded px-3 py-2 text-xs text-text-primary placeholder:text-text-muted/60 focus:outline-none focus:border-purple-500 font-mono"
-                                />
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    {((settings as any).wc_transcript ?? "").trim()
-                                        ? `Using pasted transcript (${((settings as any).wc_transcript ?? "").trim().length} chars) — YouTube subs fetch SKIPPED`
-                                        : "Leave empty to auto-fetch YouTube English subs via yt-dlp."}
-                                </p>
-                            </div>
-                        </div>
-                    )}
-
                     {/* SRT Mode: lock transcription + translation (SRT already has translated text) */}
                     {isSrtMode && (
                         <div className="rounded-lg bg-purple-500/5 border border-purple-500/20 p-3">
@@ -740,11 +651,11 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </>
                                 ) : (
                                     <>
-                                        <b className="text-text-secondary">Recommended:</b> use <i>Groq</i> (cloud, fastest) or <i>Use YouTube Transcript</i> below if the video has captions.
+                                        <b className="text-text-secondary">Recommended:</b> use <i>Groq</i> (cloud, fastest).
                                         Local models only matter if Groq is rate-limited.
                                     </>
                                 )}
-                                {whisperDisabled && !isNew && <span className="text-yellow-400 ml-1"> — Whisper currently skipped, using YouTube subs</span>}
+                                {whisperDisabled && !isNew && <span className="text-yellow-400 ml-1"> — Whisper skipped in this mode</span>}
                             </p>
                             <div className="space-y-3">
                                 <div className={(whisperDisabled && !isNew) ? 'opacity-40 pointer-events-none' : ''}>
@@ -781,188 +692,11 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
                                 </div>
 
-                                {/* YouTube Subtitles — disabled when YT Auto-Translate is on */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">Use YouTube Transcript ⚡</p>
-                                        <p className="text-xs text-text-muted">
-                                            Skip Whisper completely — download YouTube&apos;s caption file (~5-10s). Best for lectures, TED talks, tutorials with clean audio. Falls back to Whisper if no captions exist.
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— disabled: YT Translate is on (cascade includes this automatically)</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YouTube Subtitles"
-                                        onClick={() => update({
-                                            prefer_youtube_subs: !settings.prefer_youtube_subs,
-                                            ...(!settings.prefer_youtube_subs ? { use_yt_translate: false } : {}),
-                                        })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.prefer_youtube_subs ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YouTube Auto-Translate — the CASCADE toggle */}
-                                <div className={`flex items-center justify-between ${(ytSubsOn || transcribeOnly || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">YT Auto-Translate ⚡⚡ <span className="text-[10px] text-green-400">CASCADE</span></p>
-                                        <p className="text-xs text-text-muted">
-                                            <b>Recommended.</b> Full cascade: tries YouTube Hindi first (best quality, fastest).
-                                            If Hindi unavailable/429, falls back to YouTube English subs + Google Translate.
-                                            If no subs at all, falls back to Whisper. All with retries + Premium cookies.
-                                            {ytSubsOn && <span className="text-yellow-400 ml-1">— disabled: YT Transcript is on</span>}
-                                            {transcribeOnly && !ytSubsOn && <span className="text-yellow-400 ml-1">— disabled: Transcribe Only is on</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YouTube Translate"
-                                        onClick={() => update({
-                                            use_yt_translate: !settings.use_yt_translate,
-                                            ...(!settings.use_yt_translate ? { prefer_youtube_subs: false, transcribe_only: false } : {}),
-                                        })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.use_yt_translate ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.use_yt_translate ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YT Text Correction — works WITH Whisper, not instead of it */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || ytSubsOn || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">YT Text Correction</p>
-                                        <p className="text-xs text-text-muted">
-                                            Whisper runs normally (keeps precise timestamps). YouTube subs fix text errors — proper nouns, punctuation, hallucinations. Best of both.
-                                            {(ytTranslateOn || ytSubsOn) && <span className="text-yellow-400 ml-1">— disabled: YT subs mode already replaces Whisper</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YT Text Correction"
-                                        onClick={() => update({ yt_text_correction: !settings.yt_text_correction })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.yt_text_correction ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.yt_text_correction ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YT Replace Mode — only visible when YT Text Correction is ON */}
-                                {settings.yt_text_correction && !ytTranslateOn && !ytSubsOn && !isOneFlow && !isSrtMode && (
-                                    <div className="flex items-center justify-between ml-4">
-                                        <div>
-                                            <p className="text-xs font-medium text-text-secondary">Replace Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                {settings.yt_replace_mode === 'full'
-                                                    ? 'Full — replace all Whisper text with YouTube text. Clean names but loses Whisper punctuation.'
-                                                    : 'Diff — word-level comparison, only swap words that differ (names, nouns, misspellings). Keeps Whisper punctuation.'}
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_replace_mode: 'diff' })}
-                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.yt_replace_mode === 'diff'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Diff
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_replace_mode: 'full' })}
-                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.yt_replace_mode === 'full'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Full
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-
                                 {/* Translation Glossary — words to keep/transliterate */}
                                 <GlossaryEditor />
 
-                                {/* YouTube Transcript Mode — only visible when YT subs are enabled */}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <p className="text-sm text-text-primary">YT Transcript Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                How YouTube subs are structured before feeding to TTS pipeline.
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            {([
-                                                { mode: 'yt_timeline', label: 'YT Timeline', desc: 'Fast (no Whisper)' },
-                                                { mode: 'whisper_timeline', label: 'Whisper Timeline', desc: 'Precise (slower)' },
-                                            ] as const).map(({ mode, label }) => (
-                                                <button
-                                                    key={mode}
-                                                    type="button"
-                                                    onClick={() => update({ yt_transcript_mode: mode })}
-                                                    className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_transcript_mode === mode
-                                                        ? 'bg-primary text-white'
-                                                        : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                        }`}
-                                                >
-                                                    {label}
-                                                </button>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="text-[10px] text-text-muted -mt-1 ml-1">
-                                        {settings.yt_transcript_mode === 'whisper_timeline'
-                                            ? 'YouTube text + Whisper precise timestamps. Runs Whisper for timing only, uses YouTube text (better quality). Slower but exact slot durations.'
-                                            : 'YouTube text + YouTube timelines. Fast, no Whisper needed.'}
-                                    </div>
-                                )}
-
-                                {/* Segment Split Mode — only visible when YT subs are enabled */}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <p className="text-sm text-text-primary">Segment Split Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                How text is split into segments for TTS.
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_segment_mode: 'sentence' })}
-                                                className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_segment_mode === 'sentence'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Sentence
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_segment_mode: 'wordcount' })}
-                                                className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_segment_mode === 'wordcount'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Word Count
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="text-[10px] text-text-muted -mt-1 ml-1">
-                                        {settings.yt_segment_mode === 'wordcount'
-                                            ? 'Even word-count split (~20 words/segment). Uniform speed, works without punctuation. Gaps removed anyway.'
-                                            : '2 sentences per segment (atomic, never split). Needs punctuation in captions. Auto-falls back to word count if no punctuation detected.'}
-                                    </div>
-                                )}
-
-                                {/* Chain Dub — disabled when YT Translate or New pipeline */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                {/* Chain Dub — disabled when New pipeline */}
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                                     <div>
                                         <p className="text-sm text-text-primary">Chain Dub (English → Hindi)</p>
                                         <p className="text-xs text-text-muted">Dub to English first using subs, then English to Hindi (best for non-English videos)</p>
@@ -976,21 +710,19 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
 
-                                {/* WhisperX — disabled when Whisper skipped or New pipeline (built-in) */}
-                                <div className={`flex items-center justify-between ${(whisperxDisabled || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                {/* WhisperX now lives in the dedicated Word Timing module (single
+                                    source of truth). Breadcrumb shows state + where to change it. */}
+                                <div className="flex items-center justify-between py-1">
                                     <div>
                                         <p className="text-sm text-text-primary">WhisperX Alignment</p>
                                         <p className="text-xs text-text-muted">
-                                            Force word-level timestamp alignment (requires whisperx)
-                                            {whisperDisabled && <span className="text-yellow-400 ml-1">— needs Whisper</span>}
+                                            Managed in the <span className="text-primary">Word Timing</span> panel above.
+                                            {whisperDisabled && <span className="text-yellow-400 ml-1">— Whisper skipped this mode</span>}
                                         </p>
                                     </div>
-                                    <button
-                                        type="button" title="Toggle WhisperX Alignment" onClick={() => update({ use_whisperx: !settings.use_whisperx })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.use_whisperx ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.use_whisperx ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full shrink-0 ${settings.use_whisperx ? 'bg-primary/20 text-primary' : 'bg-white/10 text-text-muted'}`}>
+                                        {settings.use_whisperx ? 'ON' : 'OFF'}
+                                    </span>
                                 </div>
 
                                 {/* Wav2Lip lip-sync — post-assembly, opt-in. Needs GPU + backend/wav2lip/ + checkpoint */}
@@ -1015,7 +747,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                         <p className="text-sm text-text-primary">Simplify English</p>
                                         <p className="text-xs text-text-muted">
                                             Rewrite complex English into simple sentences — much better Hindi
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— not needed with YT Translate</span>}
                                         </p>
                                     </div>
                                     <button
@@ -1100,7 +831,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </p>
                             <p className="text-[10px] text-text-muted mb-3">
                                 <b className="text-text-secondary">Recommended:</b> <i>Google</i> = fastest free (used by default). <i>Gemma 4</i> = best Hindi quality but needs GEMINI_API_KEY. <i>Cerebras</i> = ultra-fast LLM, also good.
-                                {ytTranslateOn && <span className="text-yellow-400 ml-1"> Skipped — YouTube already translated.</span>}
                             </p>
                             <div className="grid grid-cols-6 gap-2 mb-3">
                                 {[
@@ -1188,29 +918,25 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </div>
                         )}
 
-                        {/* Transcribe Only — disabled when YT Auto-Translate or New pipeline */}
-                        <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        {/* Transcribe Only — disabled when New pipeline */}
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                                 <p className="text-sm text-text-primary">Transcribe Only</p>
                                 <p className="text-xs text-text-muted">
                                     Get SRT to translate yourself (e.g. with Claude), then upload back
-                                    {ytTranslateOn && <span className="text-yellow-400 ml-1">— off: YT Translate active</span>}
                                 </p>
                             </div>
                             <button
                                 type="button" title="Toggle Transcribe Only"
-                                onClick={() => update({
-                                    transcribe_only: !settings.transcribe_only,
-                                    ...(!settings.transcribe_only ? { use_yt_translate: false } : {}),
-                                })}
+                                onClick={() => update({ transcribe_only: !settings.transcribe_only })}
                                 className={`w-11 h-6 rounded-full transition-colors relative ${settings.transcribe_only ? 'bg-primary' : 'bg-white/10'}`}
                             >
                                 <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.transcribe_only ? 'translate-x-6' : 'translate-x-1'}`} />
                             </button>
                         </div>
 
-                        {/* Multi-Speaker Voices — disabled when YT Translate or New pipeline */}
-                        <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        {/* Multi-Speaker Voices — disabled when New pipeline */}
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                                 <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
                                 <p className="text-xs text-text-muted">Detect speakers & assign distinct voices (needs HF_TOKEN, adds ~30s)</p>
@@ -2478,13 +2204,12 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
 
-                                {/* Step-by-Step Review — disabled when YT Translate or New pipeline */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                {/* Step-by-Step Review — disabled when New pipeline */}
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                                     <div>
                                         <p className="text-sm text-text-primary">Step-by-Step Review</p>
                                         <p className="text-xs text-text-muted">
                                             Pause after transcription & translation to review output before continuing
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— off: YT Translate skips these steps</span>}
                                         </p>
                                     </div>
                                     <button

@@ -763,11 +763,6 @@ class PipelineConfig:
     use_google_tts: bool = False
     use_coqui_xtts: bool = False        # OFF: slow GPU, not needed for SRT upload
     use_edge_tts: bool = True
-    prefer_youtube_subs: bool = True     # ON: skip Whisper if YouTube has subs
-    # ON by default (2026-04-12): YouTube's auto-translated Hindi is higher
-    # quality than Google Translate API for narrative content. If 429 or
-    # unavailable, cascade falls back to English subs + Google Translate.
-    use_yt_translate: bool = True
     multi_speaker: bool = False
     transcribe_only: bool = False
     simplify_english: bool = False
@@ -949,13 +944,6 @@ class PipelineConfig:
     segmenter: str = "dp"                # "dp" | "sentence"
     segmenter_buffer_pct: float = 0.20   # Hindi expansion buffer
     max_sentences_per_cue: int = 2       # max sentences per segment
-    # YouTube transcript structuring mode:
-    #   "yt_timeline"      — YouTube text + YouTube timelines (fast, no Whisper)
-    #   "whisper_timeline" — YouTube text + Whisper timestamps (precise, slower)
-    yt_transcript_mode: str = "yt_timeline"
-    yt_segment_mode: str = "sentence"    # "sentence" | "wordcount"
-    yt_text_correction: bool = True      # correct Whisper text using YouTube subs
-    yt_replace_mode: str = "diff"        # "full" (total replace) | "diff" (word-level fix)
     tts_chunk_words: int = 0             # 0=off, 4/8/12=chunk translated text before TTS
     gap_mode: str = "micro"              # "none" | "micro" | "full"
     # ── Wav2Lip lip-sync post-processing ──
@@ -1888,74 +1876,10 @@ class Pipeline:
             self._report("transcribe", 1.0,
                          f"[cached] Loaded {len(text_segments)} transcribed segments")
         else:
-            sub_segments = None
-
-            # ── YT Auto-Translate fast-fast path: skip Whisper AND translation ──
-            # If user enabled use_yt_translate, fetch YouTube's pre-translated
-            # subs in the target language directly. Whisper never runs.
-            if self.cfg.use_yt_translate and re.match(r"^https?://", self.cfg.source):
-                self._report("transcribe", 0.0,
-                             "YT Auto-Translate ON — fetching YouTube's pre-translated subs (skipping Whisper)...")
-                yt_translated_subs = self._fetch_youtube_translated_subs(self.cfg.source)
-                if yt_translated_subs:
-                    # These segments already have text_translated populated.
-                    # Mark them so the fast path also skips translation.
-                    for seg in yt_translated_subs:
-                        seg.setdefault("_qc_issues", [])
-                        seg.setdefault("_protected_terms", [])
-                        seg.setdefault("emotion", "neutral")
-                        seg.setdefault("text_en_clean", seg.get("text", ""))
-                        # Ensure 'text' field is also set so downstream filters work
-                        if not seg.get("text") and seg.get("text_translated"):
-                            seg["text"] = seg["text_translated"]
-                    self.segments = yt_translated_subs
-                    sub_segments = yt_translated_subs  # mark for fast path below
-                    self._yt_subs_fast_path = True
-                    self._yt_already_translated = True  # tells _run_from_step4 to skip translation
-                    self._report("transcribe", 1.0,
-                                 f"YT Auto-Translate: {len(yt_translated_subs)} pre-translated segments — skipping Whisper AND translation")
-                else:
-                    self._report("transcribe", 0.05,
-                                 "No YT translated subs found -- falling back to Whisper + our translator")
-                # Mark that we already attempted, so step 4 doesn't retry
-                self._yt_translate_attempted = True
-
-            # ── CASCADE FALLBACK: English subs ──
-            # If Hindi auto-translate failed (or wasn't attempted), try English
-            # subs. This fires when EITHER:
-            #   - prefer_youtube_subs=True (user explicitly chose English subs)
-            #   - use_yt_translate=True but Hindi download failed (automatic
-            #     fallback — the UI makes these toggles mutually exclusive,
-            #     but the backend cascade should still fall through)
-            # This way the user only needs to turn ON "YT Auto-Translate"
-            # and the cascade handles Hindi -> English -> Whisper automatically.
-            _try_english_subs = (
-                self.cfg.prefer_youtube_subs
-                or (self.cfg.use_yt_translate and not sub_segments)
-            )
-            if not sub_segments and _try_english_subs:
-                self._report("transcribe", 0.0,
-                             "Checking for YouTube English subtitles (cascade fallback)...")
-                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-
-            if sub_segments:
-                self.segments = sub_segments
-                # Set fields for downstream compatibility + skip flag
-                for seg in sub_segments:
-                    seg.setdefault("_qc_issues", [])
-                    seg.setdefault("_protected_terms", [])
-                    seg.setdefault("emotion", "neutral")
-                    seg.setdefault("text_en_clean", seg.get("text", ""))
-                self._yt_subs_fast_path = True  # Skip ALL English processing
-                self._report("transcribe", 1.0,
-                             f"YouTube subs: {len(sub_segments)} segments — skipping English processing")
-            else:
-                if self.cfg.prefer_youtube_subs:
-                    self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
-                self._report("transcribe", 0.1, "Loading ASR model...")
-                whisper_audio = self._whisper_audio or audio_raw
-                self.segments = self._transcribe(whisper_audio)
-                self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+            self._report("transcribe", 0.1, "Loading ASR model...")
+            whisper_audio = self._whisper_audio or audio_raw
+            self.segments = self._transcribe(whisper_audio)
+            self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
 
             text_segments = [s for s in self.segments if s.get("text", "").strip()]
             if not text_segments:
@@ -1967,113 +1891,6 @@ class Pipeline:
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
             raise RuntimeError("No speech detected in the video")
-
-        # ── YouTube subs fast path: skip ALL English processing to Step 4 ──
-        if getattr(self, '_yt_subs_fast_path', False):
-            self._ref_english_subs = None
-            self._voice_map = None
-            self._keyterms = {}
-
-            # ── CRITICAL: merge YouTube SRT fragments into complete sentences ──
-            # YouTube's raw SRT has ~192 tiny 2-4 second chunks split mid-sentence
-            # (e.g., "also a white tiger, but he came out as a"). Without merging,
-            # these fragments go directly to TTS and produce choppy audio.
-            # _merge_broken_sentences is the same step that runs on Whisper output
-            # in the main flow — we just need to also run it here.
-            pre_merge = len(text_segments)
-            yt_sentences = self._merge_broken_sentences(text_segments)
-            if len(yt_sentences) < pre_merge:
-                self._report("transcribe", 0.80,
-                             f"Merged YouTube SRT fragments: {pre_merge} -> {len(yt_sentences)} sentences")
-
-            # ── YouTube Transcript Mode: structure into Whisper-style segments ──
-            _yt_mode = getattr(self.cfg, 'yt_transcript_mode', 'yt_timeline')
-
-            if _yt_mode == "whisper_timeline":
-                # ═══ OPTION 2: YouTube text + Whisper timeline ═══
-                # Run Whisper for precise speech timestamps, then replace its
-                # text with YouTube's (better quality). Slower but exact timelines.
-                self._report("transcribe", 0.82,
-                             "Option 2: Running Whisper for precise timestamps...")
-                whisper_audio = self._whisper_audio or audio_raw
-                whisper_raw = self._transcribe(whisper_audio)
-                whisper_merged = self._merge_broken_sentences(whisper_raw)
-                self._report("transcribe", 0.90,
-                             f"Whisper: {len(whisper_raw)} raw -> {len(whisper_merged)} "
-                             f"merged. Aligning YouTube text ({len(yt_sentences)} sentences)...")
-
-                # Align: YouTube text + Whisper timestamps
-                text_segments = self._align_yt_text_to_whisper_timeline(
-                    yt_sentences, whisper_merged)
-
-                # Merge again (alignment may have created fragments)
-                text_segments = self._merge_broken_sentences(text_segments)
-                self._report("transcribe", 0.92,
-                             f"Aligned: {len(text_segments)} segments (Whisper timeline + YT text)")
-            else:
-                # ═══ OPTION 1: YouTube text + YouTube timeline (default) ═══
-                # Fast path: no Whisper needed. YouTube's own timelines are used.
-                text_segments = yt_sentences
-
-            # ── Segment split mode: user choice ──
-            _seg_mode = getattr(self.cfg, 'yt_segment_mode', 'sentence')
-
-            # Safety: if user chose "sentence" but captions have no punctuation
-            # (avg segment > 8s after merge), auto-fallback to wordcount.
-            if _seg_mode == "sentence" and text_segments:
-                avg_dur = sum(
-                    s.get("end", 0) - s.get("start", 0) for s in text_segments
-                ) / len(text_segments)
-                if avg_dur > 8.0:
-                    _seg_mode = "wordcount"
-                    self._report("transcribe", 0.91,
-                                 f"No punctuation detected (avg seg {avg_dur:.1f}s) "
-                                 f"-> auto-switching to word-count split")
-
-            # ── Total word count (across all sentences/segments) ──
-            total_words = sum(len(s.get("text", "").split()) for s in text_segments)
-            total_sents = len(text_segments)
-            _unit = "sentences" if _seg_mode == "sentence" else "chunks"
-            self._report("transcribe", 0.93,
-                         f"Inventory: {total_sents} {_unit}, "
-                         f"{total_words} total words, "
-                         f"avg {total_words / max(total_sents, 1):.1f} words/{_unit[:-1]}")
-
-            if _seg_mode == "sentence":
-                # ── SENTENCE SPLIT: group 2 sentences per segment ──
-                # Sentences are atomic — never split. Orphan merges into previous.
-                max_per_cue = getattr(self.cfg, 'max_sentences_per_cue', 2)
-                text_segments = self._group_sentences_by_count(
-                    text_segments, target_per_group=max_per_cue)
-            else:
-                # ── WORD COUNT SPLIT: ~20 words per segment (uniform) ──
-                # Join all text, split into even segments by word count.
-                # Gaps removed anyway -> uniform word density = uniform speed.
-                target_words_per_seg = 20  # ~2 sentences worth
-                text_segments = self._split_by_even_wordcount(
-                    text_segments, target_words_per_seg)
-
-            # ── Redistribute slot timelines by word count ──
-            # Each segment gets time proportional to its word count. Segments
-            # with more words get more time -> matches what TTS will produce.
-            text_segments = self._redistribute_slots_by_wordcount(text_segments)
-
-            self.segments = text_segments
-
-            from srt_utils import write_srt as _fast_ws
-            src_srt = self.cfg.work_dir / "transcript_source.srt"
-            if not src_srt.exists():
-                _fast_ws(text_segments, src_srt, text_key="text")
-
-            _mode_label = "YT text + Whisper timeline" if _yt_mode == "whisper_timeline" \
-                          else "YT text + YT timeline"
-            _split_label = "sentence-split" if _seg_mode == "sentence" else "word-split"
-            self._report("transcribe", 1.0,
-                         f"[{_mode_label}, {_split_label}] {len(text_segments)} segments, "
-                         f"{total_words} words -> translation")
-            # SKIP to Step 4 — run _run_from_step4 which contains translate -> TTS -> assemble
-            self._run_from_step4(text_segments, video_path, audio_raw)
-            return
 
         # Fetch English reference subs for QA (save for post-translation comparison)
         self._ref_english_subs = None
@@ -2122,46 +1939,6 @@ class Pipeline:
             _write_srt_src(text_segments, source_srt, text_key="text",
                            include_speaker=has_speakers)
 
-        # ── YouTube text correction: fix Whisper text using YouTube subs ──
-        # Whisper keeps its precise timestamps (proven to produce 5:34 output).
-        # Only the TEXT is replaced with YouTube's (fewer hallucinations, better
-        # punctuation, correct proper nouns). If YouTube subs aren't available,
-        # Whisper's own text is used unchanged.
-        if getattr(self.cfg, 'yt_text_correction', False) and re.match(r"^https?://", self.cfg.source):
-            try:
-                self._report("transcribe", 0.85,
-                             "Fetching YouTube subs for text correction...")
-                yt_subs = self._fetch_youtube_subtitles(self.cfg.source)
-                if yt_subs:
-                    # Merge YouTube fragments into complete sentences
-                    yt_merged = self._merge_broken_sentences(yt_subs)
-                    self._report("transcribe", 0.88,
-                                 f"YouTube subs: {len(yt_subs)} fragments -> {len(yt_merged)} sentences. "
-                                 f"Correcting Whisper text...")
-                    # Replace Whisper text with YouTube text, keep Whisper timestamps
-                    corrected = self._correct_whisper_with_yt(text_segments, yt_merged)
-                    if corrected:
-                        corrected_count = sum(
-                            1 for i, s in enumerate(text_segments)
-                            if i < len(corrected) and s.get("text") != corrected[i].get("text")
-                        )
-                        text_segments = corrected
-                        self.segments = text_segments
-                        self._report("transcribe", 0.90,
-                                     f"Corrected {corrected_count}/{len(text_segments)} segments "
-                                     f"using YouTube subs")
-                    else:
-                        self._report("transcribe", 0.90,
-                                     "YT text correction returned empty -> using Whisper text as-is")
-                else:
-                    self._report("transcribe", 0.90,
-                                 "No YouTube subs found -> using Whisper text as-is")
-            except Exception as _ytc_err:
-                print(f"[YT-text-correct] Failed: {_ytc_err} -> continuing with Whisper text",
-                      flush=True)
-                self._report("transcribe", 0.90,
-                             f"YT text correction failed ({str(_ytc_err)[:60]}) -> using Whisper text")
-
         # ── Merge broken sentences: fix Whisper mid-sentence splits ──────
         text_segments = self._merge_broken_sentences(text_segments)
 
@@ -2186,142 +1963,39 @@ class Pipeline:
         self._check_cancelled()
 
         # Step 4: Translate — cache: _cache_translate.json exists
-        yt_translated = None
-        # Only try YouTube translated subs if we haven't already attempted
-        # them in the transcription step (line 1817). If the first attempt
-        # failed (429/unavailable), retrying here wastes 10-30 seconds on
-        # yt-dlp for the same result.
-        _yt_already_attempted = getattr(self, '_yt_translate_attempted', False)
-        if self.cfg.use_yt_translate and re.match(r"^https?://", self.cfg.source) and not _yt_already_attempted:
-            self._report("translate", 0.0, "Fetching YouTube auto-translated subtitles...")
-            yt_translated = self._fetch_youtube_translated_subs(self.cfg.source)
-            if yt_translated:
-                self.segments = yt_translated
-                text_segments = [s for s in self.segments if s.get("text_translated", "").strip()]
+        cached_translated = self._load_segments_cache("translate")
+        if cached_translated:
+            # Verify the cached translation matches current target language
+            has_translation = any(s.get("text_translated") for s in cached_translated)
+            if has_translation:
+                self.segments = cached_translated
+                text_segments = [s for s in self.segments if s.get("text", "").strip()]
                 self._report("translate", 1.0,
-                             f"Using YouTube translated subs — {len(text_segments)} segments (skipped Whisper translation)")
-                self._save_segments_cache(text_segments, "translate")
+                             f"[cached] Loaded {len(text_segments)} translated segments")
             else:
-                self._report("translate", 0.1, "No YouTube translated subs found, using normal translation...")
+                cached_translated = None
 
-        if not yt_translated:
-            cached_translated = self._load_segments_cache("translate")
-            if cached_translated:
-                # Verify the cached translation matches current target language
-                has_translation = any(s.get("text_translated") for s in cached_translated)
-                if has_translation:
-                    self.segments = cached_translated
-                    text_segments = [s for s in self.segments if s.get("text", "").strip()]
-                    self._report("translate", 1.0,
-                                 f"[cached] Loaded {len(text_segments)} translated segments")
-                else:
-                    cached_translated = None
+        if not cached_translated:
+            target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
 
-            if not cached_translated:
-                target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+            # Mask glossary words before Google Translate
+            self._glossary_mask(text_segments)
+            self._report("translate", 0.0,
+                         f"[Google Translate] Translating {len(text_segments)} segments to {target_name}...")
+            self._translate_segments(text_segments)
+            # Unmask glossary placeholders in translated text
+            self._glossary_unmask(text_segments)
 
-                # ── Try YouTube Hindi translation first (better than Google) ──
-                _yt_hindi_used = False
-                if (getattr(self.cfg, 'yt_text_correction', False)
-                    and re.match(r"^https?://", self.cfg.source)):
-                    try:
-                        import time as _yth_time
-                        yt_hindi = None
-                        for _yth_attempt in range(3):
-                            self._report("translate", 0.0,
-                                         f"[YT Hindi] Downloading YouTube Hindi auto-translate "
-                                         f"(attempt {_yth_attempt + 1}/3)...")
-                            print(f"[YT-Hindi] Attempt {_yth_attempt + 1}/3...", flush=True)
-                            yt_hindi = self._fetch_youtube_translated_subs(self.cfg.source)
-                            if yt_hindi:
-                                break
-                            if _yth_attempt < 2:
-                                _delay = 3 * (_yth_attempt + 1)
-                                print(f"[YT-Hindi] Attempt {_yth_attempt + 1} returned None, "
-                                      f"retrying in {_delay}s...", flush=True)
-                                _yth_time.sleep(_delay)
-                        if yt_hindi:
-                            print(f"[YT-Hindi] SUCCESS: Got {len(yt_hindi)} Hindi segments from YouTube",
-                                  flush=True)
-                            # Show first segment as preview
-                            _preview = ""
-                            for _ys in yt_hindi[:1]:
-                                _preview = _ys.get("text_translated", _ys.get("text", ""))[:80]
-                            self._report("translate", 0.1,
-                                         f"[YT Hindi] Downloaded {len(yt_hindi)} segments. "
-                                         f"Preview: {_preview}...")
-
-                            # Map YouTube Hindi text onto our Whisper-timed segments
-                            yt_hindi_words: List[str] = []
-                            for ys in yt_hindi:
-                                tr = ys.get("text_translated", ys.get("text", ""))
-                                yt_hindi_words.extend(tr.split())
-
-                            if yt_hindi_words:
-                                w_total = sum(
-                                    max(len(s.get("text", "").split()), 1)
-                                    for s in text_segments
-                                )
-                                yt_h_total = len(yt_hindi_words)
-                                cursor = 0
-
-                                for si, seg in enumerate(text_segments):
-                                    seg_wc = max(len(seg.get("text", "").split()), 1)
-                                    n = round((seg_wc / w_total) * yt_h_total)
-                                    n = max(1, min(n, yt_h_total - cursor))
-                                    if si == len(text_segments) - 1:
-                                        n = max(0, yt_h_total - cursor)
-                                    if n > 0 and cursor < yt_h_total:
-                                        seg["text_translated"] = " ".join(
-                                            yt_hindi_words[cursor:cursor + n])
-                                        cursor += n
-                                    elif not seg.get("text_translated"):
-                                        # Safety: if cursor exhausted, use English as fallback
-                                        seg["text_translated"] = seg.get("text", "")
-
-                                _yt_hindi_used = True
-                                self._report("translate", 0.9,
-                                             f"[YT Hindi] USED — {yt_h_total} Hindi words -> "
-                                             f"{len(text_segments)} segments (Google Translate SKIPPED)")
-                                print(f"[YT-Hindi] Mapped {yt_h_total} Hindi words to "
-                                      f"{len(text_segments)} segments. Google Translate skipped.",
-                                      flush=True)
-                                # Post-replace glossary words in YouTube Hindi
-                                self._glossary_post_replace(text_segments)
-                            else:
-                                self._report("translate", 0.05,
-                                             "[YT Hindi] Downloaded but empty text -> using Google Translate")
-                                print("[YT-Hindi] Downloaded but segments had no text", flush=True)
-                        else:
-                            self._report("translate", 0.05,
-                                         "[YT Hindi] NOT AVAILABLE -> using Google Translate instead")
-                            print("[YT-Hindi] Not available for this video. "
-                                  "Falling back to Google Translate.", flush=True)
-                    except Exception as _yth_err:
-                        self._report("translate", 0.05,
-                                     f"[YT Hindi] FAILED ({str(_yth_err)[:40]}) -> using Google Translate")
-                        print(f"[YT-Hindi] Failed: {_yth_err} -> falling back to Google Translate",
-                              flush=True)
-
-                if not _yt_hindi_used:
-                    # Mask glossary words before Google Translate
-                    self._glossary_mask(text_segments)
-                    self._report("translate", 0.0,
-                                 f"[Google Translate] Translating {len(text_segments)} segments to {target_name}...")
-                    self._translate_segments(text_segments)
-                    # Unmask glossary placeholders in translated text
-                    self._glossary_unmask(text_segments)
-
-                # Recalculate timeline for target language word count
-                self._recalculate_timeline(text_segments)
-                self._close_segment_gaps(text_segments)
-                self.segments = text_segments
-                # Tag emotion on each segment after translation
-                for _seg in text_segments:
-                    _seg["emotion"] = self._detect_segment_emotion(_seg)
-                self._report("translate", 1.0, "Translation complete")
-                # Cache translation for crash recovery
-                self._save_segments_cache(text_segments, "translate")
+            # Recalculate timeline for target language word count
+            self._recalculate_timeline(text_segments)
+            self._close_segment_gaps(text_segments)
+            self.segments = text_segments
+            # Tag emotion on each segment after translation
+            for _seg in text_segments:
+                _seg["emotion"] = self._detect_segment_emotion(_seg)
+            self._report("translate", 1.0, "Translation complete")
+            # Cache translation for crash recovery
+            self._save_segments_cache(text_segments, "translate")
 
         # ── QA Check: Compare our translation against reference English subs ──
         if getattr(self, '_ref_english_subs', None):
@@ -2465,15 +2139,8 @@ class Pipeline:
 
         self.segments = text_segments
 
-        # ── If YT Auto-Translate already provided text_translated, skip ALL translation ──
-        already_translated = getattr(self, '_yt_already_translated', False) and all(
-            s.get("text_translated", "").strip() for s in text_segments
-        )
-
-        if already_translated:
-            self._report("translate", 1.0,
-                         f"YT Auto-Translate provided {len(text_segments)} pre-translated segments — skipping translation step")
-        else:
+        # Translate Whisper/SRT output into the target language
+        if True:
             # Simplify English before translation (if enabled)
             if self.cfg.simplify_english:
                 self._report("translate", 0.0, "Simplifying English for better translation...")
@@ -2655,14 +2322,8 @@ class Pipeline:
             self.segments = cached_segs
             self._report("transcribe", 1.0, f"[cached] {len(cached_segs)} segments")
         else:
-            sub_segments = None
-            if self.cfg.prefer_youtube_subs and re.match(r"^https?://", self.cfg.source):
-                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-            if self.cfg.prefer_youtube_subs and sub_segments:
-                self.segments = sub_segments
-            else:
-                whisper_audio = self._whisper_audio or audio_raw
-                self.segments = self._transcribe(whisper_audio)
+            whisper_audio = self._whisper_audio or audio_raw
+            self.segments = self._transcribe(whisper_audio)
             text_segments = [s for s in self.segments if s.get("text", "").strip()]
             if text_segments:
                 self._save_segments_cache(text_segments, "transcribe")
@@ -3573,220 +3234,6 @@ class Pipeline:
 
         return merged
 
-    def _fetch_youtube_subtitles(self, url: str) -> Optional[List[Dict]]:
-        """Download and parse YouTube subtitles via yt-dlp. Returns segments or None.
-
-        Single yt-dlp call with all common languages + auto-generated subs.
-        ~5-10s per video. Battle-tested, updated daily, rarely breaks.
-
-        Languages are tried in PRIORITY ORDER (not filesystem order) so we
-        always prefer the source language → English → other common ones.
-        """
-        if not re.match(r"^https?://", url):
-            return None
-
-        # GUARD: NO cookies for subtitle downloads. Premium cookies trigger
-        # YouTube's JS signature challenge which kills the entire yt-dlp process.
-        # Subtitles are public — no authentication needed. See 2026-04-13 fix.
-        # cookies_args = self._get_cookies_args()  # DO NOT USE for subs
-        sub_dir = self.cfg.work_dir / "subs"
-        sub_dir.mkdir(exist_ok=True)
-        out_tpl = str(sub_dir / "sub.%(ext)s")
-
-        # Build PRIORITY-ORDERED language list — explicit source first, English next,
-        # then common fallbacks. Order matters: we pick the FIRST one that has subs.
-        if self.cfg.source_language and self.cfg.source_language != "auto":
-            priority_langs = [
-                self.cfg.source_language,          # user-specified source
-                f"{self.cfg.source_language}-US",  # variant
-                f"{self.cfg.source_language}-GB",  # variant
-                "en", "en-US", "en-GB",            # English fallback
-            ]
-        else:
-            # auto-detect: English first (most YouTube content), then common ones
-            priority_langs = [
-                "en", "en-US", "en-GB",
-                "hi", "hi-IN",
-                "zh", "zh-Hans", "zh-Hant",
-                "ja", "ko", "es", "ru", "fr", "de", "pt",
-            ]
-        # de-dup while preserving order
-        seen = set()
-        priority_langs = [l for l in priority_langs if not (l in seen or seen.add(l))]
-        langs_csv = ",".join(priority_langs)
-
-        # Single call: try BOTH manual and auto-generated subs in one shot.
-        # Retry up to 3 times on failure (429 rate limits are common even with
-        # Premium cookies — a 2-3 second delay usually resolves them).
-        # Timeout scaled for long videos: 30s base + 1s per 10 minutes of source.
-        source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
-        sub_timeout = max(30, int(30 + source_dur / 600))
-        cmd = [
-            self._ytdlp,
-            "--write-sub",          # manual subs (rare, but BEST quality)
-            "--write-auto-sub",     # auto-generated (common)
-            "--sub-lang", langs_csv,
-            "--sub-format", "vtt/srt/best",
-            "--skip-download",
-            "--no-warnings",
-            "-o", out_tpl,
-            url,
-        ]
-        # NOTE: cookies intentionally omitted for subtitle-only downloads.
-        # Premium cookies trigger YouTube's JS signature challenge which
-        # aborts the process. Subtitles are public — no auth needed.
-
-        import time as _sub_time
-        for _attempt in range(3):
-            try:
-                self._run_proc(cmd, capture_output=True, text=True,
-                               timeout=sub_timeout)
-                break  # success
-            except Exception as _sub_err:
-                if _attempt < 2:
-                    delay = 5 * (_attempt + 1)  # 5s, 10s (429 rate limits)
-                    print(f"[YT Subs] Attempt {_attempt + 1}/3 failed: {_sub_err} "
-                          f"— retrying in {delay}s", flush=True)
-                    _sub_time.sleep(delay)
-                else:
-                    print(f"[YT Subs] All 3 attempts failed: {_sub_err}", flush=True)
-                    return None
-
-        # Walk languages in PRIORITY ORDER, not filesystem order.
-        # For each language, prefer manual track (sub.en.vtt) over auto-caption.
-        # yt-dlp file naming: sub.<lang>.<ext> for manual, sub.<lang>.<ext> for auto too,
-        # so we just check each candidate language by name.
-        for lang in priority_langs:
-            # Manual + auto-cap end up with the same filename pattern in this output template,
-            # so a single match per language is enough. Try .vtt first, then .srt.
-            for ext in ("vtt", "srt"):
-                candidate = sub_dir / f"sub.{lang}.{ext}"
-                if not candidate.exists():
-                    continue
-                if ext == "vtt":
-                    segments = self._parse_vtt(candidate)
-                else:
-                    segments = self._parse_srt_file(candidate)
-                if segments:
-                    print(f"[YT Subs] Picked {candidate.name} "
-                          f"({len(segments)} segments, lang={lang})", flush=True)
-                    return segments
-
-        # Last-resort fallback: take ANY remaining file (rare — yt-dlp downloaded
-        # something but in an unexpected language code).
-        for vtt_file in sorted(sub_dir.glob("*.vtt")):
-            segments = self._parse_vtt(vtt_file)
-            if segments:
-                print(f"[YT Subs] Fallback to {vtt_file.name} "
-                      f"({len(segments)} segments) — language not in priority list", flush=True)
-                return segments
-        for srt_file in sorted(sub_dir.glob("*.srt")):
-            segments = self._parse_srt_file(srt_file)
-            if segments:
-                print(f"[YT Subs] Fallback to {srt_file.name} "
-                      f"({len(segments)} segments) — language not in priority list", flush=True)
-                return segments
-
-        return None
-
-    def _fetch_youtube_translated_subs(self, url: str) -> Optional[List[Dict]]:
-        """Download YouTube's auto-translated subtitles in the target language.
-
-        YouTube can translate auto-captions to any language on-the-fly.
-        yt-dlp format: --sub-lang {target}-{source} for translated subs.
-        This skips both Whisper AND our translation step.
-        """
-        if not re.match(r"^https?://", url):
-            return None
-
-        # GUARD: NO cookies for subtitle downloads. Premium cookies trigger
-        # YouTube's JS signature challenge which kills the entire yt-dlp process.
-        # Subtitles are public — no authentication needed. See 2026-04-13 fix.
-        # cookies_args = self._get_cookies_args()  # DO NOT USE for subs
-        sub_dir = self.cfg.work_dir / "yt_translated"
-        sub_dir.mkdir(exist_ok=True)
-
-        target = self.cfg.target_language        # "hi"
-        source = self.cfg.source_language or "en"
-        if source == "auto":
-            source = "en"
-
-        # ONE attempt only: hi-en (Hindi auto-translated from English).
-        # Pipeline is locked to English→Hindi so we never need to guess.
-        sub_lang = f"{target}-{source}" if target != source else target
-
-        # Clean previous attempts
-        for f in sub_dir.glob("*"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
-
-        # Retry up to 3 times — YouTube's auto-translate endpoint is rate-limited
-        # and returns 429 even with Premium cookies. A 3-second delay between
-        # attempts usually resolves it. Timeout scaled for long videos.
-        source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
-        sub_timeout = max(30, int(30 + source_dur / 600))
-        # NOTE: DO NOT pass cookies for subtitle-only downloads.
-        # Premium cookies trigger YouTube's JS signature challenge which
-        # causes a "Requested format is not available" error that aborts
-        # the entire process — even though subtitles don't need auth.
-        # Subtitles are public and download fine without cookies.
-        cmd = [
-            self._ytdlp,
-            "--write-auto-sub",
-            "--sub-lang", sub_lang,
-            "--sub-format", "vtt/srt/best",
-            "--skip-download",
-            "--no-warnings",
-            "-o", str(sub_dir / "ytsub.%(ext)s"),
-            url,
-        ]
-
-        import time as _sub_time
-        for _attempt in range(3):
-            try:
-                self._run_proc(cmd, capture_output=True, text=True,
-                               timeout=sub_timeout,
-                               encoding="utf-8", errors="replace")
-                break  # success
-            except Exception as e:
-                if _attempt < 2:
-                    delay = 5 * (_attempt + 1)  # 5s, 10s (429 rate limits)
-                    print(f"[YT Translated] Attempt {_attempt + 1}/3 failed: {e} "
-                          f"— retrying in {delay}s", flush=True)
-                    _sub_time.sleep(delay)
-                    # Clean partial files before retry
-                    for f in sub_dir.glob("*"):
-                        try: f.unlink()
-                        except OSError: pass
-                else:
-                    print(f"[YT Translated] All 3 attempts failed: {e}", flush=True)
-                    return None
-
-        # Find the result (single language, single file)
-        for vtt_file in sub_dir.glob("*.vtt"):
-            segments = self._parse_vtt(vtt_file)
-            if segments:
-                self._report("translate", 0.5,
-                             f"Got YouTube auto-translated {target} subs from {source} "
-                             f"({len(segments)} segments)")
-                for seg in segments:
-                    seg["text_translated"] = seg.get("text", "")
-                return segments
-        for srt_file in sub_dir.glob("*.srt"):
-            segments = self._parse_srt_file(srt_file)
-            if segments:
-                self._report("translate", 0.5,
-                             f"Got YouTube auto-translated {target} subs from {source} "
-                             f"({len(segments)} segments)")
-                for seg in segments:
-                    seg["text_translated"] = seg.get("text", "")
-                return segments
-
-        print(f"[YT Translated] No {sub_lang} subs available for this video", flush=True)
-        return None
-
     def _fetch_reference_subs(self, url: str) -> Optional[List[Dict]]:
         """Fetch English reference subs: try YouTube subs first, then OCR burned-in subs."""
         # 1. Try YouTube subtitle download
@@ -4291,66 +3738,6 @@ class Pipeline:
                 combined.setdefault(key, group[0][key])
         return combined
 
-    def _group_sentences_by_count(self, sentences: List[Dict],
-                                  target_per_group: int = 2,
-                                  word_tolerance: float = 0.15) -> List[Dict]:
-        """Group sentences into segments of exactly N sentences each.
-
-        Sentences are the ATOMIC UNIT — never split. Grouping is purely
-        by sentence count. Word count is NOT used for grouping decisions;
-        it is only used LATER in _redistribute_slots_by_wordcount to
-        assign fair timeline slots to each segment.
-
-        Rules:
-          - Each segment gets exactly target_per_group sentences
-          - Last segment gets the remainder (1 to target_per_group)
-          - If last segment is a single orphan sentence, merge it into
-            the previous segment (so last segment gets target+1 instead)
-          - Every sentence ends up in exactly one segment — none lost
-
-        Example (target=2, 7 sentences):
-          [S1, S2, S3, S4, S5, S6, S7]
-          -> [Seg1(S1+S2), Seg2(S3+S4), Seg3(S5+S6+S7)]
-             (S7 merged into Seg3 instead of orphan Seg4)
-        """
-        if not sentences:
-            return []
-        if len(sentences) <= target_per_group:
-            return [self._combine_sentence_group(sentences)]
-
-        # ── Simple fixed-count grouping ──
-        raw_groups: List[List[Dict]] = []
-        for i in range(0, len(sentences), target_per_group):
-            raw_groups.append(sentences[i:i + target_per_group])
-
-        # ── Merge orphan: if last group is a single sentence, fold into previous ──
-        if len(raw_groups) >= 2 and len(raw_groups[-1]) == 1:
-            raw_groups[-2].extend(raw_groups[-1])
-            raw_groups.pop()
-
-        # ── Combine into segment dicts ──
-        grouped = [self._combine_sentence_group(g) for g in raw_groups]
-
-        # ── Logging ──
-        total_words = sum(len(g.get("text", "").split()) for g in grouped)
-        seg_wcs = [len(g.get("text", "").split()) for g in grouped]
-        seg_counts = [len(g) for g in raw_groups]
-        min_wc, max_wc = min(seg_wcs), max(seg_wcs)
-        avg_wc = total_words / len(grouped) if grouped else 0
-        print(f"[Sentence-group] {len(sentences)} sentences -> {len(grouped)} segments "
-              f"| {target_per_group} sent/seg (sentence-first, never split) "
-              f"| words: total={total_words}, avg={avg_wc:.1f}, "
-              f"min={min_wc}, max={max_wc} "
-              f"| group sizes: {seg_counts}", flush=True)
-
-        # Verify: every sentence accounted for
-        total_in_groups = sum(seg_counts)
-        if total_in_groups != len(sentences):
-            print(f"[Sentence-group] WARNING: {total_in_groups} sentences in groups "
-                  f"vs {len(sentences)} input — mismatch!", flush=True)
-
-        return grouped
-
     def _glossary_mask(self, segments: List[Dict]) -> int:
         """Mask glossary words BEFORE translation with placeholders.
 
@@ -4460,86 +3847,6 @@ class Pipeline:
         if restored:
             print(f"[Glossary] Restored {restored} words after translation", flush=True)
         return restored
-
-    def _glossary_post_replace(self, segments: List[Dict]) -> int:
-        """Post-translation glossary for YouTube Hindi path.
-
-        YouTube Hindi auto-translate doesn't see our placeholders. Instead,
-        we translate each glossary English word to Hindi (via Google Translate)
-        to discover what YouTube likely used, then find-and-replace in the
-        translated text with the glossary's desired output.
-
-        The Hindi lookups are cached on self._glossary_hindi so they're only
-        computed once per pipeline run.
-        """
-        if not self._glossary:
-            return 0
-
-        # Build Hindi lookup cache if not already done
-        if not hasattr(self, '_glossary_hindi') or not self._glossary_hindi:
-            self._glossary_hindi: Dict[str, List[str]] = {}
-            # Hardcoded common translations (fast, no API call)
-            _KNOWN = {
-                "noble": ["कुलीन", "महान", "उत्कृष्ट", "शाही", "नेक"],
-                "king": ["राजा", "किंग"],
-                "queen": ["रानी", "क्वीन"],
-                "princess": ["राजकुमारी", "प्रिंसेस"],
-                "prince": ["राजकुमार", "युवराज", "प्रिंस"],
-                "general": ["सेनापति", "जनरल"],
-                "consort": ["पत्नी", "राजमहिषी", "संगिनी"],
-                "immortal": ["अमर", "देवता", "अमरत्व"],
-                "demon": ["राक्षस", "दानव", "असुर", "डीमन"],
-                "dragon": ["ड्रैगन", "अजगर", "नाग"],
-                "spirit": ["आत्मा", "भूत", "प्राण", "स्पिरिट"],
-                "clan": ["कुल", "वंश", "कबीला", "क्लैन"],
-                "contract": ["अनुबंध", "करार", "संविदा", "कॉन्ट्रैक्ट"],
-                "cultivation": ["साधना", "तपस्या", "खेती"],
-                "realm": ["लोक", "क्षेत्र", "राज्य", "दुनिया"],
-                "warrior": ["योद्धा", "वारियर", "सैनिक"],
-                "phoenix": ["फीनिक्स", "अग्निपक्षी"],
-                "emperor": ["सम्राट", "एम्परर", "बादशाह"],
-                "heavenly": ["स्वर्गीय", "दिव्य"],
-                "divine": ["दिव्य", "देवी", "ईश्वरीय"],
-                "beast": ["जानवर", "पशु", "बीस्ट"],
-                "sparrow": ["गौरैया", "चिड़िया", "स्पैरो"],
-                "fox": ["लोमड़ी", "फॉक्स"],
-                "palace": ["महल", "राजमहल", "पैलेस"],
-                "throne": ["सिंहासन", "गद्दी", "थ्रोन"],
-            }
-            for eng in self._glossary:
-                forms = _KNOWN.get(eng.lower(), [])
-                # Also try quick Google Translate for unknown words
-                if not forms:
-                    try:
-                        tmp_segs = [{"text": eng}]
-                        self._translate_segments(tmp_segs)
-                        hindi_tr = tmp_segs[0].get("text_translated", "").strip()
-                        if hindi_tr and hindi_tr != eng:
-                            forms = [hindi_tr]
-                            print(f"[Glossary] Looked up '{eng}' -> '{hindi_tr}' via Google", flush=True)
-                    except Exception:
-                        pass
-                self._glossary_hindi[eng] = forms
-
-        replaced = 0
-        for seg in segments:
-            translated = seg.get("text_translated", "")
-            if not translated:
-                continue
-            changed = False
-            for eng, target in self._glossary.items():
-                hindi_forms = self._glossary_hindi.get(eng, [])
-                for hindi_word in hindi_forms:
-                    if hindi_word in translated:
-                        translated = translated.replace(hindi_word, target)
-                        changed = True
-                        replaced += 1
-            if changed:
-                seg["text_translated"] = translated
-
-        if replaced:
-            print(f"[Glossary] Post-replaced {replaced} Hindi words with glossary entries", flush=True)
-        return replaced
 
     def _chunk_segments_for_tts(self, segments: List[Dict],
                                 chunk_words: int) -> List[Dict]:
@@ -4654,358 +3961,6 @@ class Pipeline:
                   f"{len(segments)} segments (now contiguous)", flush=True)
 
         return segments
-
-    def _redistribute_slots_by_wordcount(self, segments: List[Dict]) -> List[Dict]:
-        """Redistribute segment timelines proportionally by word count.
-
-        Keeps the total time span (first start -> last end) identical, but
-        gives each segment a slot proportional to its word count. Segments
-        with more words get more time -- matching TTS output duration behavior.
-
-        Before: [Seg1(0-12s, 20 words), Seg2(12-22s, 5 words)]
-                 Seg1 has 12s for 20w, Seg2 has 10s for 5w (unbalanced)
-        After:  [Seg1(0-17.6s, 20 words), Seg2(17.6-22s, 5 words)]
-                 Both get 0.88s per word (balanced)
-        """
-        if not segments or len(segments) < 2:
-            return segments
-
-        total_start = segments[0]["start"]
-        total_end = segments[-1]["end"]
-        total_duration = total_end - total_start
-
-        if total_duration <= 0:
-            return segments
-
-        # Count words per segment (min 1 to avoid zero-division)
-        word_counts = []
-        for seg in segments:
-            wc = len(seg.get("text", "").split())
-            word_counts.append(max(wc, 1))
-
-        total_words = sum(word_counts)
-
-        # Redistribute: each segment gets time proportional to its word count
-        cursor = total_start
-        for i, seg in enumerate(segments):
-            slot = (word_counts[i] / total_words) * total_duration
-            seg["start"] = round(cursor, 3)
-            seg["end"] = round(cursor + slot, 3)
-            cursor += slot
-
-        # Snap last segment's end to exact total_end (avoid float drift)
-        segments[-1]["end"] = total_end
-
-        avg_per_word = total_duration / total_words if total_words else 0
-        print(f"[Slot-redistribute] {len(segments)} segments, {total_words} words, "
-              f"{total_duration:.1f}s total, {avg_per_word:.3f}s/word avg", flush=True)
-
-        return segments
-
-    def _split_by_even_wordcount(self, segments: List[Dict],
-                                 target_words: int = 20) -> List[Dict]:
-        """Split segments into even-word-count chunks (no punctuation fallback).
-
-        When YouTube captions have no punctuation, sentence boundaries are
-        unreliable. Instead, join ALL text into one stream and split into
-        segments of ~target_words each. Gaps are removed in assembly anyway,
-        so uniform word density = uniform playback speed.
-
-        Timeline: each output segment gets a proportional slice of the
-        total time span based on its word count (same as redistribute).
-
-        No word is lost — every word from input ends up in exactly one output.
-        """
-        if not segments:
-            return []
-
-        # Collect all words + total time span
-        all_words: List[str] = []
-        for seg in segments:
-            words = seg.get("text", "").split()
-            all_words.extend(words)
-
-        if not all_words:
-            return segments
-
-        total_start = segments[0].get("start", 0)
-        total_end = segments[-1].get("end", 0)
-        total_duration = max(total_end - total_start, 0.1)
-        total_word_count = len(all_words)
-
-        # Also collect translated words if present
-        all_translated: List[str] = []
-        has_translated = any(s.get("text_translated") for s in segments)
-        if has_translated:
-            for seg in segments:
-                tr_words = seg.get("text_translated", "").split()
-                all_translated.extend(tr_words)
-
-        # Split into chunks of ~target_words
-        result: List[Dict] = []
-        cursor = total_start
-        i = 0
-        while i < total_word_count:
-            chunk_end = min(i + target_words, total_word_count)
-            chunk_words = all_words[i:chunk_end]
-            chunk_text = " ".join(chunk_words)
-
-            # Proportional time slot
-            slot = (len(chunk_words) / total_word_count) * total_duration
-            seg_dict = {
-                "start": round(cursor, 3),
-                "end": round(cursor + slot, 3),
-                "text": chunk_text,
-            }
-
-            # Proportional translated text if present
-            if has_translated and all_translated:
-                tr_ratio = len(all_translated) / max(total_word_count, 1)
-                tr_start = int(i * tr_ratio)
-                tr_end = int(chunk_end * tr_ratio)
-                seg_dict["text_translated"] = " ".join(
-                    all_translated[tr_start:tr_end])
-
-            result.append(seg_dict)
-            cursor += slot
-            i = chunk_end
-
-        # Snap last segment end
-        if result:
-            result[-1]["end"] = total_end
-
-        print(f"[Word-split] {total_word_count} words -> {len(result)} segments "
-              f"(~{target_words} words/seg, no punctuation path)", flush=True)
-
-        return result
-
-    def _align_yt_text_to_whisper_timeline(self, yt_sentences: List[Dict],
-                                           whisper_segments: List[Dict]) -> List[Dict]:
-        """Align YouTube text onto Whisper's precise timeline.
-
-        YouTube gives better TEXT (human-curated captions vs Whisper guesses).
-        Whisper gives better TIMESTAMPS (actual audio analysis vs display timing).
-
-        Strategy: walk both lists in parallel (both are chronological). For each
-        Whisper segment, find the YouTube sentence whose time overlaps most and
-        take the YouTube text. If no good overlap, keep Whisper's own text.
-
-        Returns segments with Whisper start/end but YouTube text.
-        """
-        if not yt_sentences or not whisper_segments:
-            return whisper_segments or yt_sentences or []
-
-        # Build a simple overlap matcher: for each Whisper segment, find the
-        # best-matching YouTube sentence by time overlap
-        result: List[Dict] = []
-        yt_used = set()  # track which YT sentences we've consumed
-
-        for wseg in whisper_segments:
-            w_start = wseg.get("start", 0)
-            w_end = wseg.get("end", 0)
-            w_mid = (w_start + w_end) / 2
-
-            best_idx = -1
-            best_overlap = 0.0
-
-            for j, yseg in enumerate(yt_sentences):
-                if j in yt_used:
-                    continue
-                y_start = yseg.get("start", 0)
-                y_end = yseg.get("end", 0)
-
-                # Overlap = intersection of [w_start,w_end] and [y_start,y_end]
-                overlap_start = max(w_start, y_start)
-                overlap_end = min(w_end, y_end)
-                overlap = max(0, overlap_end - overlap_start)
-
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_idx = j
-
-            # Take YouTube text if we found a decent overlap (>20% of Whisper seg)
-            w_dur = max(w_end - w_start, 0.1)
-            if best_idx >= 0 and best_overlap > w_dur * 0.2:
-                yt_used.add(best_idx)
-                aligned = dict(wseg)  # keep Whisper timeline
-                aligned["text"] = yt_sentences[best_idx].get("text", wseg.get("text", ""))
-                result.append(aligned)
-            else:
-                # No good YouTube match -- keep Whisper's own text
-                result.append(dict(wseg))
-
-        # Skip unused YouTube sentences — appending them with their imprecise
-        # YT timelines would create overlapping segments that break assembly.
-        # The matched segments already carry YouTube's text quality where overlap
-        # was found; unmatched ones are likely intros/outros or timing mismatches.
-        unmatched = len(yt_sentences) - len(yt_used)
-
-        matched = len(yt_used)
-        total_yt = len(yt_sentences)
-        print(f"[YT-Whisper-align] Matched {matched}/{total_yt} YouTube sentences "
-              f"to {len(whisper_segments)} Whisper segments"
-              f"{f' (skipped {unmatched} unmatched YT sentences)' if unmatched else ''}",
-              flush=True)
-
-        return result
-
-    def _correct_whisper_with_yt(self, whisper_segments: List[Dict],
-                                 yt_sentences: List[Dict]) -> List[Dict]:
-        """Replace or correct Whisper text using YouTube subs.
-
-        Both are English transcriptions of the same audio in the same order.
-        Whisper has precise timestamps but garbled text (name variations,
-        spelling). YouTube has clean text but imprecise display timelines.
-
-        Two modes (controlled by cfg.yt_replace_mode):
-
-        "full"  — Total replacement. Flatten both into word streams,
-                  align by time, replace Whisper text entirely with YouTube.
-                  Whisper timestamps kept. Best when YouTube text is much
-                  cleaner overall.
-
-        "diff"  — Word-level diff. Align both word streams using
-                  SequenceMatcher, only swap words that DIFFER. Keeps
-                  Whisper's punctuation and structure intact, fixes only
-                  the misheard parts (names, nouns, spelling). Best when
-                  Whisper's structure is good but specific words are wrong.
-        """
-        if not whisper_segments or not yt_sentences:
-            return whisper_segments
-
-        mode = getattr(self.cfg, 'yt_replace_mode', 'diff')
-
-        # ── Flatten both into word streams ──
-        # Whisper: word list per segment (we need to reconstruct back)
-        w_seg_words: List[List[str]] = []
-        for seg in whisper_segments:
-            w_seg_words.append(seg.get("text", "").split())
-        w_flat = []
-        for words in w_seg_words:
-            w_flat.extend(words)
-
-        # YouTube: single word stream (order matches audio)
-        yt_flat: List[str] = []
-        for yt_seg in yt_sentences:
-            yt_flat.extend(yt_seg.get("text", "").split())
-
-        if not yt_flat or not w_flat:
-            return whisper_segments
-
-        w_total = len(w_flat)
-        yt_total = len(yt_flat)
-
-        if mode == "full":
-            # ═══ FULL REPLACE: swap all Whisper words with YouTube words ═══
-            # Proportional distribution: each Whisper segment gets its share
-            # of YouTube words based on its word count relative to total.
-            result = []
-            yt_cursor = 0
-
-            for i, wseg in enumerate(whisper_segments):
-                seg = dict(wseg)
-                seg_wc = len(w_seg_words[i])
-
-                # Proportional share of YouTube words
-                proportion = seg_wc / max(w_total, 1)
-                n_words = round(proportion * yt_total)
-                n_words = max(1, min(n_words, yt_total - yt_cursor))
-
-                # Last segment gets everything remaining
-                if i == len(whisper_segments) - 1:
-                    n_words = max(0, yt_total - yt_cursor)
-
-                if n_words > 0 and yt_cursor < yt_total:
-                    yt_slice = yt_flat[yt_cursor:yt_cursor + n_words]
-                    seg["_whisper_original"] = seg.get("text", "")
-                    seg["text"] = " ".join(yt_slice)
-                    yt_cursor += n_words
-
-                result.append(seg)
-
-            print(f"[YT-replace-full] All {len(result)} segments replaced | "
-                  f"Whisper {w_total} words -> YouTube {yt_total} words | "
-                  f"consumed {yt_cursor}/{yt_total}", flush=True)
-            return result
-
-        else:
-            # ═══ DIFF REPLACE: only swap words that differ ═══
-            # Use SequenceMatcher to align the two word streams. Where they
-            # match, keep Whisper's word (with its punctuation). Where they
-            # differ, use YouTube's word (correct spelling/names).
-            from difflib import SequenceMatcher
-
-            # Normalize for comparison (lowercase, strip punctuation)
-            import string
-            _punct = set(string.punctuation)
-
-            def _normalize(word: str) -> str:
-                return word.lower().strip("".join(_punct))
-
-            w_norm = [_normalize(w) for w in w_flat]
-            yt_norm = [_normalize(w) for w in yt_flat]
-
-            # Align the two sequences
-            sm = SequenceMatcher(None, w_norm, yt_norm, autojunk=False)
-            opcodes = sm.get_opcodes()
-
-            # Build the corrected flat word list
-            corrected_flat: List[str] = []
-            diff_count = 0
-
-            for tag, i1, i2, j1, j2 in opcodes:
-                if tag == "equal":
-                    # Words match — keep Whisper's version (preserves punctuation)
-                    corrected_flat.extend(w_flat[i1:i2])
-                elif tag == "replace":
-                    # Words differ — use YouTube's version (correct names/spelling)
-                    corrected_flat.extend(yt_flat[j1:j2])
-                    diff_count += (j2 - j1)
-                elif tag == "insert":
-                    # YouTube has extra words — insert them (Whisper dropped words)
-                    corrected_flat.extend(yt_flat[j1:j2])
-                    diff_count += (j2 - j1)
-                elif tag == "delete":
-                    # Whisper has extra words — skip them (hallucinations)
-                    diff_count += (i2 - i1)
-
-            # ── Reconstruct back into Whisper's segment structure ──
-            # Each segment gets the same NUMBER of words it originally had
-            # (from the corrected stream), preserving segment boundaries.
-            result = []
-            cursor = 0
-            corrected_total = len(corrected_flat)
-
-            for i, wseg in enumerate(whisper_segments):
-                seg = dict(wseg)
-                orig_wc = len(w_seg_words[i])
-
-                # Proportional share from corrected stream
-                if w_total > 0:
-                    proportion = orig_wc / w_total
-                    n_words = round(proportion * corrected_total)
-                else:
-                    n_words = orig_wc
-
-                n_words = max(1, min(n_words, corrected_total - cursor))
-                if i == len(whisper_segments) - 1:
-                    n_words = max(0, corrected_total - cursor)
-
-                if n_words > 0 and cursor < corrected_total:
-                    new_text = " ".join(corrected_flat[cursor:cursor + n_words])
-                    if new_text != seg.get("text", ""):
-                        seg["_whisper_original"] = seg.get("text", "")
-                    seg["text"] = new_text
-                    cursor += n_words
-
-                result.append(seg)
-
-            match_pct = ((w_total - diff_count) / max(w_total, 1)) * 100
-            print(f"[YT-replace-diff] {diff_count} words changed out of {w_total} "
-                  f"({match_pct:.0f}% match) | "
-                  f"Whisper {w_total} words, YouTube {yt_total} words, "
-                  f"corrected {corrected_total} words", flush=True)
-            return result
 
     def _refine_word_timing(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
         """Refine to word-level timestamps via the tiered strategy in
