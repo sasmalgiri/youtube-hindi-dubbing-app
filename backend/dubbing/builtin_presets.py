@@ -235,6 +235,59 @@ _HINDI_REVOICE_CLONE = {
 }
 
 
+_HINDI_REVOICE_EDGE = {
+    "slug": "hindi-revoice-edge",
+    "name": "Hindi Re-Voice (Edge-TTS)",
+    "description": (
+        "Re-voice a HINDI video in Hindi with a clean Edge-TTS voice — no cloning. "
+        "Whisper transcribes the Hindi audio → translation is SKIPPED (same language) "
+        "→ Edge-TTS re-speaks in your chosen Hindi voice → per-cue video stretch to "
+        "match timing. Keeps the video's background music under the new voice. Pick the "
+        "voice in the voice selector (Madhur male / Swara female)."
+    ),
+    "settings": {
+        "source_language": "hi",         # -> sets From = Hindi (triggers the skip-translation path)
+        "target_language": "hi",         # -> sets To = Hindi
+        "pipeline_mode": "classic",
+        # Standard Edge-TTS voice (NOT cloning). Others off.
+        "use_edge_tts": True,
+        "use_coqui_xtts": False,
+        "use_sarvam_bulbul": False,
+        "use_google_tts": False,
+        "use_cosyvoice": False,
+        "use_chatterbox": False,
+        "use_elevenlabs": False,
+        # Same language: skip the English-only simplify + noun-masking steps.
+        "simplify_english": False,
+        "keep_subject_english": False,
+        # Rate-match the re-voice to the source for clean sync (NOT untouchable —
+        # that is a clone-only setting that would leave audio unaligned).
+        "audio_untouchable": False,
+        "use_wav2lip": False,
+        # AV sync: audio drives, video adapts per cue.
+        "audio_priority": True,
+        "video_slow_to_match": True,
+        "tts_no_time_pressure": True,
+        "tts_rate_mode": "auto",
+        "tts_rate_ceiling": "+25%",
+        "tts_rate_target_wpm": 130,
+        "slot_verify": "dry_run",
+        "av_sync_mode": "original",
+        # ASR + verification (same quality bar as Balanced).
+        "use_whisperx": True,
+        "tts_word_match_verify": True,
+        "tts_word_match_tolerance": 0.15,
+        "tts_truncation_threshold": 0.30,
+        # Keep the video's background music/SFX under the new voice.
+        "mix_original": True,
+        # Output.
+        "audio_bitrate": "192k",
+        "post_tts_level": "minimal",
+        "audio_quality_mode": "fast",
+    },
+}
+
+
 _BUDGET = {
     "slug": "budget",
     "name": "Budget (Free-Tier Max)",
@@ -275,6 +328,7 @@ _BUILTIN_PRESETS: List[Dict] = [
     _SRT_DIRECT,
     _VOICE_CLONE_SAME,
     _HINDI_REVOICE_CLONE,
+    _HINDI_REVOICE_EDGE,
     _BUDGET,
 ]
 
