@@ -21,6 +21,8 @@ _STUDIO_QUALITY = {
         "All verifications on, slot auto-fix, simplify+noun-preserve. Slowest, highest fidelity."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         # TTS chain: Sarvam primary, Edge fallback, Sarvam salvages stragglers
         "use_sarvam_bulbul": True,
@@ -68,6 +70,8 @@ _BALANCED = {
         "Sarvam salvage. Auto-disables expensive verification above 1000 cues."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_google_tts": True,
         "use_edge_tts": True,
@@ -105,6 +109,8 @@ _FAST_PREVIEW = {
         "Use to sanity-check a video before committing to Studio/Balanced."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "oneflow",
         "use_edge_tts": True,
         "use_google_tts": False,
@@ -138,6 +144,8 @@ _SRT_DIRECT = {
         "concat zero-gap, stretch video to fit. No translation, no transcription."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "srtdub",
         "use_sarvam_bulbul": True,
         "use_edge_tts": True,
@@ -164,6 +172,8 @@ _VOICE_CLONE_SAME = {
         "output language. Audio stays untouchable; post-processing disabled."
     ),
     "settings": {
+        "source_language": "hi",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_coqui_xtts": True,
         "use_edge_tts": False,
@@ -296,6 +306,8 @@ _BUDGET = {
         "Minimal verification, Edge-TTS overflow, Sarvam salvage if key present."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_google_tts": True,
         "use_edge_tts": True,
