@@ -247,7 +247,7 @@ export default function HomePage() {
 
                     {/* Saved Links */}
                     <div className="mt-4">
-                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} />
+                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) })} />
                     </div>
 
                     {error && (

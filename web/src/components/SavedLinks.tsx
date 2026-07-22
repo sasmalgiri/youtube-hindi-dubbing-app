@@ -7,6 +7,9 @@ import { extractYouTubeId, getThumbnailUrl } from '@/lib/utils';
 interface SavedLinksProps {
     onSelect: (url: string) => void;
     onJobStarted?: (jobId: string) => void;
+    // Live settings from the main panel. Re-running a saved link uses these so
+    // it honors the user's CURRENT selection instead of the URL's stale preset.
+    getCurrentSettings?: () => Record<string, unknown>;
 }
 
 const PRESET_LABELS: { key: keyof LinkPreset; label: string; type: 'select' | 'toggle'; options?: { value: string; label: string }[] }[] = [
@@ -116,7 +119,7 @@ function PresetEditor({ preset, onSave }: { preset: LinkPreset; onSave: (p: Link
     );
 }
 
-export default function SavedLinks({ onSelect, onJobStarted }: SavedLinksProps) {
+export default function SavedLinks({ onSelect, onJobStarted, getCurrentSettings }: SavedLinksProps) {
     const [links, setLinks] = useState<SavedLink[]>([]);
     const [open, setOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
@@ -148,14 +151,17 @@ export default function SavedLinks({ onSelect, onJobStarted }: SavedLinksProps) 
         setQueuingId(link.id);
         try {
             const preset = link.preset || {};
-            const { id } = await createJob({ url: link.url, ...preset });
+            const current = getCurrentSettings?.() || {};
+            // Live settings WIN over the URL's stale saved preset, so re-running
+            // honors the user's CURRENT selection (ASR model, voice, etc.).
+            const { id } = await createJob({ url: link.url, ...preset, ...current });
             onJobStarted?.(id);
         } catch (e) {
             console.error('Failed to queue:', e);
         } finally {
             setQueuingId(null);
         }
-    }, [onJobStarted]);
+    }, [onJobStarted, getCurrentSettings]);
 
     return (
         <div className="glass-card overflow-hidden">
