@@ -1785,7 +1785,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         <CollapsibleGroup
                             title="Visual Transforms"
                             subtitle="Content-ID / duplicate evasion (classic mode)"
-                            master={settings.visual_transforms}
+                            master={settings.visual_transforms ?? true}
                             onMaster={(v) => update({ visual_transforms: v })}
                         >
                             <p className="text-[11px] text-text-muted">
@@ -1812,9 +1812,9 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             <div>
                                 <div className="flex items-center justify-between mb-1">
                                     <p className="text-sm text-text-primary">Hue shift</p>
-                                    <span className="text-xs text-text-muted">{settings.vx_hue}°</span>
+                                    <span className="text-xs text-text-muted">{settings.vx_hue ?? 4}°</span>
                                 </div>
-                                <input type="range" min={0} max={15} step={1} value={settings.vx_hue}
+                                <input type="range" min={0} max={15} step={1} value={settings.vx_hue ?? 4}
                                     onChange={e => update({ vx_hue: parseFloat(e.target.value) })}
                                     className="w-full accent-primary" />
                                 <p className="text-[10px] text-text-muted">0 = off · 4° recommended (imperceptible)</p>
@@ -1824,9 +1824,9 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             <div>
                                 <div className="flex items-center justify-between mb-1">
                                     <p className="text-sm text-text-primary">Zoom + crop</p>
-                                    <span className="text-xs text-text-muted">{settings.vx_zoom.toFixed(2)}×</span>
+                                    <span className="text-xs text-text-muted">{(settings.vx_zoom ?? 1.04).toFixed(2)}×</span>
                                 </div>
-                                <input type="range" min={1.0} max={1.1} step={0.01} value={settings.vx_zoom}
+                                <input type="range" min={1.0} max={1.1} step={0.01} value={settings.vx_zoom ?? 1.04}
                                     onChange={e => update({ vx_zoom: parseFloat(e.target.value) })}
                                     className="w-full accent-primary" />
                                 <p className="text-[10px] text-text-muted">1.00 = off · 1.04 recommended (zoom in, crop back)</p>
