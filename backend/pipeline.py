@@ -71,24 +71,10 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
     """Top-level function for multiprocessing — must be picklable."""
     import json as _json
     try:
-        from faster_whisper import WhisperModel
-        import wave
-
-        # Detect long audio
-        long_audio = False
-        try:
-            with wave.open(wav_path_str, "rb") as w:
-                duration_sec = w.getnframes() / float(w.getframerate())
-                long_audio = duration_sec > 1200
-        except Exception:
-            pass
-
-        # Pre-clean GPU + make torch's bundled cuDNN/cuBLAS DLLs discoverable to
-        # CTranslate2 (faster-whisper). Without this, CT2 can intermittently fail
-        # on Windows with "Could not load symbol cudnnGetLibConfig" (error 127)
-        # when the DLL load order leaves it looking at a system cuDNN that differs
-        # from torch's bundled cuDNN 9. Injecting torch/lib first makes the GPU
-        # word-timing fallback reliable.
+        # Expose torch's bundled cuDNN/cuBLAS DLLs to CTranslate2 (faster-whisper)
+        # BEFORE importing it — CT2 can otherwise fail or hard-crash on Windows
+        # when the DLL load order points it at a system cuDNN that differs from
+        # torch's bundled cuDNN 9 ("Could not load symbol cudnnGetLibConfig").
         if device == "cuda":
             try:
                 import torch, os as _os
@@ -103,6 +89,18 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
                 torch.cuda.ipc_collect()
             except Exception:
                 pass
+
+        from faster_whisper import WhisperModel
+        import wave
+
+        # Detect long audio
+        long_audio = False
+        try:
+            with wave.open(wav_path_str, "rb") as w:
+                duration_sec = w.getnframes() / float(w.getframerate())
+                long_audio = duration_sec > 1200
+        except Exception:
+            pass
 
         _model = WhisperModel(model_name, device=device, compute_type=compute)
         try:
@@ -4158,33 +4156,43 @@ class Pipeline:
         import json as _json
         import tempfile as _tmpmod
 
-        local_model = model_override or self.cfg.asr_model
-        if local_model in ("groq-whisper", "groq", "parakeet"):
-            local_model = "medium"
+        requested = model_override or self.cfg.asr_model
+        if requested in ("groq-whisper", "groq", "parakeet"):
+            requested = "medium"
 
         source_lang = self.cfg.source_language if self.cfg.source_language != "auto" else None
 
-        def _run_in_child(device: str, compute: str) -> List[Dict]:
-            """Spawn a child process to run Whisper. Returns segments or raises."""
+        # Timeout scales with audio length. A crash returns instantly (nonzero
+        # exit), so this only bounds a genuine hang — capped at 15 min, down from
+        # 30, so nothing grinds for half an hour.
+        try:
+            _audio_dur = self._get_duration(wav_path) or 300.0
+        except Exception:
+            _audio_dur = 300.0
+        child_timeout = int(min(900, max(180, _audio_dur * 3)))
+
+        def _run_in_child(model: str, device: str, compute: str) -> List[Dict]:
+            """Spawn a child process to run a SPECIFIC Whisper model. Returns
+            segments or raises."""
             fd, result_path = _tmpmod.mkstemp(suffix=".json", prefix="whisper_result_")
             import os as _os
             _os.close(fd)
             try:
                 self._report("transcribe", 0.1,
-                             f"Loading Whisper ({local_model}) on {device.upper()} (isolated process)...")
+                             f"Loading Whisper ({model}) on {device.upper()} (isolated process)...")
                 p = mp.Process(
                     target=_whisper_child_worker,
-                    args=(str(wav_path), local_model, device, compute, source_lang, result_path),
+                    args=(str(wav_path), model, device, compute, source_lang, result_path),
                     daemon=True,
                 )
                 p.start()
-                p.join(timeout=1800)  # 30 min max
+                p.join(timeout=child_timeout)
                 if p.is_alive():
                     p.kill()
                     p.join(5)
-                    raise RuntimeError("Whisper transcription timed out (30 min limit)")
+                    raise RuntimeError(f"Whisper {model}/{device} timed out ({child_timeout}s)")
                 if p.exitcode != 0:
-                    err_msg = f"Whisper child process died with exit code {p.exitcode}"
+                    err_msg = f"Whisper {model}/{device} child died with exit code {p.exitcode}"
                     try:
                         with open(result_path, "r", encoding="utf-8") as f:
                             data = _json.load(f)
@@ -4206,28 +4214,48 @@ class Pipeline:
                 except Exception:
                     pass
 
-        # Auto-detect GPU
-        device, compute = "cpu", "int8"
+        # Auto-detect GPU.
+        gpu = False
         try:
             import torch as _torch_mod
-            if _torch_mod.cuda.is_available():
-                device, compute = "cuda", "float16"
+            gpu = bool(_torch_mod.cuda.is_available())
+            if gpu:
                 print(f"[Whisper] GPU detected: {_torch_mod.cuda.get_device_name(0)}", flush=True)
             else:
                 print("[Whisper] torch.cuda.is_available() = False -> using CPU", flush=True)
-        except ImportError:
-            print("[Whisper] torch not installed -> using CPU", flush=True)
         except Exception as _gpu_err:
             print(f"[Whisper] GPU detection failed: {_gpu_err} -> using CPU", flush=True)
 
-        try:
-            return _run_in_child(device, compute)
-        except RuntimeError as e:
-            if device == "cuda":
+        # Fallback LADDER. A heavy model (e.g. large-v3) can hard-crash the CUDA
+        # child on some driver/CTranslate2 combos (exit 0xC0000409), and running
+        # a heavy model on CPU is so slow it used to hit the 30-min timeout. So
+        # on failure we DOWNSHIFT the model (then the device) to something lighter
+        # that actually finishes, instead of re-running the same heavy model on
+        # CPU. For large-v3 quality without a local GPU, use the Groq ASR model.
+        attempts: List[tuple] = []
+        if gpu:
+            attempts.append((requested, "cuda", "float16"))
+            if requested not in ("medium", "small", "base", "tiny"):
+                attempts.append(("medium", "cuda", "float16"))
+            attempts.append(("small", "cuda", "float16"))   # tiny + very stable
+        cpu_model = requested if requested in ("small", "base", "tiny") else "small"
+        attempts.append((cpu_model, "cpu", "int8"))         # CPU last resort — light so it completes
+
+        last_err: Optional[Exception] = None
+        for _i, (_model, _dev, _comp) in enumerate(attempts):
+            try:
+                return _run_in_child(_model, _dev, _comp)
+            except RuntimeError as _e:
+                last_err = _e
+                _nxt = attempts[_i + 1] if _i + 1 < len(attempts) else None
                 self._report("transcribe", 0.15,
-                             f"GPU transcription failed ({str(e)[:80]}) — retrying on CPU...")
-                return _run_in_child("cpu", "int8")
-            raise
+                             f"Whisper {_model}/{_dev} failed ({str(_e)[:55]})"
+                             + (f" — trying {_nxt[0]}/{_nxt[1]}..." if _nxt else "."))
+                continue
+        raise RuntimeError(
+            f"Local Whisper failed on all fallbacks ({str(last_err)[:100]}). "
+            f"Switch the ASR model to 'Groq Whisper' (cloud) — it runs large-v3 "
+            f"fast with no local GPU.")
 
     # ── Step 4: Translate full narrative ─────────────────────────────────
     def _translate_full_narrative(self, text_segments: List[Dict], speech_duration: float = 0) -> tuple:
