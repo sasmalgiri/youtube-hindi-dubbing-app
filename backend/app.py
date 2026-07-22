@@ -289,7 +289,7 @@ class JobCreateRequest(BaseModel):
     fast_assemble: bool = False
     dub_chain: List[str] = []
     enable_manual_review: bool = False
-    use_whisperx: bool = False         # WhisperX forced alignment for tighter word timestamps
+    use_whisperx: bool = True          # WhisperX forced alignment for tighter word timestamps (on by default; whisperx installed)
     simplify_english: bool = False     # OFF: translation 35% word cap handles it
     enable_tts_verify_retry: bool = False  # OFF: 70% false-positive rate on Hindi turns 5s cleanup into 2h bottleneck
     # Inline TTS truncation guard: catches Edge-TTS WebSocket drops that
@@ -2382,7 +2382,7 @@ async def create_job_upload(
     dub_duration: int = Form(0),
     fast_assemble: str = Form("false"),
     enable_manual_review: str = Form("false"),
-    use_whisperx: str = Form("false"),
+    use_whisperx: str = Form("true"),
     simplify_english: str = Form("false"),
     step_by_step: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
@@ -2741,7 +2741,7 @@ async def create_job_with_srt(
     dub_duration: int = Form(0),
     fast_assemble: str = Form("false"),
     enable_manual_review: str = Form("false"),
-    use_whisperx: str = Form("false"),
+    use_whisperx: str = Form("true"),
     simplify_english: str = Form("false"),
     step_by_step: str = Form("false"),
     srt_needs_translation: str = Form("false"),

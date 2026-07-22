@@ -83,10 +83,22 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
         except Exception:
             pass
 
-        # Pre-clean GPU
+        # Pre-clean GPU + make torch's bundled cuDNN/cuBLAS DLLs discoverable to
+        # CTranslate2 (faster-whisper). Without this, CT2 can intermittently fail
+        # on Windows with "Could not load symbol cudnnGetLibConfig" (error 127)
+        # when the DLL load order leaves it looking at a system cuDNN that differs
+        # from torch's bundled cuDNN 9. Injecting torch/lib first makes the GPU
+        # word-timing fallback reliable.
         if device == "cuda":
             try:
-                import torch
+                import torch, os as _os
+                _tlib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+                if _os.path.isdir(_tlib):
+                    try:
+                        _os.add_dll_directory(_tlib)   # Windows py3.8+
+                    except Exception:
+                        pass
+                    _os.environ["PATH"] = _tlib + _os.pathsep + _os.environ.get("PATH", "")
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
             except Exception:
@@ -732,8 +744,16 @@ class PipelineConfig:
     translation_engine: str = "google"  # Google Translate (parallel x20, fastest free)
     tts_voice: str = "hi-IN-SwaraNeural"
     tts_rate: str = "+0%"
-    mix_original: bool = False   # SUSPENDED — always False until explicitly reactivated
+    mix_original: bool = False   # keep original background music/SFX (Demucs) under the Hindi voice
     original_volume: float = 0.10
+    # Fingerprint-break the retained background bed so the kept music is less
+    # likely to trip YouTube Content ID. DURATION-PRESERVING only (pitch + EQ,
+    # never tempo) so the bed stays aligned to the per-segment-stretched video.
+    # HONEST CAVEAT: Content ID audio matching is robust to pitch/EQ shifts —
+    # this REDUCES but does NOT guarantee evasion on copyrighted music. The only
+    # sure way to avoid a music match is to drop the music (mix_original=False).
+    bg_alter: bool = True
+    bg_pitch: float = 1.03       # rubberband pitch scale (1.03 ≈ +3%, duration preserved)
     use_cosyvoice: bool = False          # OFF: slow GPU, not needed for SRT upload
     use_chatterbox: bool = False
     use_fish_speech: bool = False
@@ -767,6 +787,17 @@ class PipelineConfig:
     audio_bitrate: str = "192k"
     # Video encode speed: NVENC GPU encoding
     encode_preset: str = "fast"
+    # ── Visual transforms (Content-ID / duplicate evasion) — classic mode ──
+    # Applied ONCE at the final mux as a single re-encode pass (the video is
+    # normally stream-copied there). Gives a uniform fingerprint break across
+    # the whole video. hflip is OFF by default because mirroring flips any
+    # on-screen text/logos (a visible tell); hue+zoom are imperceptible yet
+    # change the visual hash. Set visual_transforms=False for a bit-faithful cut.
+    visual_transforms: bool = True
+    vx_hflip: bool = False               # horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: float = 4.0                  # hue shift in degrees (imperceptible, breaks color hash)
+    vx_zoom: float = 1.04                # zoom-in then crop back (1.0 = off, 1.04 = 4%)
+    vx_strip_metadata: bool = True       # drop container metadata (-map_metadata -1)
     # Download mode for yt-dlp:
     #   "remux"  — current default. Uses --remux-video mp4. Instant container
     #              swap (no re-encode). ~2x faster but fails if YouTube serves
@@ -792,6 +823,12 @@ class PipelineConfig:
     enable_manual_review: bool = False
     # WhisperX forced alignment: refine word-level timestamps after transcription
     use_whisperx: bool = True
+    # When WhisperX is unavailable or produces an unhealthy alignment ("not
+    # proper"), re-transcribe locally on the GPU with faster-whisper to get
+    # native word-level timestamps instead of dropping to coarse segment timing.
+    # See backend/dubbing/word_timing.py for the tiered strategy + health check.
+    whisper_gpu_fallback: bool = True
+    whisper_fallback_model: str = "large-v3"   # local model for the word-timing fallback
     # TTS verify retry loop: re-generates segments that fail duration/energy check.
     # OFF by default — Hindi WPM variance causes 70%+ false positives, making the
     # loop take hours on long videos. Turn ON for short videos where you want the
@@ -968,8 +1005,10 @@ class Pipeline:
                  cancel_check: Optional[Callable[[], bool]] = None,
                  pause_event=None):
         self.cfg = cfg
-        # SUSPENDED: mix_original is permanently disabled until explicitly reactivated
-        self.cfg.mix_original = False
+        # mix_original (keep the original background music/SFX under the Hindi
+        # voice) is now RESPECTED — Demucs isolates the vocal-free bed and
+        # _mix_audio ducks it beneath the TTS. Re-enabled per user request; the
+        # value flows through from the request/UI toggle.
         self._on_progress = on_progress or (lambda *_: None)
         self._cancel_check = cancel_check or (lambda: False)
         self._pause_event = pause_event
@@ -2886,21 +2925,120 @@ class Pipeline:
                 "FFmpeg not found! Install: winget install Gyan.FFmpeg"
             )
         self._ffmpeg = resolved
+        # Keep the ORIGINAL system ffmpeg (standard name + ffprobe sibling) for
+        # yt-dlp's remux/merge. self._ffmpeg may be swapped to imageio below
+        # purely for NVENC encoding, and yt-dlp can't use that (odd binary name,
+        # no ffprobe alongside it).
+        self._ffmpeg_system = resolved
+
+        # ── GPU-encode rescue ────────────────────────────────────────────────
+        # If the resolved ffmpeg can't actually run NVENC (common when a rolling
+        # ffmpeg build outpaces the installed GPU driver), switch to the bundled
+        # imageio-ffmpeg in the venv, whose older NVENC matches the driver. Only
+        # switch if it TRULY encodes a frame; otherwise stay on libx264 (CPU).
+        if self._nvenc_usable(resolved):
+            self._has_nvenc = True
+        else:
+            self._has_nvenc = False
+            try:
+                import imageio_ffmpeg
+                bundled = imageio_ffmpeg.get_ffmpeg_exe()
+                if (bundled and os.path.exists(bundled) and bundled != resolved
+                        and self._nvenc_usable(bundled)):
+                    print(f"[FFmpeg] '{Path(resolved).name}' NVENC unusable on this "
+                          f"driver — switching to bundled imageio ffmpeg for GPU "
+                          f"encoding.", flush=True)
+                    self._ffmpeg = bundled
+                    self._has_nvenc = True
+            except Exception as e:
+                print(f"[FFmpeg] imageio-ffmpeg NVENC fallback unavailable ({e}).",
+                      flush=True)
+        print(f"[FFmpeg] Using {self._ffmpeg} | GPU encode (NVENC): "
+              f"{'yes' if self._has_nvenc else 'no — libx264 CPU'}", flush=True)
+
+        # Resolve ffprobe INDEPENDENTLY of self._ffmpeg. self._ffmpeg may be the
+        # imageio binary (no ffprobe sibling, non-standard name), so deriving
+        # ffprobe from its path returns a non-existent file — every duration
+        # probes as 0 and assembly aborts. Prefer PATH ffprobe, then the system
+        # ffmpeg's sibling.
+        self._ffprobe = self._resolve_ffprobe()
+        print(f"[FFmpeg] ffprobe: {self._ffprobe}", flush=True)
+
+    def _resolve_ffprobe(self) -> str:
+        """Locate a working ffprobe, independent of self._ffmpeg."""
+        p = shutil.which("ffprobe")
+        if p:
+            return p
+        sysff = getattr(self, "_ffmpeg_system", None)
+        if sysff:
+            sp = Path(sysff)
+            if sp.is_absolute() and sp.stem.lower() == "ffmpeg":
+                cand = sp.parent / ("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+                if cand.exists():
+                    return str(cand)
+        return "ffprobe"
+
+    def _nvenc_usable(self, ffmpeg_path: str) -> bool:
+        """Run a throwaway 1-frame NVENC encode with a SPECIFIC ffmpeg binary.
+        Returns True only when it exits 0 — i.e. the encoder is compiled in AND
+        the installed GPU driver actually supports it."""
+        try:
+            r = self._run_proc(
+                [ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5",
+                 "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _check_nvenc(self) -> bool:
-        """Check if NVIDIA NVENC hardware encoder is available."""
+        """Check if the NVIDIA NVENC hardware encoder is actually USABLE.
+
+        Seeing ``h264_nvenc`` in ``-encoders`` is NOT enough: the encoder can be
+        compiled into ffmpeg yet fail at runtime when the ffmpeg build requires a
+        newer GPU driver than is installed (e.g. a scoop/gyan ffmpeg 8.x needing
+        NVENC API 13.1 on a driver that only provides 13.0 → "Driver does not
+        support the required nvenc API version"). That mismatch would otherwise
+        crash EVERY section encode. So we run a throwaway 1-frame encode and fall
+        back to libx264 (CPU) on any failure.
+        """
         if self._has_nvenc is not None:
             return self._has_nvenc
+        # 1. Must at least be compiled in.
+        listed = False
         try:
             r = self._run_proc(
                 [self._ffmpeg, "-hide_banner", "-encoders"],
                 capture_output=True, text=True, timeout=10,
             )
-            self._has_nvenc = "h264_nvenc" in (r.stdout or "")
+            listed = "h264_nvenc" in (r.stdout or "")
         except Exception:
+            listed = False
+        if not listed:
             self._has_nvenc = False
+            return False
+        # 2. Must actually encode a frame with THIS ffmpeg + THIS driver.
+        try:
+            t = self._run_proc(
+                [self._ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5",
+                 "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self._has_nvenc = (t.returncode == 0)
+            if not self._has_nvenc:
+                first = next((ln for ln in (t.stderr or "").splitlines() if ln.strip()),
+                             "unknown error")
+                print(f"[NVENC] Encoder listed but NOT usable — falling back to "
+                      f"libx264 (CPU). Reason: {first}", flush=True)
+        except Exception as e:
+            self._has_nvenc = False
+            print(f"[NVENC] Test-encode errored ({e}) — falling back to libx264 (CPU).",
+                  flush=True)
         if self._has_nvenc:
-            print("[NVENC] GPU encoding available — using h264_nvenc", flush=True)
+            print("[NVENC] GPU encoding verified — using h264_nvenc", flush=True)
         return self._has_nvenc
 
     def _video_encode_args(self, crf: str = "18", force_cpu: bool = False) -> list:
@@ -3098,10 +3236,14 @@ class Pipeline:
 
                 self._report("download", 0.05, f"Downloading [{mode_label}]...")
 
-                # Only add --ffmpeg-location if we have a real path (not bare "ffmpeg")
-                ffmpeg_path = Path(self._ffmpeg)
-                if ffmpeg_path.is_absolute():
-                    dl_cmd += ["--ffmpeg-location", str(ffmpeg_path.parent)]
+                # yt-dlp needs a real ffmpeg+ffprobe for remux/merge. Use the
+                # SYSTEM ffmpeg (has an ffprobe sibling), NOT self._ffmpeg, which
+                # may be the imageio binary we switched to for NVENC (odd name,
+                # no ffprobe). If it isn't a standard ffmpeg, omit the flag and
+                # let yt-dlp find ffmpeg/ffprobe on PATH.
+                dl_ffmpeg = Path(getattr(self, "_ffmpeg_system", self._ffmpeg))
+                if dl_ffmpeg.is_absolute() and dl_ffmpeg.stem.lower() == "ffmpeg":
+                    dl_cmd += ["--ffmpeg-location", str(dl_ffmpeg.parent)]
                 dl_cmd += cookies_args + js_args + [src]
                 print(f"[YTDLP] cmd: {dl_cmd}", flush=True)
                 # ── Live progress: watchdog polls work_dir file growth every 1s ──
@@ -3905,7 +4047,7 @@ class Pipeline:
                     if not segments:
                         raise RuntimeError("Groq Whisper returned 0 segments")
                     if self.cfg.use_whisperx and segments:
-                        segments = self._whisperx_align(wav_path, segments)
+                        segments = self._refine_word_timing(wav_path, segments)
                     segments = self._dedup_segments(segments)
                     _cache.put_asr(wav_path, model, lang, segments)
                     return segments
@@ -3919,7 +4061,7 @@ class Pipeline:
 
         # Optional: refine word-level timestamps with WhisperX forced alignment
         if self.cfg.use_whisperx and segments:
-            segments = self._whisperx_align(wav_path, segments)
+            segments = self._refine_word_timing(wav_path, segments)
 
         segments = self._dedup_segments(segments)
         _cache.put_asr(wav_path, model, lang, segments)
@@ -4865,53 +5007,47 @@ class Pipeline:
                   f"corrected {corrected_total} words", flush=True)
             return result
 
-    def _whisperx_align(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
-        """Refine word-level timestamps using WhisperX forced alignment.
-        Falls back to original segments if whisperx is not installed."""
+    def _refine_word_timing(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
+        """Refine to word-level timestamps via the tiered strategy in
+        dubbing/word_timing.py:
+
+            WhisperX forced alignment  →  local faster-whisper on GPU (when
+            WhisperX 'is not proper')  →  original segment-level timing.
+
+        The heavy local re-transcription is injected as a closure so the module
+        stays free of the multiprocessing worker; it is bound to
+        cfg.whisper_fallback_model (default large-v3)."""
         try:
-            import whisperx
-            import torch
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            lang = self.cfg.source_language
-            if not lang or lang == "auto":
-                lang = "en"
-
-            self._report("transcribe", 0.97, "Running WhisperX forced alignment...")
-            align_model, metadata = whisperx.load_align_model(
-                language_code=lang, device=device
-            )
-            result = whisperx.align(
-                segments, align_model, metadata, str(wav_path), device,
-                return_char_alignments=False,
-            )
-            refined = result.get("segments", segments)
-            # Normalise to our segment dict format (ensure start/end/text present)
-            # Preserve all original fields (e.g. speaker_id for multi-speaker mode)
-            out = []
-            for seg in refined:
-                entry = {**seg,  # Preserve original fields first
-                    "start": float(seg.get("start", 0)),
-                    "end":   float(seg.get("end", 0)),
-                    "text":  seg.get("text", "").strip(),
-                }
-                words = seg.get("words")
-                if words:
-                    entry["words"] = [
-                        {"word": w.get("word", "").strip(),
-                         "start": float(w.get("start", entry["start"])),
-                         "end":   float(w.get("end", entry["end"]))}
-                        for w in words
-                    ]
-                out.append(entry)
-            self._report("transcribe", 0.99, f"WhisperX alignment complete ({len(out)} segments)")
-            return out
-        except ImportError:
-            print("[Pipeline] whisperx not installed — skipping forced alignment", flush=True)
-            return segments
+            from dubbing import word_timing
         except Exception as e:
-            print(f"[Pipeline] WhisperX alignment failed ({e}) — using original timestamps", flush=True)
+            print(f"[Pipeline] word_timing module unavailable ({e}) — keeping timestamps",
+                  flush=True)
             return segments
+
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+        lang = self.cfg.source_language or "en"
+
+        def _local_whisper():
+            # Native word_timestamps via faster-whisper, forced to the fallback model.
+            return self._transcribe_local(
+                wav_path,
+                model_override=getattr(self.cfg, "whisper_fallback_model", "large-v3"),
+            )
+
+        return word_timing.refine(
+            wav_path, segments,
+            language=lang,
+            device=device,
+            use_whisperx=bool(self.cfg.use_whisperx),
+            gpu_fallback=bool(getattr(self.cfg, "whisper_gpu_fallback", True)),
+            local_whisper=_local_whisper,
+            report=self._report,
+        )
 
     def _transcribe_groq(self, wav_path: Path, api_key: str) -> List[Dict]:
         """Transcribe using Groq Whisper API — ~25s per hour of audio.
@@ -5049,7 +5185,7 @@ class Pipeline:
 
         return segments
 
-    def _transcribe_local(self, wav_path: Path) -> List[Dict]:
+    def _transcribe_local(self, wav_path: Path, model_override: Optional[str] = None) -> List[Dict]:
         """Transcribe speech from audio using local faster-whisper (GPU/CPU).
 
         Runs Whisper in a **child process** so that C-level crashes
@@ -5062,7 +5198,7 @@ class Pipeline:
         import json as _json
         import tempfile as _tmpmod
 
-        local_model = self.cfg.asr_model
+        local_model = model_override or self.cfg.asr_model
         if local_model in ("groq-whisper", "groq", "parakeet"):
             local_model = "medium"
 
@@ -10753,8 +10889,7 @@ class Pipeline:
         callers can treat "unknown" as "don't retry".
         """
         try:
-            ffprobe = self._ffmpeg.replace("ffmpeg", "ffprobe") \
-                if "ffmpeg" in self._ffmpeg else "ffprobe"
+            ffprobe = getattr(self, "_ffprobe", None) or shutil.which("ffprobe") or "ffprobe"
             result = self._run_proc(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", str(mp3_path)],
@@ -13048,13 +13183,7 @@ class Pipeline:
     # ── Duration & tempo adjustment ───────────────────────────────────────
     def _get_duration(self, media_path: Path) -> float:
         """Get duration of a media file in seconds using ffprobe."""
-        ffmpeg_path = Path(self._ffmpeg)
-        if ffmpeg_path.is_absolute():
-            ffprobe = str(ffmpeg_path.parent / "ffprobe")
-            if sys.platform == "win32" and not ffprobe.endswith(".exe"):
-                ffprobe += ".exe"
-        else:
-            ffprobe = shutil.which("ffprobe") or "ffprobe"
+        ffprobe = getattr(self, "_ffprobe", None) or shutil.which("ffprobe") or "ffprobe"
         try:
             result = self._run_proc(
                 [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
@@ -13150,6 +13279,8 @@ class Pipeline:
 
             if total_duration <= CHUNK_SECS:
                 # Short audio — process in one shot
+                self._report("assemble", 0.85,
+                             "Separating vocals from background music (Demucs)...")
                 return self._demucs_single(audio_raw, bg_path)
 
             # Long audio — split, process chunks, concatenate
@@ -13158,6 +13289,11 @@ class Pipeline:
             chunk_bg_paths = []
 
             for ci in range(num_chunks):
+                if self._cancel_check():
+                    print("[DEMUCS] Cancelled during background separation", flush=True)
+                    return audio_raw
+                self._report("assemble", 0.85,
+                             f"Separating background (Demucs) — chunk {ci+1}/{num_chunks}...")
                 start = ci * CHUNK_SECS
                 chunk_audio = self.cfg.work_dir / f"demucs_chunk_{ci:03d}.wav"
                 chunk_bg = self.cfg.work_dir / f"demucs_bg_{ci:03d}.wav"
@@ -13227,6 +13363,8 @@ class Pipeline:
             import demucs.separate
             demucs_out = self.cfg.work_dir / "demucs_out"
             print(f"[DEMUCS] Separating {audio_path.name}...", flush=True)
+            self._report("assemble", 0.86,
+                         f"Demucs isolating background from {audio_path.name} (GPU)...")
             demucs.separate.main([
                 "--two-stems", "vocals",
                 "-n", "htdemucs",
@@ -13250,30 +13388,60 @@ class Pipeline:
         return audio_path
 
     def _mix_audio(self, original: Path, tts: Path, original_vol: float) -> Path:
-        # Use background-only track (no vocals) instead of full original
+        # Keep the original BACKGROUND (music/SFX) under the Hindi voice. We mix
+        # the vocal-free Demucs stem — never the raw original — so the English
+        # speech is removed and only the bed remains beneath the dubbed voice.
         bg_track = self._separate_background(original)
         mixed = self.cfg.work_dir / "audio_mixed.wav"
-        self._run_proc(
-            [
-                self._ffmpeg, "-y",
-                "-i", str(tts),
-                "-i", str(bg_track),
-                "-filter_complex",
-                (
-                    f"[0:a]asplit=2[tts_out][tts_sc];"
-                    f"[1:a]volume={original_vol}[bg_raw];"
-                    f"[bg_raw][tts_sc]sidechaincompress="
-                    f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
-                    f"[tts_out][bg_duck]amix=inputs=2:duration=longest:dropout_transition=2[out]"
-                ),
-                "-map", "[out]",
-                "-ar", str(self.SAMPLE_RATE),
-                "-ac", str(self.N_CHANNELS),
-                str(mixed),
-            ],
-            check=True,
-            capture_output=True,
-        )
+
+        def _run_mix(alter: bool):
+            # Bed pre-chain. Any alteration is DURATION-PRESERVING (pitch + EQ
+            # only, never tempo) so the bed stays aligned to the per-segment
+            # stretched video timeline.
+            bg_pre = f"volume={original_vol}"
+            if alter and getattr(self.cfg, "bg_alter", False):
+                pitch = float(getattr(self.cfg, "bg_pitch", 1.03) or 1.0)
+                if abs(pitch - 1.0) > 0.001:
+                    bg_pre += f",rubberband=pitch={pitch:.4f}"
+                # Gentle spectral tilt further shifts the audio fingerprint.
+                bg_pre += ",equalizer=f=2500:t=q:w=2:g=-2,equalizer=f=180:t=q:w=2:g=1.5"
+            self._run_proc(
+                [
+                    self._ffmpeg, "-y",
+                    "-i", str(tts),
+                    "-i", str(bg_track),
+                    "-filter_complex",
+                    (
+                        f"[0:a]asplit=2[tts_out][tts_sc];"
+                        f"[1:a]{bg_pre}[bg_raw];"
+                        f"[bg_raw][tts_sc]sidechaincompress="
+                        f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
+                        f"[tts_out][bg_duck]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+                    ),
+                    "-map", "[out]",
+                    "-ar", str(self.SAMPLE_RATE),
+                    "-ac", str(self.N_CHANNELS),
+                    str(mixed),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        want_alter = bool(getattr(self.cfg, "bg_alter", False))
+        self._report("assemble", 0.88,
+                     "Mixing background (fingerprint-break: pitch+EQ) under voice..."
+                     if want_alter else "Mixing background under voice...")
+        try:
+            _run_mix(alter=True)
+        except Exception as e:
+            if want_alter:
+                # rubberband/EQ can be missing in some ffmpeg builds — retry with
+                # a plain unaltered mix so the job never dies on this step.
+                print(f"[Mix] Altered mix failed ({e}) — retrying without "
+                      f"fingerprint-break", flush=True)
+                _run_mix(alter=False)
+            else:
+                raise
         return mixed
 
     # ── Video split / concat ─────────────────────────────────────────────
@@ -14520,31 +14688,72 @@ class Pipeline:
         audio_dur = self._get_duration(audio_path)
         video_dur = self._get_duration(video_path)
 
-        cmd = [
-            self._ffmpeg, "-y",
-            "-i", str(video_path),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
-        ]
+        # ── Visual transforms (Content-ID / duplicate evasion) ──
+        # When enabled, apply hflip/hue/zoom + metadata strip HERE as a single
+        # re-encode pass over the whole video (it is otherwise stream-copied),
+        # giving one uniform fingerprint break. Cheap on NVENC; skipped entirely
+        # when the toggle is off so the fast lossless -c:v copy path is kept.
+        vx = ""
+        if getattr(self.cfg, "visual_transforms", False):
+            try:
+                from dubbing.srtdub import _build_vx_filter
+                vx = _build_vx_filter(
+                    bool(getattr(self.cfg, "vx_hflip", False)),
+                    float(getattr(self.cfg, "vx_hue", 0.0) or 0.0),
+                    float(getattr(self.cfg, "vx_zoom", 1.0) or 1.0),
+                )
+            except Exception as e:
+                print(f"[Mux] visual-transform build failed ({e}) — skipping", flush=True)
+                vx = ""
+        strip_meta = (["-map_metadata", "-1"]
+                      if (getattr(self.cfg, "visual_transforms", False)
+                          and getattr(self.cfg, "vx_strip_metadata", True)) else [])
+        if vx:
+            print(f"[Mux] Visual transforms ON — filter chain: {vx}", flush=True)
+
+        if vx:
+            # Re-encode video once with the transform chain applied.
+            cmd = [
+                self._ffmpeg, "-y",
+                "-i", str(video_path),
+                "-i", str(audio_path),
+                "-filter:v", vx,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                *self._video_encode_args(),  # NVENC when available
+                *strip_meta,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
+            ]
+        else:
+            cmd = [
+                self._ffmpeg, "-y",
+                "-i", str(video_path),
+                "-i", str(audio_path),
+                "-c:v", "copy",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                *strip_meta,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
+            ]
 
         if audio_dur > video_dur + 1.0:
             # Audio is longer — DON'T let FFmpeg cut it at video end
             # Loop last video frame to cover remaining audio
             print(f"[Mux] Audio ({audio_dur:.0f}s) > Video ({video_dur:.0f}s) "
                   f"— extending video to match audio", flush=True)
-            # Re-encode video with loop to match audio length
+            # Re-encode video with loop to match audio length (vx folded in when on)
             cmd = [
                 self._ffmpeg, "-y",
                 "-stream_loop", "-1",  # loop video
                 "-i", str(video_path),
                 "-i", str(audio_path),
+                *(["-filter:v", vx] if vx else []),
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 *self._video_encode_args(),  # NVENC when available
+                *strip_meta,
                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                 "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
                 "-t", f"{audio_dur:.3f}",  # output = audio length (NOT video length)

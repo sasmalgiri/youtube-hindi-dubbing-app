@@ -16,3 +16,11 @@ rich==13.9.4
 yt-dlp>=2024.1.0
 pywebview>=5.0
 supabase>=2.0.0
+
+# ── GPU features: WhisperX word-level alignment + Demucs background separation ──
+# torch must be the CUDA build to use the GPU. On an NVIDIA machine install with:
+#   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# (plain `pip install torch` pulls the CPU build — WhisperX/Demucs still run, just slowly.)
+torch>=2.2
+whisperx>=3.8.0        # forced alignment for tighter word timestamps (on by default)
+demucs>=4.0.0          # vocal/background stem separation for "keep background music"

@@ -1565,7 +1565,25 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </div>
                     </div>
 
-                    {/* Mix Background Music — SUSPENDED (permanently disabled) */}
+                    {/* Keep Background Music — Demucs bed ducked under the Hindi voice */}
+                    {!isSrtDub && (
+                        <div className={`flex items-center justify-between mb-3 ${(isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                            <div className="pr-3">
+                                <p className="text-sm text-text-primary">Keep Background Music</p>
+                                <p className="text-xs text-text-muted">
+                                    Demucs isolates the original music/SFX and mixes it (auto-ducked) under the Hindi voice.
+                                    The bed is pitch/EQ-shifted to reduce Content-ID matching — this lowers, but does not
+                                    guarantee, avoiding a music copyright claim. Adds a GPU separation step.
+                                </p>
+                            </div>
+                            <button
+                                type="button" title="Toggle Keep Background Music" onClick={() => update({ mix_original: !settings.mix_original })}
+                                className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${settings.mix_original ? 'bg-primary' : 'bg-white/10'}`}
+                            >
+                                <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.mix_original ? 'translate-x-6' : 'translate-x-1'}`} />
+                            </button>
+                        </div>
+                    )}
 
                     {/* ── Audio & Performance Section — HIDDEN in SRT Direct (it has its own assembly) ── */}
                     {!isSrtDub && (

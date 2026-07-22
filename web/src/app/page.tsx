@@ -22,7 +22,7 @@ export default function HomePage() {
         // ── Stage 5: Translation — Google (parallel x20, FASTEST free) ──
         translation_engine: 'google',
         tts_rate: '+0%',
-        mix_original: false,
+        mix_original: true,   // keep original background music/SFX (Demucs) under the Hindi voice
         video_slow_to_match: true,
         original_volume: 0.10,
         // ── Stage 8: TTS (Managed Quad Parallel) ──
@@ -56,7 +56,7 @@ export default function HomePage() {
         fast_assemble: false,
         dub_chain: [],
         enable_manual_review: false,
-        use_whisperx: false,
+        use_whisperx: true,
         simplify_english: false,             // OFF: translation 35% word cap handles it
         step_by_step: false,
         use_new_pipeline: false,
