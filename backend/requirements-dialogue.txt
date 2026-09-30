@@ -1,0 +1,28 @@
+# Optional dependencies for the Hindi dialogue profile (pipeline_mode=hindi_dialogue).
+# Base requirements (backend/requirements.txt) must be installed first.
+#
+# These are version RANGES, not a tested lock: the cloud environment that
+# built this profile had no GPU and could not install/run these models.
+# Install into a separate virtualenv first, run
+#     python -m dubbing.dialogue doctor
+# and only then switch your working environment. Do not upgrade an existing
+# working install blindly (pyannote 4 / torch 2.8 are large upgrades).
+
+numpy>=1.24
+python-dotenv>=0.19
+
+# Local ASR with word timestamps + Hindi re-ASR content verification
+faster-whisper>=1.1,<2
+
+# Speaker diarization (pyannote/speaker-diarization-community-1 needs pyannote.audio 4.x,
+# Python >= 3.10, a Hugging Face token, and accepting the model's conditions)
+pyannote.audio>=4.0,<5
+
+# Background (speech/music) separation estimate — optional
+demucs>=4.0
+
+# Last-resort non-contextual translation fallback (flagged in the report)
+deep-translator>=1.11
+
+# EXPERIMENTAL IndicF5 provider (gated model; curated authorised references only)
+# transformers>=4.44
