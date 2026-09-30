@@ -7,7 +7,7 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
-import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob } from '@/lib/api';
+import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob, dialogueReportUrl } from '@/lib/api';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -275,6 +275,31 @@ export default function JobPage() {
                                     </span>
                                 </div>
                             ))}
+                        </div>
+                    </div>
+                )}
+
+                {/* Hindi dialogue profile: honest result status + report */}
+                {status?.result_status && (
+                    <div className="glass-card p-4">
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${
+                                    status.result_status === 'completed' ? 'bg-green-500/20 text-green-400' :
+                                    status.result_status === 'completed_with_warnings' ? 'bg-amber-500/20 text-amber-400' :
+                                    'bg-red-500/20 text-red-400'}`}>
+                                    {status.result_status.replace(/_/g, ' ')}
+                                </span>
+                                {(status.status_reasons || []).length > 0 && (
+                                    <ul className="mt-2 text-xs text-text-muted list-disc pl-4 space-y-0.5">
+                                        {(status.status_reasons || []).slice(0, 6).map((r, i) => <li key={i}>{r}</li>)}
+                                    </ul>
+                                )}
+                            </div>
+                            <a href={dialogueReportUrl(jobId)} target="_blank" rel="noreferrer"
+                               className="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-text-primary whitespace-nowrap">
+                                Open report
+                            </a>
                         </div>
                     </div>
                 )}

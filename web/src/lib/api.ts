@@ -103,6 +103,12 @@ export interface JobCreateRequest {
     sd_vx_hflip?: boolean;           // horizontal mirror
     sd_vx_hue?: number;              // hue shift degrees (-30..+30)
     sd_vx_zoom?: number;             // zoom + crop back (1.0 = off, 1.05 = 5% zoom)
+    // ── Hindi dialogue profile (pipeline_mode = 'hindi_dialogue') ──
+    dialogue_tts_providers?: string;        // e.g. "edge" or "sarvam,edge" (paid only if listed)
+    dialogue_translation_engines?: string;  // e.g. "gemini,groq,cerebras"
+    dialogue_num_speakers?: number;         // 0 = detect
+    dialogue_background?: 'auto' | 'demucs' | 'none';
+    dialogue_verify?: 'auto' | 'on' | 'off';
 }
 
 export interface JobConfig {
@@ -210,6 +216,10 @@ export interface JobStatus {
     avg_words_per_sent?: number;
     max_seg_words?: number;
     max_sent_words?: number;
+    // Hindi dialogue profile: honest outcome + report
+    result_status?: 'completed' | 'completed_with_warnings' | 'draft_incomplete' | 'failed' | 'cancelled' | null;
+    status_reasons?: string[];
+    report_path?: string | null;
 }
 
 export interface TranscriptSegment {
@@ -390,6 +400,10 @@ export function originalVideoUrl(id: string): string {
 
 export function resultSrtUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/srt`;
+}
+
+export function dialogueReportUrl(id: string, fmt: 'md' | 'json' = 'md'): string {
+    return `${API_BASE}/api/jobs/${id}/report?fmt=${fmt}`;
 }
 
 export function sourceSrtUrl(id: string): string {

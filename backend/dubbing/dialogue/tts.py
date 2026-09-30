@@ -1,0 +1,412 @@
+"""TTS providers and the speaker-preserving router.
+
+Every synthesis goes through ``TTSRouter.synthesize(turn)``, which obtains the
+voice from ``SpeakerRegistry.resolve_voice`` -- first pass, retries, rewrites
+and fallbacks alike. Retries keep the text and voice unchanged. A provider
+fallback uses the *same speaker's* binding on the fallback provider and marks
+the clip degraded; ``reroute_mixed_speakers`` then moves the whole speaker to
+one provider so a character is not voiced by two different voices.
+
+Paid providers (sarvam, elevenlabs, google) are only constructed when the
+owner lists them explicitly; the default provider list is ["edge"].
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import math
+import os
+import re
+import threading
+import wave
+from array import array
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence
+
+from . import audio
+from .contracts import UNKNOWN_SPEAKER, Clip, Turn
+from .speaker_registry import SpeakerRegistry, VoiceResolutionError
+
+SENTENCE_SPLIT = re.compile(r"(?<=[।.!?])\s+")
+
+
+class TTSProviderError(RuntimeError):
+    pass
+
+
+class TTSFailure(RuntimeError):
+    def __init__(self, turn_id: str, history: List[Dict]):
+        super().__init__(f"TTS failed for {turn_id}")
+        self.turn_id = turn_id
+        self.history = history
+
+
+def split_for_limit(text: str, max_chars: int) -> List[str]:
+    """Split at sentence (then clause/space) boundaries. Never drops text."""
+    if len(text) <= max_chars:
+        return [text]
+    parts, cur = [], ""
+    for sent in SENTENCE_SPLIT.split(text):
+        if len(cur) + len(sent) + 1 <= max_chars:
+            cur = f"{cur} {sent}".strip()
+            continue
+        if cur:
+            parts.append(cur)
+        while len(sent) > max_chars:
+            cut = max(sent.rfind(",", 0, max_chars), sent.rfind(" ", 0, max_chars))
+            cut = cut if cut > 0 else max_chars
+            parts.append(sent[:cut + 1].strip())
+            sent = sent[cut + 1:].strip()
+        cur = sent
+    if cur:
+        parts.append(cur)
+    assert "".join(parts).replace(" ", "") == text.replace(" ", ""), "split lost text"
+    return parts
+
+
+class BaseProvider:
+    name = "base"
+    max_chars = 3000
+    paid = False
+
+    def synthesize_part(self, text: str, binding: Dict, out: Path) -> Path:
+        raise NotImplementedError
+
+    def synthesize(self, text: str, binding: Dict, out_wav: Path) -> Path:
+        """Synthesize full text to a 48 kHz mono WAV (concatenating parts)."""
+        parts = split_for_limit(text, self.max_chars)
+        wavs = []
+        for i, part in enumerate(parts):
+            raw = out_wav.with_name(f"{out_wav.stem}.p{i}.raw")
+            got = self.synthesize_part(part, binding, raw)
+            w = out_wav.with_name(f"{out_wav.stem}.p{i}.48k.wav")
+            audio.to_wav(got, w)
+            got.unlink(missing_ok=True)
+            wavs.append(w)
+        if len(wavs) == 1:
+            wavs[0].replace(out_wav)
+        else:
+            import numpy as np
+            chunks = [audio.read_wav(w)[0][:, 0] for w in wavs]
+            gap = np.zeros(int(0.12 * audio.SR), dtype=np.float32)
+            joined = np.concatenate([x for c in chunks for x in (c, gap)][:-1])
+            audio.write_wav(out_wav, joined, audio.SR)
+            for w in wavs:
+                w.unlink(missing_ok=True)
+        return out_wav
+
+
+class EdgeProvider(BaseProvider):
+    name = "edge"
+    max_chars = 2000
+
+    def synthesize_part(self, text, binding, out):
+        try:
+            import edge_tts
+        except ImportError as e:
+            raise TTSProviderError("edge-tts not installed") from e
+        mp3 = out.with_suffix(".mp3")
+        kwargs = {"rate": binding.get("rate") or "+0%"}
+        if binding.get("pitch"):
+            kwargs["pitch"] = binding["pitch"]
+
+        async def _go():
+            await edge_tts.Communicate(text, binding["voice"], **kwargs).save(str(mp3))
+        try:
+            asyncio.run(_go())
+        except Exception as e:
+            raise TTSProviderError(f"edge: {type(e).__name__}: {str(e)[:160]}") from e
+        if not mp3.exists() or mp3.stat().st_size < 500:
+            raise TTSProviderError("edge: empty audio")
+        return mp3
+
+
+class SarvamProvider(BaseProvider):
+    name = "sarvam"
+    paid = True
+    max_chars = 1400  # bulbul:v2 limit is 1500 characters
+
+    def __init__(self):
+        self.key = os.environ.get("SARVAM_API_KEY", "").strip()
+
+    def synthesize_part(self, text, binding, out):
+        import requests
+        if not self.key:
+            raise TTSProviderError("SARVAM_API_KEY not set")
+        body = {"text": text, "target_language_code": "hi-IN", "speaker": binding["voice"],
+                "model": binding.get("model") or "bulbul:v2", "speech_sample_rate": 24000}
+        r = requests.post("https://api.sarvam.ai/text-to-speech", json=body, timeout=60,
+                          headers={"api-subscription-key": self.key})
+        if r.status_code != 200:
+            raise TTSProviderError(f"sarvam HTTP {r.status_code}: {r.text[:160]}")
+        b64 = (r.json().get("audios") or [None])[0]
+        if not b64:
+            raise TTSProviderError("sarvam: no audio")
+        p = out.with_suffix(".wav")
+        p.write_bytes(base64.b64decode(b64))
+        return p
+
+
+class ElevenLabsProvider(BaseProvider):
+    name = "elevenlabs"
+    paid = True
+    max_chars = 5000
+
+    def __init__(self):
+        self.key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+
+    def synthesize_part(self, text, binding, out):
+        import requests
+        if not self.key:
+            raise TTSProviderError("ELEVENLABS_API_KEY not set")
+        r = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{binding['voice']}?output_format=mp3_44100_128",
+            headers={"xi-api-key": self.key, "Content-Type": "application/json"},
+            json={"text": text, "model_id": binding.get("model") or "eleven_multilingual_v2",
+                  "language_code": "hi"}, timeout=120)
+        if r.status_code != 200:
+            raise TTSProviderError(f"elevenlabs HTTP {r.status_code}: {r.text[:160]}")
+        p = out.with_suffix(".mp3")
+        p.write_bytes(r.content)
+        return p
+
+
+class GoogleProvider(BaseProvider):
+    name = "google"
+    paid = True
+    max_chars = 4500
+
+    def __init__(self):
+        self.key = os.environ.get("GOOGLE_TTS_API_KEY", "").strip()
+
+    def synthesize_part(self, text, binding, out):
+        import requests
+        if not self.key:
+            raise TTSProviderError("GOOGLE_TTS_API_KEY not set")
+        pitch = 0.0
+        if binding.get("pitch"):
+            try:  # "+8Hz" -> ~ semitones (rough, only to separate shared voices)
+                pitch = max(-20.0, min(20.0, float(binding["pitch"].rstrip("Hz")) / 6.0))
+            except ValueError:
+                pitch = 0.0
+        r = requests.post(
+            f"https://texttospeech.googleapis.com/v1/text:synthesize?key={self.key}",
+            json={"input": {"text": text},
+                  "voice": {"languageCode": "hi-IN", "name": binding["voice"]},
+                  "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000,
+                                  "pitch": pitch}}, timeout=60)
+        if r.status_code != 200:
+            raise TTSProviderError(f"google HTTP {r.status_code}: {r.text[:160]}")
+        p = out.with_suffix(".wav")
+        p.write_bytes(base64.b64decode(r.json()["audioContent"]))
+        return p
+
+
+class MockProvider(BaseProvider):
+    """Deterministic offline provider for tests and dry runs (tones, not speech)."""
+    name = "mock"
+
+    def __init__(self, seconds_per_char: float = 0.06,
+                 fail: Optional[Callable[[str, Dict], bool]] = None, name: str = "mock"):
+        self.seconds_per_char = seconds_per_char
+        self.fail = fail
+        self.name = name
+        self.calls: List[Dict] = []
+        self._lock = threading.Lock()
+
+    def synthesize_part(self, text, binding, out):
+        with self._lock:
+            self.calls.append({"text": text, "voice": binding["voice"], "pitch": binding.get("pitch")})
+        if self.fail and self.fail(text, binding):
+            raise TTSProviderError("mock failure")
+        sr = 24000
+        dur = max(0.3, len(text) * self.seconds_per_char)
+        f0 = 110.0 + (sum(map(ord, binding["voice"])) % 7) * 25.0
+        data = array("h", (int(8000 * math.sin(2 * math.pi * f0 * n / sr)
+                               * (0.6 + 0.4 * math.sin(2 * math.pi * 3 * n / sr)))
+                           for n in range(int(dur * sr))))
+        p = out.with_suffix(".wav")
+        with wave.open(str(p), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(data.tobytes())
+        return p
+
+
+class IndicF5Provider(BaseProvider):
+    """EXPERIMENTAL local IndicF5 (ai4bharat/IndicF5, gated, MIT) synthesis.
+
+    Each binding's "voice" is a curated reference id resolved to
+    backend/voices/indicf5/<category>/<id>.wav + <id>.txt (exact transcript of
+    the reference, in Hindi). Only references you are authorised to use may be
+    placed there. Original-speaker cloning is NOT enabled: a clean Hindi
+    reference with an exact transcript is required, and arbitrary English
+    clips are not assumed to clone reliably into Hindi.
+    Not runtime-verified in this repository's CI (needs GPU + gated weights).
+    """
+    name = "indicf5"
+    max_chars = 600
+    SR = 24000
+
+    def __init__(self):
+        self.model = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self.model is None:
+            try:
+                from transformers import AutoModel
+            except ImportError as e:
+                raise TTSProviderError("transformers not installed (IndicF5 is optional)") from e
+            self.model = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+
+    def synthesize_part(self, text, binding, out):
+        ref_wav = Path(binding["ref_audio"])
+        ref_txt = Path(binding["ref_text"]).read_text(encoding="utf-8").strip()
+        with self._lock:  # one GPU generation at a time
+            self._load()
+            try:
+                wav = self.model(text, ref_audio_path=str(ref_wav), ref_text=ref_txt)
+            except Exception as e:
+                raise TTSProviderError(f"indicf5: {str(e)[:160]}") from e
+        import numpy as np
+        arr = np.asarray(wav)
+        if arr.dtype == np.int16:
+            arr = arr.astype(np.float32) / 32768.0
+        p = out.with_suffix(".wav")
+        audio.write_wav(p, arr.reshape(-1), self.SR)
+        return p
+
+
+PROVIDER_CLASSES = {"edge": EdgeProvider, "sarvam": SarvamProvider,
+                    "elevenlabs": ElevenLabsProvider, "google": GoogleProvider,
+                    "indicf5": IndicF5Provider, "mock": MockProvider}
+
+
+def build_providers(names: Sequence[str]) -> Dict[str, BaseProvider]:
+    out = {}
+    for n in names:
+        if n not in PROVIDER_CLASSES:
+            raise ValueError(f"Unknown TTS provider '{n}'")
+        out[n] = PROVIDER_CLASSES[n]()
+    return out
+
+
+class TTSRouter:
+    def __init__(self, providers: Dict[str, BaseProvider], registry: SpeakerRegistry,
+                 order: Sequence[str], clip_dir: Path, max_retries: int = 2,
+                 pronunciation: Optional[Dict[str, str]] = None):
+        if not order:
+            raise ValueError("at least one TTS provider is required")
+        self.providers = providers
+        self.registry = registry
+        self.order = list(order)
+        self.clip_dir = Path(clip_dir)
+        self.clip_dir.mkdir(parents=True, exist_ok=True)
+        self.max_retries = max_retries
+        self.pronunciation = pronunciation or {}
+        self.speaker_provider: Dict[str, str] = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def _next_id(self) -> str:
+        with self._lock:
+            self._counter += 1
+            return f"c{self._counter:05d}"
+
+    def _spoken_text(self, text: str) -> str:
+        for k in sorted(self.pronunciation, key=len, reverse=True):
+            if k in text:
+                text = text.replace(k, self.pronunciation[k])
+        return text
+
+    def providers_for(self, speaker_id: str) -> List[str]:
+        first = self.speaker_provider.get(speaker_id, self.order[0])
+        return [first] + [p for p in self.order if p != first]
+
+    def synthesize(self, turn: Turn, reason: str = "initial",
+                   only_provider: Optional[str] = None) -> Clip:
+        text = turn.speech_text
+        if not text:
+            raise TTSFailure(turn.turn_id, [{"error": "empty text"}])
+        spoken = self._spoken_text(text)
+        history: List[Dict] = []
+        policy = "register_unknown" if turn.speaker_id == UNKNOWN_SPEAKER else "strict"
+        chain = [only_provider] if only_provider else self.providers_for(turn.speaker_id)
+        primary = chain[0]
+        for prov_name in chain:
+            prov = self.providers.get(prov_name)
+            if prov is None:
+                continue
+            try:
+                binding = self.registry.resolve_voice(turn.speaker_id, prov_name, policy)
+            except VoiceResolutionError as e:
+                history.append({"provider": prov_name, "error": str(e)})
+                continue
+            for attempt in range(self.max_retries + 1):
+                clip_id = self._next_id()
+                raw = self.clip_dir / f"{turn.turn_id}_{clip_id}_raw.wav"
+                final = self.clip_dir / f"{turn.turn_id}_{clip_id}.wav"
+                try:
+                    prov.synthesize(spoken, binding, raw)
+                    dur = audio.trim_silence(raw, final)
+                    raw.unlink(missing_ok=True)
+                except Exception as e:
+                    history.append({"provider": prov_name, "voice": binding["voice"],
+                                    "attempt": attempt + 1, "error": str(e)[:200]})
+                    continue
+                # Anything not voiced by the configured primary provider is degraded.
+                degraded = prov_name != self.order[0]
+                if prov_name != primary:
+                    self.registry.record_fallback(turn.speaker_id, primary, prov_name,
+                                                  turn.turn_id, history[-1]["error"] if history else "")
+                return Clip(clip_id=clip_id, turn_id=turn.turn_id, speaker_id=turn.speaker_id,
+                            provider=prov_name, voice=binding["voice"], model=binding.get("model", ""),
+                            voice_params={"pitch": binding.get("pitch"), "variant": binding.get("variant")},
+                            spoken_text=spoken, path=str(final), natural_duration=dur,
+                            final_duration=dur, degraded=degraded,
+                            retry_history=history + [{"reason": reason}])
+        raise TTSFailure(turn.turn_id, history)
+
+    def reroute_mixed_speakers(self, turns: Dict[str, Turn], clips: Dict[str, Clip],
+                               synth: Optional[Callable[[Turn, str, str], Clip]] = None) -> List[Dict]:
+        """If a speaker's clips came from >1 provider, re-voice the whole
+        speaker with the fallback provider. Returns unresolved mixes.
+
+        `synth(turn, reason, provider)` should run the same acceptance checks
+        as the first pass; without it clips are accepted unchecked."""
+        by_spk: Dict[str, Dict[str, List[str]]] = {}
+        for tid, c in clips.items():
+            by_spk.setdefault(c.speaker_id, {}).setdefault(c.provider, []).append(tid)
+        unresolved = []
+        for spk, provs in by_spk.items():
+            if len(provs) < 2:
+                continue
+            target = max((p for p in provs if p != self.order[0]),
+                         key=lambda p: len(provs[p]), default=None)
+            if target is None:
+                continue
+            self.speaker_provider[spk] = target
+            failed = []
+            for prov, tids in provs.items():
+                if prov == target:
+                    continue
+                for tid in tids:
+                    try:
+                        if synth is not None:
+                            new = synth(turns[tid], "speaker_reroute", target)
+                        else:
+                            new = self.synthesize(turns[tid], reason="speaker_reroute", only_provider=target)
+                            new.accepted = True
+                    except TTSFailure:
+                        failed.append(tid)
+                        continue
+                    if not new.accepted:
+                        failed.append(tid)
+                        continue
+                    new.degraded = True
+                    clips[tid] = new
+            if failed:
+                unresolved.append({"speaker_id": spk, "providers": sorted(provs), "turn_ids": failed})
+        return unresolved

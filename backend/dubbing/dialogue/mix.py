@@ -1,0 +1,215 @@
+"""Timestamped multi-track dialogue render, background policy, mux, subtitles.
+
+Background policy (dialogue profile):
+  * "auto"  : try Demucs speech/music separation; if it is unavailable or
+              fails, output clean Hindi-only audio and report it.
+  * "demucs": same as auto but the failure is also a job warning.
+  * "none"  : Hindi-only audio (no background bed).
+The original English audio is never used as a "background" stand-in.
+Separation is an *estimate* of the non-speech bed, not a clean M&E track.
+"""
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+from . import audio
+from .contracts import Clip, Turn
+
+
+def render_dialogue(clips: Sequence[Clip], duration: float, out_dir: Path,
+                    sr: int = audio.SR) -> Dict:
+    """Place every accepted clip at its scheduled time. Writes one stem per
+    track plus the summed dialogue bus. Nothing is cut: if clips extend past
+    `duration`, the bus is extended and the excess is reported."""
+    import numpy as np
+    accepted = [c for c in clips if c.accepted]
+    end = max([duration] + [c.scheduled_end for c in accepted])
+    n = int(round(end * sr)) + 1
+    n_tracks = max([c.track for c in accepted], default=-1) + 1
+    tracks = [np.zeros(n, dtype=np.float32) for _ in range(max(1, n_tracks))]
+    for c in accepted:
+        data, csr = audio.read_wav(Path(c.path))
+        if csr != sr:
+            tmp = Path(c.path).with_name(Path(c.path).stem + f"_{sr}.wav")
+            audio.to_wav(Path(c.path), tmp, sr=sr)
+            data, csr = audio.read_wav(tmp)
+        mono = data.mean(axis=1)
+        s = int(round(c.scheduled_start * sr))
+        e = min(n, s + len(mono))
+        tracks[c.track][s:e] += mono[:e - s]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stems = []
+    for i, tr in enumerate(tracks):
+        p = out_dir / f"dialogue_track_{i}.wav"
+        audio.write_wav(p, tr, sr)
+        stems.append(str(p))
+    bus = np.sum(tracks, axis=0)
+    peak = float(np.max(np.abs(bus))) if bus.size else 0.0
+    if peak > 0.98:
+        bus = bus * (0.98 / peak)
+    bus_path = out_dir / "dialogue_bus.wav"
+    audio.write_wav(bus_path, bus, sr)
+    return {"bus": str(bus_path), "stems": stems, "tracks": len(tracks),
+            "rendered_duration": round(n / sr, 3),
+            "beyond_media_end_s": round(max(0.0, end - duration), 3),
+            "pre_normalise_peak": round(peak, 4)}
+
+
+def separate_background(original: Path, work: Path, policy: str = "auto") -> Dict:
+    """Return {"status": ..., "background": path|None, "detail": ...}."""
+    if policy == "none":
+        return {"status": "disabled", "background": None, "detail": "policy=none"}
+    out = work / "background_estimate.wav"
+    try:
+        import demucs  # noqa: F401
+    except ImportError:
+        return {"status": "unavailable", "background": None,
+                "detail": "demucs not installed; output is Hindi dialogue only"}
+    try:
+        return _demucs_api(original, out)
+    except Exception as api_err:
+        try:
+            return _demucs_cli(original, out, work)
+        except Exception as cli_err:
+            return {"status": "failed", "background": None,
+                    "detail": f"demucs failed ({str(api_err)[:120]} / {str(cli_err)[:120]}); "
+                              f"output is Hindi dialogue only"}
+
+
+def _demucs_api(original: Path, out: Path) -> Dict:
+    import demucs.api
+    import torch
+    sep = demucs.api.Separator(model="htdemucs", overlap=0.25, segment=7, shifts=0,
+                               progress=False)
+    _, stems = sep.separate_audio_file(str(original))
+    bed = None
+    for name, wav in stems.items():
+        if name == "vocals":
+            continue
+        bed = wav if bed is None else bed + wav
+    if bed is None:
+        raise RuntimeError("no non-vocal stems")
+    demucs.api.save_audio(bed, str(out), samplerate=sep.samplerate)
+    del sep
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"status": "ok", "background": str(out),
+            "detail": "demucs.api htdemucs (overlap 0.25, segment 7s); sum of non-vocal stems"}
+
+
+def _demucs_cli(original: Path, out: Path, work: Path) -> Dict:
+    import demucs.separate
+    dst = work / "demucs_out"
+    demucs.separate.main(["--two-stems", "vocals", "-n", "htdemucs", "--overlap", "0.25",
+                          "-o", str(dst), str(original)])
+    nv = dst / "htdemucs" / original.stem / "no_vocals.wav"
+    if not nv.exists():
+        raise RuntimeError("no_vocals.wav not produced")
+    audio.to_wav(nv, out, channels=2)
+    shutil.rmtree(dst, ignore_errors=True)
+    return {"status": "ok", "background": str(out),
+            "detail": "demucs CLI --two-stems vocals (htdemucs, overlap 0.25)"}
+
+
+def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
+              duration: float, bg_gain: float = 0.8, target_lufs: float = -17.0) -> Dict:
+    """Duck background under dialogue, normalise loudness, limit peaks."""
+    pre = out.with_name("mix_pre_norm.wav")
+    dur = f"{duration:.3f}"
+    if background:
+        flt = (f"[0:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},asplit=2[dlg][sc];"
+               f"[1:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},volume={bg_gain}[bg];"
+               f"[bg][sc]sidechaincompress=threshold=0.05:ratio=6:attack=20:release=350[duck];"
+               f"[dlg][duck]amix=inputs=2:duration=first:normalize=0[m]")
+        audio.run_ffmpeg(["-i", str(dialogue_bus), "-i", str(background),
+                          "-filter_complex", flt, "-map", "[m]", "-ar", str(audio.SR),
+                          "-ac", "2", "-acodec", "pcm_s16le", str(pre)])
+    else:
+        audio.run_ffmpeg(["-i", str(dialogue_bus), "-af",
+                          f"aformat=channel_layouts=stereo,apad,atrim=0:{dur}",
+                          "-ar", str(audio.SR), "-ac", "2", "-acodec", "pcm_s16le", str(pre)])
+    info = audio.loudnorm_two_pass(pre, out, target_i=target_lufs)
+    pre.unlink(missing_ok=True)
+    st = audio.audio_stats(out)
+    info.update({"duration": round(st["duration"], 3), "peak": round(st["peak"], 4),
+                 "clip_fraction": st["clip_fraction"], "channels": st["channels"],
+                 "sample_rate": st["sample_rate"], "background": bool(background)})
+    return info
+
+
+def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
+        subtitles: Optional[Path] = None) -> Path:
+    args = ["-i", str(video), "-i", str(mix_wav)]
+    if subtitles:
+        args += ["-i", str(subtitles)]
+    args += ["-map", "0:v:0", "-map", "1:a:0"]
+    if subtitles:
+        args += ["-map", "2:s:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=hin"]
+    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", bitrate,
+             "-metadata:s:a:0", "language=hin", "-movflags", "+faststart", str(out)]
+    audio.run_ffmpeg(args)
+    return out
+
+
+# ── subtitles ─────────────────────────────────────────────────────────────
+def _ts(t: float, sep: str = ",") -> str:
+    ms = int(round(max(0.0, t) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02}:{m:02}:{s:02}{sep}{ms:03}"
+
+
+def wrap_lines(text: str, width: int = 42) -> str:
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    if len(lines) > 2:  # rebalance into two lines rather than dropping text
+        half = (len(words) + 1) // 2
+        lines = [" ".join(words[:half]), " ".join(words[half:])]
+    return "\n".join(lines)
+
+
+def subtitle_cues(turns: Dict[str, Turn], clips: Dict[str, Clip]) -> List[Dict]:
+    """Cues timed to the *scheduled* dub audio (what is actually heard)."""
+    cues = []
+    for tid, c in clips.items():
+        if not c.accepted:
+            continue
+        t = turns[tid]
+        cues.append({"start": c.scheduled_start, "end": c.scheduled_end,
+                     "text": wrap_lines(t.hi_display or t.speech_text), "turn_id": tid})
+    return sorted(cues, key=lambda x: x["start"])
+
+
+def write_srt(cues: Sequence[Dict], path: Path, key: str = "text"):
+    lines = []
+    for i, c in enumerate(cues, 1):
+        lines.append(f"{i}\n{_ts(c['start'])} --> {_ts(c['end'])}\n{c[key]}\n")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_vtt(cues: Sequence[Dict], path: Path, key: str = "text"):
+    lines = ["WEBVTT", ""]
+    for c in cues:
+        lines += [f"{_ts(c['start'], '.')} --> {_ts(c['end'], '.')}", c[key], ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def verify_subtitles(cues: Sequence[Dict], clips: Dict[str, Clip]) -> List[Dict]:
+    """Every cue must match the final scheduled audio of its turn."""
+    out = []
+    for c in cues:
+        clip = clips.get(c["turn_id"])
+        if clip is None or abs(clip.scheduled_start - c["start"]) > 0.01 \
+                or abs(clip.scheduled_end - c["end"]) > 0.01:
+            out.append({"turn_id": c["turn_id"], "problem": "subtitle_not_aligned_to_audio"})
+    return out

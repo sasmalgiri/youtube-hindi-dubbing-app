@@ -250,6 +250,11 @@ class Job:
     pause_event: threading.Event = field(default_factory=threading.Event)
     pipeline_ref: Optional[Any] = None  # Reference to Pipeline for step-by-step state
     worker_thread: Optional[Any] = None  # threading.Thread running this job — used by cancel
+    # Honest result status for the hindi_dialogue profile:
+    # completed | completed_with_warnings | draft_incomplete | failed | cancelled
+    result_status: Optional[str] = None
+    status_reasons: List[str] = field(default_factory=list)
+    report_path: Optional[str] = None    # report.md of a hindi_dialogue job
 
 
 class JobCreateRequest(BaseModel):
@@ -344,7 +349,14 @@ class JobCreateRequest(BaseModel):
     purge_on_new_url: bool = False     # When True: delete prior job's work_dir + caches when a different URL is submitted
     step_by_step: bool = False         # Pause after transcription & translation for review
     use_new_pipeline: bool = False     # Use new modular pipeline (experimental)
-    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "srtdub"
+    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "srtdub" | "hindi_dialogue"
+    # ── Hindi dialogue profile (pipeline_mode="hindi_dialogue") ──
+    # Speaker diarization always runs in this profile; multi_speaker is implied.
+    dialogue_tts_providers: str = "edge"            # priority list; paid providers only if listed
+    dialogue_translation_engines: str = "gemini,groq,cerebras"
+    dialogue_num_speakers: int = 0                  # 0 = detect automatically
+    dialogue_background: str = "auto"               # "auto" | "demucs" | "none"
+    dialogue_verify: str = "auto"                   # Hindi re-ASR content check: "auto" | "on" | "off"
     # ── SRT Direct mode options ──
     sd_srt_content: str = ""            # Full SRT content (cues verbatim) — required for srtdub mode
     sd_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown; freeze-pads if still short
@@ -779,6 +791,116 @@ def _translate_srt_content(
     return "\n".join(out_lines)
 
 
+def _apply_legacy_outcome(job: Job, pipeline) -> None:
+    """Surface legacy-pipeline gaps (missing segment audio, shortened retry
+    text, voice substitutions, separation failure) instead of a bare
+    "Complete"."""
+    warnings = list(getattr(pipeline, "result_warnings", None) or [])
+    status = getattr(pipeline, "result_status", "completed") if pipeline is not None else "completed"
+    if not warnings and status == "completed":
+        return
+    if status == "completed":
+        status = "completed_with_warnings"
+    job.result_status = status
+    job.status_reasons = warnings[:50]
+    label = "DRAFT (incomplete)" if status == "draft_incomplete" else "with warnings"
+    job.message = f"{job.message} — {label}: {warnings[0] if warnings else ''}"[:300]
+
+
+def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
+                       english_srt: Optional[Path] = None):
+    """pipeline_mode="hindi_dialogue": the shared speaker-aware dialogue path.
+
+    Runs inside the caller's pipeline semaphore. Never deletes partial assets:
+    a failed or draft job keeps its work folder and report for review.
+    """
+    from dubbing.dialogue.orchestrator import DialogueConfig, run_dialogue
+
+    job_dir = OUTPUTS / job.id
+    work_dir = job_dir / "work"
+    out_dir = job_dir / "dialogue_out"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Visible normalisation of options this profile handles differently.
+    notes = []
+    if getattr(req, "use_yt_translate", False):  # option removed on this branch
+        notes.append("YouTube auto-translated Hindi is not used (it cannot be attached to "
+                     "speaker turns); contextual translation is used instead")
+    if not req.multi_speaker:
+        notes.append("speaker diarization always runs in the Hindi dialogue profile")
+    if req.split_duration:
+        notes.append("split_duration ignored (dialogue profile processes the video in one pass)")
+    for n in notes:
+        print(f"[hindi_dialogue] {n}", flush=True)
+        job.events.append({"type": "note", "message": n})
+
+    source_srt = english_srt
+    transcript = (getattr(req, "transcript_srt_content", "") or "").strip()
+    if transcript and not translated_srt and not source_srt:
+        source_srt = work_dir / "transcript_upload_en.srt"
+        source_srt.write_text(transcript, encoding="utf-8")
+
+    cfg = DialogueConfig(
+        source=req.url, work_dir=work_dir, output_dir=out_dir,
+        source_srt=source_srt, translated_srt=translated_srt,
+        use_youtube_subs=False,  # YouTube-subs input was removed on this branch (092e758)
+        asr="groq" if (req.asr_model or "").startswith("groq") else "auto",
+        asr_model=req.asr_model if req.asr_model not in ("groq-whisper", "groq", "parakeet") else "large-v3",
+        num_speakers=req.dialogue_num_speakers or None,
+        tts_providers=[p.strip() for p in req.dialogue_tts_providers.split(",") if p.strip()] or ["edge"],
+        translation_engines=[e.strip() for e in req.dialogue_translation_engines.split(",") if e.strip()],
+        background=req.dialogue_background, content_verify=req.dialogue_verify,
+        audio_bitrate=req.audio_bitrate,
+        limit_seconds=float(req.dub_duration or 0) * 60.0,
+    )
+    res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
+                       cancel_check=job.cancel_event.is_set)
+
+    job.result_status = res.status
+    job.status_reasons = list(res.reasons)
+    job.report_path = str(res.report_md)
+    job.segments = [{"start": t.source_start, "end": t.source_end, "text": t.source_text,
+                     "text_translated": t.speech_text, "speaker_id": t.speaker_id,
+                     "turn_id": t.turn_id} for t in res.turns]
+    if not job.video_title:
+        job.video_title = (Path(req.url).stem if not re.match(r"^https?://", req.url or "")
+                           else req.url.rstrip("/").split("/")[-1].split("=")[-1]) or "Untitled"
+
+    # Save a titled copy of every deliverable (video, subtitles, report, stems)
+    title = _sanitize_filename(job.video_title)
+    folder = SAVED_DIR / f"{title} [HI Dialogue {res.status}] ({job.id})"
+    try:
+        shutil.copytree(out_dir, folder, dirs_exist_ok=True)
+        job.saved_folder = str(folder)
+        if res.output_video and res.output_video.exists():
+            job.saved_video = str(folder / res.output_video.name)
+    except Exception as e:
+        print(f"[hindi_dialogue] could not copy outputs to {folder}: {e}", flush=True)
+
+    if res.output_video and res.output_video.exists():
+        job.result_path = res.output_video
+    labels = {
+        "completed": "Complete",
+        "completed_with_warnings": "Complete with warnings — see report",
+        "draft_incomplete": "DRAFT (incomplete) — see report for missing/unresolved turns",
+        "cancelled": "Cancelled — partial assets kept",
+        "failed": "Failed — partial assets and report kept",
+    }
+    job.message = labels.get(res.status, res.status)
+    job.overall_progress = 1.0
+    if res.status in ("failed", "cancelled"):
+        job.state = "error"
+        job.error = "; ".join(res.reasons)[:500] or res.status
+        job.events.append({"type": "complete", "state": "error", "error": job.error,
+                           "result_status": res.status})
+    else:
+        job.state = "done"
+        job.events.append({"type": "complete", "state": "done", "result_status": res.status})
+        if job.source_url and res.status == "completed" and not job.chain_languages:
+            _mark_url_completed(job.source_url)
+    _store.save(job)
+
+
 def _run_job(job: Job, req: JobCreateRequest):
     """Run the dubbing pipeline in a background thread."""
     # ── Status helper: every line below sets a visible message AND persists ──
@@ -863,6 +985,24 @@ def _run_job(job: Job, req: JobCreateRequest):
 
         # Voice was auto-selected or user-chosen above. Use it as-is.
         voice = req.voice
+
+        # ── HINDI DIALOGUE PROFILE: one shared speaker-aware path ──
+        # Per-speaker voices come from the dialogue speaker registry, so the
+        # single-voice Edge lock above does not apply to this profile.
+        if getattr(req, "pipeline_mode", "classic") == "hindi_dialogue":
+            _setup_status("Hindi dialogue profile (speaker-aware)...", 0.40)
+            _run_dialogue_mode(job, req)
+            return
+
+        # Modes that cannot carry per-speaker voices: say so instead of
+        # silently producing a single-voice dub.
+        _mode_now = getattr(req, "pipeline_mode", "classic")
+        if req.multi_speaker and _mode_now in ("new", "oneflow", "wordchunk", "srtdub"):
+            _note = (f"multi_speaker is not supported in pipeline_mode={_mode_now}: output uses ONE "
+                     f"voice. Use pipeline_mode=hindi_dialogue for per-speaker voices.")
+            print(f"[Route] {_note}", flush=True)
+            job.events.append({"type": "note", "message": _note})
+            _setup_status(_note, 0.35)
 
         # ── SPLIT MODE: Split video into parts and dub each ──────────
         # SKIP split mode for pipelines that have their own single-pass
@@ -1224,23 +1364,37 @@ def _run_job(job: Job, req: JobCreateRequest):
             # Step 3: ASR (old shell — Whisper/YouTube subs, all options work)
             pipeline._run_transcription()
 
+            # Speakers come from the audio, whatever the text source was.
+            if req.multi_speaker:
+                _hy_audio = OUTPUTS / job.id / "work" / "audio_raw.wav"
+                _hy_genders, _hy_ranges = pipeline._diarize(_hy_audio)
+                if _hy_genders and _hy_ranges:
+                    pipeline._assign_speaker_to_segments(pipeline.segments, _hy_ranges)
+                    pipeline._voice_map = pipeline._assign_voices_to_speakers(_hy_genders)
+                else:
+                    pipeline.result_warnings.append(
+                        "multi_speaker requested but diarization was unavailable: one voice used")
+
             # ─── NEW CORE TAKES OVER ───
             # Convert old segments to Word objects
             words = []
             for seg in pipeline.segments:
+                # Carry the segment's speaker on every word so DP cues never
+                # cross a speaker change and TTS can use the speaker's voice.
+                _w_spk = seg.get("speaker_id")
                 if seg.get("words"):
                     for w in seg["words"]:
                         words.append(Word(
                             text=w.get("word", w.get("text", "")),
                             start=w.get("start", 0), end=w.get("end", 0),
-                            source="whisper",
+                            speaker=_w_spk, source="whisper",
                         ))
                 else:
                     for word_text in seg.get("text", "").split():
                         words.append(Word(
                             text=word_text,
                             start=seg.get("start", 0), end=seg.get("end", 0),
-                            source="whisper",
+                            speaker=_w_spk, source="whisper",
                         ))
             words = normalize_words(words)
 
@@ -1411,6 +1565,7 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.state = "done"
         qa_msg = f" (QA: {job.qa_score:.0%})" if job.qa_score is not None else ""
         job.message = f"Complete{qa_msg}"
+        _apply_legacy_outcome(job, pipeline if pipeline_mode not in ("oneflow", "wordchunk", "srtdub") else None)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 
@@ -1630,6 +1785,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, p)
         job.events.append({"type": "complete", "state": "done"})
         try:
             _save_to_titled_folder(job)
@@ -2488,6 +2644,15 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
         job.message = "Starting (SRT provided, skipping transcription)..."
         _store.save(job)
 
+        if getattr(req, "pipeline_mode", "classic") == "hindi_dialogue":
+            # Hindi SRT supplied: translation is skipped, but speakers still come
+            # from audio diarization of the original video.
+            if getattr(req, "srt_needs_translation", False):
+                _run_dialogue_mode(job, req, english_srt=srt_path)
+            else:
+                _run_dialogue_mode(job, req, translated_srt=srt_path)
+            return
+
         job_dir = OUTPUTS / job.id
         work_dir = job_dir / "work"
         out_path = job_dir / "dubbed.mp4"
@@ -2626,6 +2791,7 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, pipeline)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 
@@ -2990,6 +3156,9 @@ def get_job(job_id: str):
         "avg_words_per_sent": job.avg_words_per_sent,
         "max_seg_words":      job.max_seg_words,
         "max_sent_words":     job.max_sent_words,
+        "result_status":      job.result_status,
+        "status_reasons":     job.status_reasons,
+        "report_path":        job.report_path,
     }
 
 
@@ -3247,6 +3416,22 @@ def get_source_srt(job_id: str):
     )
 
 
+@app.get("/api/jobs/{job_id}/report")
+def get_dialogue_report(job_id: str, fmt: str = "md"):
+    """Quality/coverage report of a hindi_dialogue job (fmt=md|json)."""
+    job = JOBS.get(job_id)
+    if not job or not job.report_path:
+        raise HTTPException(status_code=404, detail="No dialogue report for this job")
+    md = Path(job.report_path)
+    path = md if fmt == "md" else md.with_name("report.json")
+    if not path.exists() and job.saved_folder:
+        path = Path(job.saved_folder) / path.name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file missing")
+    media = "text/markdown; charset=utf-8" if fmt == "md" else "application/json"
+    return FileResponse(path=str(path), media_type=media, filename=path.name)
+
+
 @app.get("/api/jobs/{job_id}/qa")
 def get_qa_report(job_id: str):
     """Get the QA report for a job."""
@@ -3387,6 +3572,7 @@ def _run_resume(job: Job):
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, pipeline)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 

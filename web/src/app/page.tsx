@@ -282,7 +282,7 @@ export default function HomePage() {
                     targetLanguage={targetLanguage}
                 />
 
-                {/* Pipeline Switcher — 6 modes (hidden in SRT mode — only Classic applies) */}
+                {/* Pipeline Switcher — 7 modes (hidden in SRT mode — only Classic applies) */}
                 {settings._input_mode !== 'srt' && (
                     <div className="flex flex-col gap-2 px-1">
                         <div className="flex flex-wrap gap-1 rounded-xl border border-border p-1">
@@ -292,6 +292,7 @@ export default function HomePage() {
                                 { mode: 'new', label: 'New (DP)', color: 'bg-green-500' },
                                 { mode: 'oneflow', label: 'OneFlow', color: 'bg-red-500' },
                                 { mode: 'srtdub', label: 'SRT Direct', color: 'bg-teal-500' },
+                                { mode: 'hindi_dialogue', label: 'Hindi Dialogue', color: 'bg-pink-500' },
                             ].map(({ mode, label, color }) => (
                                 <button
                                     key={mode}
@@ -313,6 +314,7 @@ export default function HomePage() {
                                 new: 'Parakeet + WhisperX + DP cues + glossary (experimental)',
                                 oneflow: 'Groq Whisper → Google Translate → Edge-TTS → 1.15x (FASTEST)',
                                 srtdub: 'Your Hindi SRT → TTS each cue verbatim → 0-gap concat → stretch 1-10× + freeze-pad (audio never trimmed)',
+                                hindi_dialogue: 'Speaker-aware: diarization → per-speaker Hindi voices → contextual translation → original video speed + honest report (recommended for conversations)',
                             }) as Record<string, string>)[settings.pipeline_mode || 'classic']}
                         </span>
                     </div>
