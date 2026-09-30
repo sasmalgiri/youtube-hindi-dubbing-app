@@ -978,6 +978,10 @@ class Pipeline:
         self.video_title: str = ""
         self.qa_score: Optional[float] = None
         self._voice_map = None
+        # Honest-outcome bookkeeping surfaced to the job (app.py):
+        #   missing segment audio, shortened retry text, failed separation, ...
+        self.result_warnings: List[str] = []
+        self.result_status: str = "completed"
         self._whisper_audio = None  # Lightweight 16kHz mono audio for transcription
         self._has_nvenc: Optional[bool] = None  # Cached NVENC availability
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
@@ -1649,7 +1653,29 @@ class Pipeline:
                     best_overlap = overlap
                     best_speaker = speaker
 
-            seg["speaker_id"] = best_speaker or "SPEAKER_00"
+            if best_speaker:
+                seg["speaker_id"] = best_speaker
+            else:
+                # No diarized speech overlaps this segment: keep it explicitly
+                # unknown (default voice) instead of attributing it to SPEAKER_00.
+                seg.pop("speaker_id", None)
+                seg["_speaker_unknown"] = True
+
+    def _voice_for_segment(self, seg: Dict) -> str:
+        """The Edge voice for a segment: its speaker's mapped voice when a
+        voice map exists, otherwise the configured voice. Every synthesis and
+        retry path must use this so a speaker never changes voice."""
+        if self._voice_map and seg.get("speaker_id") in self._voice_map:
+            return self._voice_map[seg["speaker_id"]]
+        return self.cfg.tts_voice
+
+    def _sarvam_speaker_for_voice(self, edge_voice: str) -> str:
+        """Register-matched Sarvam bulbul:v3 fallback speaker for an Edge voice.
+        Only speakers whose register Sarvam documents are used
+        (shubh = male, ishita = female)."""
+        female = set(VOICE_POOL.get(self.cfg.target_language, {}).get("female", [])) | {
+            DEFAULT_VOICES.get(self.cfg.target_language, "")}
+        return "ishita" if edge_voice in female else "shubh"
 
     def _assign_voices_to_speakers(self, speaker_genders: Dict[str, str]) -> Dict[str, str]:
         """Map each speaker to a distinct Edge-TTS voice from VOICE_POOL."""
@@ -1935,6 +1961,19 @@ class Pipeline:
             self._voice_map = None
             self._keyterms = {}
 
+            # Subtitle TEXT is used, but speakers must still come from the
+            # AUDIO: a text source never bypasses speaker analysis.
+            if self.cfg.multi_speaker:
+                speaker_genders, speaker_ranges = self._diarize(audio_raw)
+                if speaker_genders and speaker_ranges:
+                    self._assign_speaker_to_segments(text_segments, speaker_ranges)
+                    self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                    self._report("transcribe", 0.79,
+                                 f"YouTube subs + audio diarization: {len(self._voice_map)} speakers")
+                else:
+                    self.result_warnings.append(
+                        "multi_speaker requested but diarization was unavailable: one voice used")
+
             # ── CRITICAL: merge YouTube SRT fragments into complete sentences ──
             # YouTube's raw SRT has ~192 tiny 2-4 second chunks split mid-sentence
             # (e.g., "also a white tiger, but he came out as a"). Without merging,
@@ -1985,7 +2024,11 @@ class Pipeline:
                 avg_dur = sum(
                     s.get("end", 0) - s.get("start", 0) for s in text_segments
                 ) / len(text_segments)
-                if avg_dur > 8.0:
+                if avg_dur > 8.0 and self._voice_map:
+                    # word-count re-splitting pools text across speakers
+                    self.result_warnings.append(
+                        "captions lack punctuation; kept sentence grouping to preserve speakers")
+                elif avg_dur > 8.0:
                     _seg_mode = "wordcount"
                     self._report("transcribe", 0.91,
                                  f"No punctuation detected (avg seg {avg_dur:.1f}s) "
@@ -2006,6 +2049,13 @@ class Pipeline:
                 max_per_cue = getattr(self.cfg, 'max_sentences_per_cue', 2)
                 text_segments = self._group_sentences_by_count(
                     text_segments, target_per_group=max_per_cue)
+            elif self._voice_map:
+                # Word-count re-splitting joins all text and would drop speaker
+                # boundaries; with multiple speakers keep sentence grouping.
+                self.result_warnings.append(
+                    "yt_segment_mode=wordcount ignored: incompatible with per-speaker voices")
+                text_segments = self._group_sentences_by_count(
+                    text_segments, target_per_group=getattr(self.cfg, 'max_sentences_per_cue', 2))
             else:
                 # ── WORD COUNT SPLIT: ~20 words per segment (uniform) ──
                 # Join all text, split into even segments by word count.
@@ -2756,17 +2806,12 @@ class Pipeline:
                 self._report("translate", 0.8,
                              f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
             else:
-                # No audio for gender detection — alternate male/female
-                self._voice_map = {}
-                lang = self.cfg.target_language
-                pool = VOICE_POOL.get(lang, {})
-                female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
-                male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
-                for i, spk in enumerate(sorted(speakers_found)):
-                    if i % 2 == 0:
-                        self._voice_map[spk] = female_voices[i // 2 % len(female_voices)]
-                    else:
-                        self._voice_map[spk] = male_voices[i // 2 % len(male_voices)]
+                # No audio to judge voices: do NOT invent a male/female
+                # alternation. Every speaker keeps the configured voice.
+                self._voice_map = {spk: self.cfg.tts_voice for spk in speakers_found}
+                self.result_warnings.append(
+                    f"{len(speakers_found)} SRT speakers but no original audio to classify "
+                    f"voices: all use {self.cfg.tts_voice}")
         else:
             self._voice_map = None
 
@@ -4096,6 +4141,11 @@ class Pipeline:
                     i += 1
                     continue
 
+                # Never merge across a known speaker change: the merged
+                # segment would be voiced entirely by the first speaker.
+                if self._different_speakers(current, next_seg):
+                    break
+
                 # Check gap between segments
                 gap = next_seg.get("start", 0) - current.get("end", 0)
                 if gap > MAX_GAP:
@@ -4114,7 +4164,10 @@ class Pipeline:
                     cur_tr = current.get("text_translated", "").strip()
                     nxt_tr = next_seg.get("text_translated", "").strip()
                     current["text_translated"] = (cur_tr + " " + nxt_tr).strip()
-                # Preserve speaker from first segment
+                # Same (or unknown) speaker on both sides. Adopt the first known
+                # label so a later, different speaker is still recognised.
+                if not current.get("speaker_id") and next_seg.get("speaker_id"):
+                    current["speaker_id"] = next_seg["speaker_id"]
                 text = current["text"].strip()
                 i += 1
 
@@ -4127,8 +4180,20 @@ class Pipeline:
 
         return merged
 
+    @staticmethod
+    def _different_speakers(a: Dict, b: Dict) -> bool:
+        """True only when BOTH segments carry a speaker label and they differ."""
+        sa, sb = a.get("speaker_id"), b.get("speaker_id")
+        return bool(sa) and bool(sb) and sa != sb
+
     def _combine_sentence_group(self, group: List[Dict]) -> Dict:
-        """Combine a list of sentences into a single segment dict."""
+        """Combine a list of sentences into a single segment dict.
+
+        Callers must pass single-speaker groups (see _group_sentences_by_count).
+        """
+        speakers = {g.get("speaker_id") for g in group if g.get("speaker_id")}
+        if len(speakers) > 1:
+            raise ValueError(f"refusing to combine sentences of different speakers: {sorted(speakers)}")
         combined_text = " ".join(
             s.get("text", "").strip() for s in group if s.get("text", "").strip()
         )
@@ -4173,6 +4238,23 @@ class Pipeline:
         """
         if not sentences:
             return []
+        # Speaker boundaries are hard boundaries: group each same-speaker run
+        # separately so no group mixes two speakers.
+        runs: List[List[Dict]] = []
+        run_speaker: List[Optional[str]] = []
+        for snt in sentences:
+            spk = snt.get("speaker_id")
+            if runs and (not spk or not run_speaker[-1] or spk == run_speaker[-1]):
+                runs[-1].append(snt)
+                run_speaker[-1] = run_speaker[-1] or spk
+            else:
+                runs.append([snt])
+                run_speaker.append(spk)
+        if len(runs) > 1:
+            out: List[Dict] = []
+            for run in runs:
+                out.extend(self._group_sentences_by_count(run, target_per_group, word_tolerance))
+            return out
         if len(sentences) <= target_per_group:
             return [self._combine_sentence_group(sentences)]
 
@@ -10501,7 +10583,7 @@ class Pipeline:
         except Exception:
             pass
 
-    def _sarvam_tts_single_mp3(self, text: str, mp3_path) -> bool:
+    def _sarvam_tts_single_mp3(self, text: str, mp3_path, speaker: str = "shubh") -> bool:
         """Synthesize a single segment via Sarvam Bulbul v3 → MP3.
 
         Returns True if the file was written successfully, False otherwise.
@@ -10544,7 +10626,7 @@ class Pipeline:
                     json={
                         "text": text,
                         "target_language_code": lang_code,
-                        "speaker": "shubh",
+                        "speaker": speaker,
                         "model": "bulbul:v3",
                         "pace": 1.0,
                         "temperature": 0.6,
@@ -11051,7 +11133,9 @@ class Pipeline:
                 if not raw_text:
                     return None
                 text = self._prepare_tts_text(raw_text)
-                voice = self.cfg.tts_voice  # still Madhur — consistent voice
+                # Retries must keep the segment's OWN speaker voice (the same
+                # lookup _tts_edge uses), never the global default voice.
+                voice = self._voice_for_segment(seg)
                 rate = self.cfg.tts_rate
                 retry_dir = self.cfg.work_dir / "tts_word_verify_retry"
                 retry_dir.mkdir(exist_ok=True)
@@ -12487,8 +12571,11 @@ class Pipeline:
 
                 # ── Sarvam Bulbul v3 fallback (no more Edge retries) ──
                 if _sarvam_fallback_available:
-                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3)
+                    _fb_spk = self._sarvam_speaker_for_voice(seg_voice)
+                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3, speaker=_fb_spk)
                     if sarvam_ok:
+                        self.result_warnings.append(
+                            f"segment {i} voiced by Sarvam '{_fb_spk}' instead of {seg_voice} (Edge failed)")
                         _sarvam_fallback_count[0] += 1
                         if _sarvam_fallback_count[0] <= 10:
                             print(f"[TTS-SARVAM] Seg {i}: Sarvam Bulbul fallback succeeded",
@@ -12612,9 +12699,13 @@ class Pipeline:
 
                 rescued = False
                 if _sarvam_fallback_available:
-                    rescued = self._sarvam_tts_single_mp3(text, mp3)
+                    _seg_voice = self._voice_for_segment(seg)
+                    _fb_spk = self._sarvam_speaker_for_voice(_seg_voice)
+                    rescued = self._sarvam_tts_single_mp3(text, mp3, speaker=_fb_spk)
                     if rescued:
                         sarvam_rescued += 1
+                        self.result_warnings.append(
+                            f"segment {i} voiced by Sarvam '{_fb_spk}' instead of {_seg_voice} (Edge failed)")
 
                 if rescued:
                     seg["_tts_mp3"] = mp3
@@ -12718,6 +12809,12 @@ class Pipeline:
                 retry_qc = self._rerender_edge_segment(tts_text, seg_voice, wav, expected_dur)
                 rerender_count = retry_qc.get("attempt", 0) + 1
                 manual_review = retry_qc.get("manual_review", False)
+                _used = (retry_qc.get("text_used") or tts_text).strip()
+                if _used != tts_text.strip():
+                    # Retry text was simplified/shortened: record it, never silently.
+                    self.result_warnings.append(
+                        f"segment {i} @ {seg.get('start', 0):.1f}s spoken with SHORTENED text after "
+                        f"QC retries ({len(_used.split())}/{len(tts_text.split())} words)")
 
                 if manual_review:
                     print(f"[QC] Seg {i} -> MANUAL REVIEW after {rerender_count} rerenders", flush=True)
@@ -13133,10 +13230,13 @@ class Pipeline:
         return adjusted
 
     # ── Audio mixing ─────────────────────────────────────────────────────
-    def _separate_background(self, audio_raw: Path) -> Path:
+    def _separate_background(self, audio_raw: Path) -> Optional[Path]:
         """Use demucs to extract instrumental/background track (no vocals).
         For long audio (>10min), splits into chunks to avoid GPU OOM.
-        Returns path to the no-vocals audio file, or audio_raw as fallback."""
+
+        Returns the no-vocals track, or None if separation is unavailable or
+        failed for ANY chunk. The original (English-dialogue) audio is never
+        returned as a stand-in for "background"."""
         bg_path = self.cfg.work_dir / "background_music.wav"
         if bg_path.exists():
             return bg_path
@@ -13150,7 +13250,10 @@ class Pipeline:
 
             if total_duration <= CHUNK_SECS:
                 # Short audio — process in one shot
-                return self._demucs_single(audio_raw, bg_path)
+                bg = self._demucs_single(audio_raw, bg_path)
+                if bg is None:
+                    raise RuntimeError("demucs produced no background track")
+                return bg
 
             # Long audio — split, process chunks, concatenate
             print(f"[DEMUCS] Audio is {total_duration/60:.0f}min, splitting into {CHUNK_MINS}min chunks...", flush=True)
@@ -13178,22 +13281,17 @@ class Pipeline:
                 if result == chunk_bg and chunk_bg.exists():
                     chunk_bg_paths.append(chunk_bg)
                 else:
-                    # Demucs failed for this chunk — use original audio chunk as fallback
-                    fallback = self.cfg.work_dir / f"demucs_fallback_{ci:03d}.wav"
-                    self._run_proc(
-                        [self._ffmpeg, "-y", "-i", str(audio_raw),
-                         "-ss", str(start), "-t", str(CHUNK_SECS),
-                         "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                         "-acodec", "pcm_s16le", str(fallback)],
-                        check=True, capture_output=True,
-                    )
-                    chunk_bg_paths.append(fallback)
+                    # A failed chunk would put raw English dialogue into the
+                    # "background" bed. Abort separation instead.
+                    for p in chunk_bg_paths:
+                        p.unlink(missing_ok=True)
+                    raise RuntimeError(f"demucs failed on chunk {ci + 1}/{num_chunks}")
 
                 print(f"[DEMUCS] Chunk {ci+1}/{num_chunks} done", flush=True)
 
             # Concatenate all chunk backgrounds
             if not chunk_bg_paths:
-                return audio_raw
+                return None
             concat_list = self.cfg.work_dir / "demucs_concat.txt"
             concat_list.write_text(
                 "\n".join(f"file '{str(p).replace(chr(92), '/')}'" for p in chunk_bg_paths),
@@ -13216,12 +13314,14 @@ class Pipeline:
             return bg_path
 
         except ImportError:
-            print("[DEMUCS] demucs not installed, falling back to raw audio", flush=True)
+            msg = "demucs not installed: no background bed (original audio NOT used as background)"
         except Exception as e:
-            print(f"[DEMUCS] Separation failed: {e}, falling back to raw audio", flush=True)
-        return audio_raw
+            msg = f"background separation failed ({e}): no background bed (original audio NOT used)"
+        print(f"[DEMUCS] {msg}", flush=True)
+        self.result_warnings.append(msg)
+        return None
 
-    def _demucs_single(self, audio_path: Path, output_path: Path) -> Path:
+    def _demucs_single(self, audio_path: Path, output_path: Path) -> Optional[Path]:
         """Run demucs on a single audio file and return the no-vocals track."""
         try:
             import demucs.separate
@@ -13247,11 +13347,15 @@ class Pipeline:
             print(f"[DEMUCS] no_vocals.wav not found for {audio_path.name}", flush=True)
         except Exception as e:
             print(f"[DEMUCS] Failed on {audio_path.name}: {e}", flush=True)
-        return audio_path
+        return None  # caller treats None as "separation failed"
 
     def _mix_audio(self, original: Path, tts: Path, original_vol: float) -> Path:
-        # Use background-only track (no vocals) instead of full original
+        # Use background-only track (no vocals) instead of full original.
+        # If separation failed, output the dub alone rather than mixing the
+        # English dialogue back in under the label "background".
         bg_track = self._separate_background(original)
+        if bg_track is None:
+            return tts
         mixed = self.cfg.work_dir / "audio_mixed.wav"
         self._run_proc(
             [
@@ -14196,44 +14300,47 @@ class Pipeline:
         return segment_map
 
     def _verify_tts_completeness(self, tts_data, text_segments):
-        """Verify ALL non-empty segments have audio before proceeding to assembly.
+        """Verify every non-empty segment has audio, by segment identity.
 
-        Logs a clear warning for any segments that are missing. Does NOT block
-        assembly (to avoid losing a 90% complete job), but provides visibility
-        into exactly which segments are missing and why.
+        Coverage is counted per unique segment (``_seg_idx``, with a start-time
+        fallback), so duplicate audio for one segment can never hide a missing
+        segment. Assembly still proceeds so expensive work is not lost, but a
+        gap marks the result as ``draft_incomplete`` (``self.result_status``)
+        and every missing segment is listed in ``self.result_warnings``.
 
         Returns the count of missing segments.
         """
-        # Count non-empty input segments
         non_empty = [i for i, seg in enumerate(text_segments)
                      if seg.get("text_translated", seg.get("text", "")).strip()]
-        produced = len(tts_data)
-        missing_count = len(non_empty) - produced
+        produced_idxs = {t.get("_seg_idx") for t in tts_data
+                         if "_seg_idx" in t and t.get("wav") and Path(t["wav"]).exists()}
+        produced_starts = {round(t.get("start", -1), 2) for t in tts_data
+                           if "_seg_idx" not in t and t.get("wav")}
+        missing_details = []
+        for i in non_empty:
+            seg = text_segments[i]
+            seg_idx = seg.get("_seg_idx", i)
+            if seg_idx in produced_idxs or round(seg.get("start", 0), 2) in produced_starts:
+                continue
+            text_preview = seg.get("text_translated", seg.get("text", ""))[:60]
+            missing_details.append(f"segment {i} @ {seg.get('start', 0):.1f}s: {text_preview!r}")
 
-        if missing_count > 0:
-            # Find which segment indices are missing
-            produced_starts = {round(t.get("start", -1), 2) for t in tts_data}
-            produced_idxs = {t.get("_seg_idx") for t in tts_data if "_seg_idx" in t}
-            missing_details = []
-            for i in non_empty:
-                seg = text_segments[i]
-                seg_start = round(seg.get("start", 0), 2)
-                seg_idx = seg.get("_seg_idx", i)
-                if seg_idx not in produced_idxs and seg_start not in produced_starts:
-                    text_preview = seg.get("text_translated", seg.get("text", ""))[:60]
-                    missing_details.append(f"  Seg {i} @ {seg.get('start', 0):.1f}s: {text_preview!r}")
-            if missing_details:
-                print(f"[TTS-COMPLETE] WARNING: {len(missing_details)} segments "
-                      f"missing audio out of {len(non_empty)} non-empty:", flush=True)
-                for detail in missing_details[:20]:  # cap log output
-                    print(detail, flush=True)
-                if len(missing_details) > 20:
-                    print(f"  ... and {len(missing_details) - 20} more", flush=True)
+        if missing_details:
+            print(f"[TTS-COMPLETE] WARNING: {len(missing_details)} segments "
+                  f"missing audio out of {len(non_empty)} non-empty:", flush=True)
+            for detail in missing_details[:20]:  # cap log output
+                print("  " + detail, flush=True)
+            if len(missing_details) > 20:
+                print(f"  ... and {len(missing_details) - 20} more", flush=True)
+            self.result_status = "draft_incomplete"
+            self.result_warnings.append(
+                f"{len(missing_details)} of {len(non_empty)} segments have NO dubbed audio")
+            self.result_warnings.extend("missing " + d for d in missing_details[:50])
         else:
-            print(f"[TTS-COMPLETE] All {produced}/{len(non_empty)} non-empty "
+            print(f"[TTS-COMPLETE] All {len(non_empty)} non-empty "
                   f"segments have audio — ready for assembly", flush=True)
 
-        return max(0, missing_count)
+        return len(missing_details)
 
     # ── Librosa Deep QC (process-isolated, thread-safe) ─────────────────
     @staticmethod
