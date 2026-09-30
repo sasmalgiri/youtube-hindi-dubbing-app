@@ -321,6 +321,11 @@ class JobCreateRequest(BaseModel):
     long_segment_threshold_words: int = 15
     # No time pressure on TTS: TTS gets every word, post-processing handles slots.
     tts_no_time_pressure: bool = True
+    # Tempo Match (per-segment): dubbed speech is fitted into each original
+    # time slot; video is never slowed; output length == source length.
+    tempo_match: bool = False
+    tempo_max_speedup: float = 1.5
+    tempo_gap_borrow_ms: int = 500
     # Dynamic worker scaling — adapts to Edge-TTS rate limits between batches.
     tts_dynamic_workers: bool = True
     tts_dynamic_min: int = 10
@@ -929,6 +934,9 @@ def _run_job(job: Job, req: JobCreateRequest):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -1576,6 +1584,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -1712,6 +1723,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -1843,6 +1857,9 @@ def _queue_chain_next(parent_job: Job):
         use_whisperx=getattr(_orig, 'use_whisperx', False) if _orig else False,
         simplify_english=getattr(_orig, 'simplify_english', False) if _orig else False,
         tts_no_time_pressure=getattr(_orig, 'tts_no_time_pressure', True) if _orig else True,
+        tempo_match=getattr(_orig, 'tempo_match', False) if _orig else False,
+        tempo_max_speedup=getattr(_orig, 'tempo_max_speedup', 1.5) if _orig else 1.5,
+        tempo_gap_borrow_ms=getattr(_orig, 'tempo_gap_borrow_ms', 500) if _orig else 500,
         tts_rate_mode=getattr(_orig, 'tts_rate_mode', 'auto') if _orig else 'auto',
         tts_rate_ceiling=getattr(_orig, 'tts_rate_ceiling', '+25%') if _orig else '+25%',
         tts_rate_target_wpm=getattr(_orig, 'tts_rate_target_wpm', 130) if _orig else 130,
@@ -2515,6 +2532,9 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -2887,6 +2907,9 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "tts_word_match_verify": getattr(req, "tts_word_match_verify", True),
         "long_segment_trace": getattr(req, "long_segment_trace", True),
         "tts_no_time_pressure": getattr(req, "tts_no_time_pressure", True),
+        "tempo_match": getattr(req, "tempo_match", False),
+        "tempo_max_speedup": getattr(req, "tempo_max_speedup", 1.5),
+        "tempo_gap_borrow_ms": getattr(req, "tempo_gap_borrow_ms", 500),
         "tts_dynamic_workers": getattr(req, "tts_dynamic_workers", True),
         "purge_on_new_url": getattr(req, "purge_on_new_url", False),
         "step_by_step": getattr(req, "step_by_step", False),
@@ -3290,6 +3313,9 @@ def _run_resume(job: Job):
             use_whisperx=req.use_whisperx if req else False,
             simplify_english=req.simplify_english if req else True,
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True) if req else True,
+            tempo_match=getattr(req, 'tempo_match', False) if req else False,
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5) if req else 1.5,
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500) if req else 500,
             tts_rate_mode=getattr(req, 'tts_rate_mode', 'auto') if req else 'auto',
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%') if req else '+25%',
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130) if req else 130,

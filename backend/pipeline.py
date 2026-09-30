@@ -907,6 +907,16 @@ class PipelineConfig:
     # The slot timing is then handled ENTIRELY in assembly via the
     # _assemble_video_adapts_to_audio path (which is the audio_priority path).
     tts_no_time_pressure: bool = True
+    # ── Tempo Match (per-segment) ──
+    # Match the ORIGINAL speaker's tempo segment by segment: dubbed speech is
+    # fitted INTO each original Whisper time slot (per-segment Edge-TTS rate
+    # re-synthesis + one pitch-preserving atempo fine-fit), the video is NEVER
+    # slowed, and output duration == source duration by construction (anchored
+    # assembly). When enabled it supersedes tts_no_time_pressure, the auto
+    # global rate, and the video-stretch assembly path.
+    tempo_match: bool = False
+    tempo_max_speedup: float = 1.5       # total speech speedup ceiling (engine rate x atempo)
+    tempo_gap_borrow_ms: int = 500       # max trailing-silence borrow per segment (ms)
     # Dynamic worker scaling for Edge-TTS — adjusts concurrency based on
     # observed failure rate. Starts at tts_dynamic_min, grows to tts_dynamic_max
     # when no failures, halves on rate-limit / WebSocket errors.
@@ -2103,7 +2113,11 @@ class Pipeline:
 
         # Audio-priority: video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.05, "Building per-segment video (NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -2218,6 +2232,10 @@ class Pipeline:
 
         total_tts = sum(t.get("duration", 0) for t in tts_data)
         total_slots = sum(max(0, t.get("end", 0) - t.get("start", 0)) for t in tts_data)
+        # Tempo Match: the per-segment fit ladder supersedes this global
+        # stretch (which uses rubberband and computed — not measured — durations).
+        if getattr(self.cfg, "tempo_match", False):
+            total_slots = 0
         if total_slots > 0 and total_tts > 0:
             ratio = total_tts / total_slots
             speed = min(max(ratio, 1.0), 1.25) if ratio > 0.95 else 1.0
@@ -2248,7 +2266,11 @@ class Pipeline:
 
         # Step 6: Assembly — audio-priority, video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.1, "Assembling (per-segment NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -2355,6 +2377,12 @@ class Pipeline:
 
         srt_path = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
         write_srt(text_segments, srt_path, text_key="text_translated")
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: snapshot _orig_gap + clamp cue overlaps so the fit
+            # ladder can borrow trailing silence (matches the other run modes;
+            # SRT above was already written on the raw cue times).
+            text_segments = self._close_segment_gaps(text_segments)
+            self.segments = text_segments
         self._report("synthesize", 0.0, f"Generating speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
         # Sync text_segments with the split segments from _generate_tts_natural
@@ -2390,7 +2418,11 @@ class Pipeline:
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)
         self._report("assemble", 0.1, "Assembling (per-segment NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
         if srt_path.exists():
             shutil.copy2(srt_path, out_srt)
@@ -2558,7 +2590,11 @@ class Pipeline:
 
         # Audio-priority: video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.05, "Building per-segment video (NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -3870,7 +3906,7 @@ class Pipeline:
 
         result: List[Dict] = []
 
-        for seg in segments:
+        for pi, seg in enumerate(segments):
             hindi = seg.get("text_translated", "").split()
             english = seg.get("text", "").split()
             seg_start = seg.get("start", 0)
@@ -3914,6 +3950,18 @@ class Pipeline:
                     if key not in ("start", "end", "text", "text_translated"):
                         chunk_seg.setdefault(key, seg[key])
 
+                # Tempo Match: chunk start/end are SYNTHETIC (proportional).
+                # Stamp the REAL parent anchors so the fit ladder groups all
+                # chunks back to the original Whisper slot. The "c{pi}" string
+                # key cannot collide with the integer keys stamped later by
+                # _split_segments_at_sentences (different list, different ids).
+                chunk_seg["_parent_idx"] = f"c{pi}"
+                chunk_seg["_parent_start"] = seg_start
+                chunk_seg["_parent_end"] = seg_end
+                # The parent's trailing silence follows only the LAST chunk.
+                if ci + chunk_words < hindi_total:
+                    chunk_seg["_orig_gap"] = 0.0
+
                 result.append(chunk_seg)
                 cursor_time += chunk_dur
 
@@ -3945,6 +3993,11 @@ class Pipeline:
         total_overlap = 0.0
         for i in range(len(segments) - 1):
             gap = segments[i + 1].get("start", 0) - segments[i].get("end", 0)
+            # Tempo Match: remember the REAL trailing silence before it is
+            # folded into the slot — the fit ladder borrows from this snapshot
+            # (only the first gap-close call sees the true gap).
+            if "_orig_gap" not in segments[i]:
+                segments[i]["_orig_gap"] = max(0.0, gap)
             if gap > 0.01:
                 # Gap: extend current segment's end to meet next start
                 total_gap += gap
@@ -4992,6 +5045,15 @@ class Pipeline:
 
         Only extends — never shrinks (shorter translation keeps original timing).
         """
+        # Tempo Match: slots must stay the ORIGINAL Whisper timing (they are
+        # the original speaker's tempo container). The per-segment fit ladder
+        # handles long translations; extending slots here would shift capacity
+        # between neighbours and distort every fit ratio.
+        if getattr(self.cfg, "tempo_match", False):
+            print("[Timeline] tempo_match ON — keeping original Whisper slots "
+                  "(WPM extension skipped)", flush=True)
+            return
+
         # Ensure sorted by start time before clamping to next segment
         segments.sort(key=lambda s: s.get("start", 0))
 
@@ -6887,6 +6949,17 @@ class Pipeline:
     SPEED_MIN = 1.0 / 1.1    # 0.909 — slowest we allow (1.1x slower than natural)
     SPEED_MAX = 1.25          # fastest we allow (1.25x faster than natural)
 
+    # ── Tempo Match constants (per-segment fit ladder) ──
+    # Research band: ±10-15% speech-rate change is imperceptible; a single
+    # atempo pass on clean TTS speech stays natural up to ~1.25x.
+    TEMPO_ATEMPO_MAX = 1.25        # max single atempo fine-fit ratio
+    TEMPO_MIN_SLOT_SEC = 0.4       # slots shorter than this skip the ladder
+    TEMPO_MIN_RESIDUAL_PAUSE = 0.15  # seconds of borrowed gap always left intact
+    TEMPO_EDGE_RATE_MAX = 100      # Edge-TTS silently clamps rates above +100%
+    TEMPO_TAIL_SHAVE = 0.03        # fit-target shave: atempo slop lands in padding, not speech
+    TEMPO_STUB_SEC = 0.05          # audio shorter than this = failed TTS stub
+    TEMPO_INTER_PAUSE = 0.15       # pause between sentence-children inside a parent slot
+
     # Spec-aligned duration fitting thresholds (per production-grade dubbing spec)
     FIT_PASS_MS = 80          # ≤80ms error → accept as-is (no stretch)
     FIT_STRETCH_MS = 150      # ≤150ms → fine stretch within preferred ratio
@@ -7022,15 +7095,20 @@ class Pipeline:
         results.sort(key=lambda x: x[0])
         return [r[1] for r in results]
 
-    def _build_timeline_no_cut(self, tts_data, total_duration, prefix=""):
+    def _build_timeline_no_cut(self, tts_data, total_duration, prefix="",
+                               exact=False):
         """Place TTS segments on a timeline WITHOUT cutting any audio.
 
         Uses FFmpeg adelay filter to place each segment at its correct time,
         then amix to combine. Handles arbitrarily long videos without loading
         the entire timeline into RAM (avoids OOM on 12h+ videos).
+
+        exact=True (Tempo Match): the timeline is EXACTLY total_duration —
+        no extension for overruns, and every ffmpeg call is bounded with -t.
+        Without -t the adelay+apad+amix graph pads forever and never exits.
         """
         # Extend total_duration to fit all reflowed segments
-        if tts_data:
+        if tts_data and not exact:
             last = max(tts_data, key=lambda s: s.get("start", 0) + s.get("duration", 0))
             actual_end = last.get("start", 0) + last.get("duration", 0) + 0.5
             total_duration = max(total_duration, actual_end)
@@ -7052,14 +7130,14 @@ class Pipeline:
         # FFmpeg's filter complexity limits (~500 inputs max)
         CHUNK_SIZE = 200
         if len(tts_data) <= CHUNK_SIZE:
-            self._build_timeline_chunk(tts_data, total_duration, output)
+            self._build_timeline_chunk(tts_data, total_duration, output, exact=exact)
         else:
             # Build chunks, then merge
             chunk_paths = []
             for ci in range(0, len(tts_data), CHUNK_SIZE):
                 chunk = tts_data[ci:ci + CHUNK_SIZE]
                 chunk_out = self.cfg.work_dir / f"{prefix}timeline_chunk_{ci:04d}.wav"
-                self._build_timeline_chunk(chunk, total_duration, chunk_out)
+                self._build_timeline_chunk(chunk, total_duration, chunk_out, exact=exact)
                 chunk_paths.append(chunk_out)
                 self._report("assemble",
                              0.2 + 0.3 * ((ci + CHUNK_SIZE) / len(tts_data)),
@@ -7088,8 +7166,9 @@ class Pipeline:
                             [self._ffmpeg, "-y"] + inputs + [
                                 "-filter_complex",
                                 f"amix=inputs={len(batch)}:duration=longest:normalize=0",
-                                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                                "-acodec", "pcm_s16le", str(merge_out)],
+                                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS)]
+                            + (["-t", f"{total_duration:.3f}"] if exact else [])
+                            + ["-acodec", "pcm_s16le", str(merge_out)],
                             check=True, capture_output=True,
                         )
                         next_paths.append(merge_out)
@@ -7105,11 +7184,16 @@ class Pipeline:
 
         return output
 
-    def _build_timeline_chunk(self, tts_data, total_duration, output: Path):
+    def _build_timeline_chunk(self, tts_data, total_duration, output: Path,
+                              exact=False):
         """Build a WAV timeline for a chunk of TTS segments using FFmpeg adelay + amix.
 
         Segments are pre-reflowed by _truncate_overlaps() so they don't overlap.
         Each segment plays at full duration — no trimming.
+
+        exact=True bounds the output with -t total_duration — REQUIRED for the
+        Tempo Match path: the adelay+apad+amix graph is otherwise infinite
+        (apad pads forever, amix duration=longest waits forever).
         """
         inputs = []
         filter_parts = []
@@ -7143,10 +7227,547 @@ class Pipeline:
         self._run_proc(
             [self._ffmpeg, "-y"] + inputs + [
                 "-filter_complex", filter_complex,
-                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                "-acodec", "pcm_s16le", str(output)],
+                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS)]
+            + (["-t", f"{total_duration:.3f}"] if exact else [])
+            + ["-acodec", "pcm_s16le", str(output)],
             check=True, capture_output=True,
         )
+
+    # ── Tempo Match: per-segment fit + anchored assembly ────────────────
+
+    def _atempo_exact_fit(self, wav_path, ratio: float, target_dur: float,
+                          output_path) -> None:
+        """Speed a WAV by `ratio` and land EXACTLY on target_dur.
+
+        atempo's own length math has ~1% slop, so we never trust it:
+        `apad` + `-t` makes the clip sample-exact regardless of filter
+        internals. Deliberately atempo-only (no rubberband) so output is
+        identical on every ffmpeg build.
+        """
+        filters = []
+        t = max(ratio, 0.5)
+        while t > 2.0:
+            filters.append("atempo=2.0")
+            t /= 2.0
+        filters.append(f"atempo={t:.4f}")
+        af = ",".join(filters) + ",apad"
+        self._run_proc(
+            [self._ffmpeg, "-y", "-i", str(wav_path),
+             "-af", af, "-t", f"{max(target_dur, 0.05):.3f}",
+             "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+             "-acodec", "pcm_s16le", str(output_path)],
+            check=True, capture_output=True,
+        )
+
+    def _tempo_edge_trim(self, wav_path) -> None:
+        """Trim ONLY leading/trailing silence in place (no internal edits).
+
+        Used under tempo_match when _enhance_tts_wav is a no-op
+        (post_tts_level=='none' / audio_untouchable): Edge-TTS bakes
+        0.7-1.3s of trailing silence into every MP3, which would
+        systematically inflate every fit measurement.
+        """
+        try:
+            import soundfile as _sf
+            import numpy as _np
+            data, srate = _sf.read(str(wav_path))
+            mono = _np.mean(data, axis=1) if data.ndim > 1 else data
+            frame_len = max(1, int(srate * 0.01))
+            n_frames = len(mono) // frame_len
+            if n_frames < 3:
+                return
+            energy = _np.array([
+                _np.sqrt(_np.mean(mono[i * frame_len:(i + 1) * frame_len] ** 2))
+                for i in range(n_frames)
+            ])
+            loud = _np.nonzero(energy > 0.01)[0]
+            if len(loud) == 0:
+                return
+            s = max(0, (int(loud[0]) - 1)) * frame_len
+            e = min(len(data), (int(loud[-1]) + 2) * frame_len)
+            if e - s < len(data):
+                _sf.write(str(wav_path), data[s:e], srate)
+        except Exception:
+            pass  # trimming is best-effort; measurement still works untrimmed
+
+    def _tempo_fit_segments(self, tts_data, segments):
+        """Tempo Match fit ladder — fit dubbed speech INTO the original slots.
+
+        Groups sentence-children back to their PARENT Whisper segment (child
+        timestamps are synthetic), then per group:
+
+          slot   = parent_end - parent_start          (original speaker tempo)
+          borrow = min(real trailing silence - 150ms, tempo_gap_borrow_ms)
+          budget = slot + borrow
+
+          r0 = measured_audio / budget
+          a) r0 <= 1.0                → place as-is (rest of slot stays silent)
+          b) r0 <= 1.25 & <= user max → one atempo exact-fit (imperceptible band)
+          c) r0 >  1.25               → re-synthesize once at Edge rate +N%
+                                        (validated vs pass-1), then atempo trim
+          d) still over user max      → cap at user max, overflow into the
+                                        physical gap; if even that fails,
+                                        hard-trim + flag for manual review
+
+        Every decision derives ONLY from ffprobe/soundfile measurements.
+        Records go to self._tempo_fit_records for the QA report.
+        """
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not tts_data:
+            return tts_data
+
+        cfg = self.cfg
+        max_speed = float(getattr(cfg, "tempo_max_speedup", 1.5) or 1.5)
+        max_speed = min(max(max_speed, 1.05), 3.0)
+        borrow_cap = max(0, int(getattr(cfg, "tempo_gap_borrow_ms", 500) or 0)) / 1000.0
+        level = getattr(cfg, "post_tts_level", "full")
+        enhance_noop = (level == "none"
+                        or getattr(cfg, "audio_untouchable", False))
+        work_dir = cfg.work_dir
+
+        # ── Group entries by parent Whisper segment ──
+        def _seg_for(entry):
+            si = entry.get("_seg_idx")
+            if si is not None and segments and 0 <= si < len(segments):
+                return segments[si]
+            return None
+
+        groups = {}   # key -> list of (order, entry, seg)
+        order_of = {}
+        for oi, entry in enumerate(tts_data):
+            seg = _seg_for(entry)
+            if seg is not None and "_parent_idx" in seg:
+                key = ("p", seg["_parent_idx"])
+                p_start = float(seg.get("_parent_start", seg.get("start", 0)))
+                p_end = float(seg.get("_parent_end", seg.get("end", p_start)))
+            else:
+                key = ("s", oi)
+                src = seg if seg is not None else entry
+                p_start = float(src.get("start", 0))
+                p_end = float(src.get("end", p_start))
+            g = groups.setdefault(key, {"start": p_start, "end": p_end,
+                                        "members": [], "gap": 0.0})
+            g["members"].append((oi, entry, seg))
+            gap_src = seg if seg is not None else entry
+            g["gap"] = max(g["gap"], float(gap_src.get("_orig_gap", 0.0) or 0.0))
+            order_of[key] = min(order_of.get(key, oi), oi)
+
+        ordered = sorted(groups.items(), key=lambda kv: kv[1]["start"])
+        total_groups = len(ordered)
+        records = []
+        self._report("assemble", 0.10,
+                     f"[TempoFit] Fitting {len(tts_data)} segments into "
+                     f"{total_groups} original slots (max {max_speed:.1f}x)...")
+
+        def _measure(path):
+            d = self._get_duration(Path(path))
+            return max(0.0, d)
+
+        def _resynth_child(entry, seg, rate_pct, tag):
+            """Pass-2: re-synthesize one child at +N% Edge rate. Returns
+            (wav_path, duration) or None if pass-2 is rejected."""
+            # Pass-2 is Edge-only. If pass-1 could have come from any other
+            # engine (XTTS clone, CosyVoice, Chatterbox, Sarvam, ElevenLabs,
+            # Google, ...), re-synthesizing here would swap the voice
+            # mid-video — bail and let the atempo ladder absorb the excess.
+            non_edge = (getattr(cfg, "use_cosyvoice", False)
+                        or getattr(cfg, "use_coqui_xtts", False)
+                        or getattr(cfg, "use_chatterbox", False)
+                        or getattr(cfg, "use_sarvam_bulbul", False)
+                        or getattr(cfg, "use_elevenlabs", False)
+                        or getattr(cfg, "use_google_tts", False)
+                        or getattr(cfg, "use_fish_speech", False)
+                        or getattr(cfg, "use_indic_parler", False))
+            if non_edge or not getattr(cfg, "use_edge_tts", True):
+                return None
+            text_src = ""
+            if seg is not None:
+                text_src = (seg.get("_expected_text")
+                            or seg.get("text_translated")
+                            or seg.get("text", "")).strip()
+            if not text_src:
+                return None
+            text = self._prepare_tts_text(text_src)
+            voice = cfg.tts_voice
+            vmap = getattr(self, "_voice_map", None)
+            if vmap and seg is not None and "speaker_id" in seg:
+                voice = vmap.get(seg["speaker_id"], cfg.tts_voice)
+            mp3 = work_dir / f"tempo2_{tag}.mp3"
+            wav = work_dir / f"tempo2_{tag}.wav"
+            try:
+                asyncio.run(self._edge_tts_single(
+                    text, mp3, voice=voice, rate=f"+{int(rate_pct)}%"))
+                if not mp3.exists() or mp3.stat().st_size < 200:
+                    return None
+                self._run_proc(
+                    [self._ffmpeg, "-y", "-i", str(mp3),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     str(wav)],
+                    check=True, capture_output=True)
+                mp3.unlink(missing_ok=True)
+                self._enhance_tts_wav(wav)
+                if enhance_noop:
+                    self._tempo_edge_trim(wav)
+                return (wav, _measure(wav))
+            except Exception as e:
+                print(f"[TempoFit] pass-2 synth failed ({tag}): {e}", flush=True)
+                return None
+
+        def _fit_group(gi_key_g):
+            gi, (key, g) = gi_key_g
+            members = sorted(g["members"], key=lambda m: float(m[1].get("start", 0)))
+            p_start, p_end = g["start"], g["end"]
+            # _close_segment_gaps already folded the trailing silence INTO the
+            # slot (end was extended to next start), so the parent span is
+            # speech + silence. _orig_gap (snapshotted before folding) tells
+            # us how much is silence: the REAL speech slot is span - gap, and
+            # "borrowing" means letting speech eat into that folded silence.
+            slot_closed = max(p_end - p_start, 0.05)
+            gap = min(max(0.0, g["gap"]), slot_closed)
+            slot = max(slot_closed - gap, 0.05)     # original speech portion
+            borrow = min(max(0.0, gap - self.TEMPO_MIN_RESIDUAL_PAUSE), borrow_cap)
+            budget = slot + borrow
+            # Absolute physical ceiling: never past the next parent's start.
+            hard_ceiling = max(slot_closed - 0.05, slot)
+
+            rec = {"slot": round(slot, 3), "slot_closed": round(slot_closed, 3),
+                   "gap": round(gap, 3),
+                   "budget": round(budget, 3), "start": round(p_start, 3),
+                   "n_children": len(members), "tier": "fit",
+                   "rate_pct": 0, "atempo": 1.0, "flagged": False,
+                   "overflow_ms": 0}
+
+            # ── Measure pass-1 children (re-probe, never trust stale) ──
+            durs = []
+            for oi, entry, seg in members:
+                wav = entry.get("wav")
+                if not wav or not Path(wav).exists():
+                    durs.append(0.0)
+                    continue
+                if enhance_noop:
+                    self._tempo_edge_trim(Path(wav))
+                durs.append(_measure(wav))
+
+            # ── Stub guard: near-empty audio is a TTS failure, not "a fit" ──
+            for k, (oi, entry, seg) in enumerate(members):
+                text_here = ""
+                if seg is not None:
+                    text_here = (seg.get("text_translated") or seg.get("text", "")).strip()
+                if durs[k] < self.TEMPO_STUB_SEC and text_here:
+                    redo = _resynth_child(entry, seg, 0, f"stub_{gi}_{k}")
+                    if redo and redo[1] >= self.TEMPO_STUB_SEC:
+                        entry["wav"] = redo[0]
+                        durs[k] = redo[1]
+                    else:
+                        # Sticky: later tiers may overwrite rec["tier"], but a
+                        # permanently-empty child must still reach review.
+                        rec["tier"] = "empty"
+                        rec["flagged"] = True
+                        rec["has_empty_child"] = True
+
+            n_live = sum(1 for d in durs if d >= self.TEMPO_STUB_SEC)
+            pauses = self.TEMPO_INTER_PAUSE * max(0, n_live - 1)
+            d0 = sum(durs) + pauses
+            rec["d0"] = round(d0, 3)
+
+            if d0 <= 0.001:
+                rec["tier"] = "empty"
+                rec["flagged"] = True
+                self._tempo_place(members, durs, p_start)
+                return rec
+
+            # ── Short-slot guard: interjections skip the ladder ──
+            if slot < self.TEMPO_MIN_SLOT_SEC:
+                if d0 <= hard_ceiling:
+                    rec["tier"] = "short_slot"
+                    rec["overflow_ms"] = int(max(0.0, d0 - slot) * 1000)
+                    self._tempo_place(members, durs, p_start)
+                    return rec
+                budget = hard_ceiling  # too long even for that → normal ladder
+
+            # Pauses are placed at FULL length (never compressed), so every
+            # ratio is computed over the speech portion against a
+            # pause-reduced target — placed span = speech/ratio + pauses.
+            fit_target = max(budget - self.TEMPO_TAIL_SHAVE, 0.1)
+            r0 = (d0 - pauses) / max(fit_target - pauses, 0.1)
+            rec["r0"] = round(r0, 3)
+            rate_pct = 0
+
+            # ── Tier c: re-synthesize once at the needed Edge rate ──
+            if r0 > self.TEMPO_ATEMPO_MAX:
+                needed = min(r0, max_speed)
+                rate_pct = int(math.ceil((needed - 1.0) * 100))
+                rate_pct = int(math.ceil(rate_pct / 5.0) * 5)     # cache-friendly steps
+                rate_pct = max(5, min(rate_pct,
+                                      int((max_speed - 1.0) * 100),
+                                      self.TEMPO_EDGE_RATE_MAX))
+                new_durs = list(durs)
+                for k, (oi, entry, seg) in enumerate(members):
+                    if durs[k] < self.TEMPO_STUB_SEC:
+                        continue
+                    redo = _resynth_child(entry, seg, rate_pct, f"{gi}_{k}")
+                    if redo is None:
+                        continue
+                    wav2, d1 = redo
+                    expected = durs[k] / (1.0 + rate_pct / 100.0)
+                    # Acceptance rule: pass-2 must be shorter than pass-1 and
+                    # not truncated (>= 60% of the linear expectation).
+                    if self.TEMPO_STUB_SEC < d1 < durs[k] and d1 >= 0.6 * expected:
+                        entry["wav"] = wav2
+                        new_durs[k] = d1
+                    # else: keep pass-1 child; atempo below absorbs the excess
+                durs = new_durs
+                pauses = self.TEMPO_INTER_PAUSE * max(
+                    0, sum(1 for d in durs if d >= self.TEMPO_STUB_SEC) - 1)
+                d0 = sum(durs) + pauses
+                rec["tier"] = "two_pass"
+                rec["rate_pct"] = rate_pct
+                rec["d1"] = round(d0, 3)
+                r0 = (d0 - pauses) / max(fit_target - pauses, 0.1)
+
+            engine_factor = 1.0 + rate_pct / 100.0
+
+            # ── Fine fit / placement ──
+            if r0 <= 1.0:
+                if rec["tier"] == "fit" and rate_pct == 0:
+                    rec["tier"] = "fit"
+                self._tempo_place(members, durs, p_start)
+                return rec
+
+            # atempo ratio allowed by the user's TOTAL speed ceiling
+            allowed_atempo = min(self.TEMPO_ATEMPO_MAX, max_speed / engine_factor)
+            ratio = r0
+            if ratio <= allowed_atempo:
+                if rec["tier"] == "fit":
+                    rec["tier"] = "atempo_only"
+            else:
+                # Over the user's ceiling — cap and try to overflow into the
+                # folded silence beyond what we already borrowed.
+                ratio = max(allowed_atempo, 1.0)
+                capped_total = (d0 - pauses) / ratio + pauses
+                if capped_total <= hard_ceiling + 0.001:
+                    rec["tier"] = "over_cap"
+                    rec["flagged"] = True
+                    rec["overflow_ms"] = int(max(0.0, capped_total - budget) * 1000)
+                else:
+                    # Even the folded silence can't hold it. Speech is never
+                    # deleted, and the next anchor is sacred — so the ONLY
+                    # remaining move is to exceed the user's speed cap for
+                    # this one group, fit exactly into the physical ceiling,
+                    # and flag it loudly for manual review.
+                    rec["tier"] = "hard_cap"
+                    rec["flagged"] = True
+                    rec["overflow_ms"] = int((capped_total - hard_ceiling) * 1000)
+                    ratio = (d0 - pauses) / max(hard_ceiling - 0.05 - pauses, 0.1)
+
+            rec["atempo"] = round(ratio, 4)
+            if ratio > 1.001:
+                fitted_durs = []
+                for k, (oi, entry, seg) in enumerate(members):
+                    if durs[k] < self.TEMPO_STUB_SEC:
+                        fitted_durs.append(durs[k])
+                        continue
+                    child_target = durs[k] / ratio
+                    out = work_dir / f"tempo_fit_{gi:04d}_{k}.wav"
+                    try:
+                        self._atempo_exact_fit(entry["wav"], ratio,
+                                               child_target, out)
+                        entry["wav"] = out
+                        fitted_durs.append(child_target)
+                    except Exception as e:
+                        print(f"[TempoFit] atempo failed g{gi} c{k}: {e} "
+                              f"— keeping unfitted audio", flush=True)
+                        fitted_durs.append(durs[k])
+                durs = fitted_durs
+            self._tempo_place(members, durs, p_start)
+            return rec
+
+        done = 0
+        indexed = list(enumerate(ordered))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fit_group, item): item[0] for item in indexed}
+            results = [None] * len(indexed)
+            for fut in as_completed(futures):
+                gi = futures[fut]
+                try:
+                    results[gi] = fut.result()
+                except Exception as e:
+                    print(f"[TempoFit] group {gi} failed: {e}", flush=True)
+                    results[gi] = {"tier": "error", "flagged": True,
+                                   "error": str(e)}
+                done += 1
+                if done % 10 == 0 or done == total_groups:
+                    self._report("assemble",
+                                 0.10 + 0.04 * (done / max(total_groups, 1)),
+                                 f"[TempoFit] {done}/{total_groups} slots fitted")
+
+        records = [r for r in results if r]
+        self._tempo_fit_records = records
+
+        # Manual-review queue for the hard cases
+        review = []
+        for r in records:
+            if r.get("flagged") and (r.get("tier") in ("hard_cap", "empty", "error")
+                                     or r.get("has_empty_child")):
+                review.append({"start": r.get("start"), "slot": r.get("slot"),
+                               "tier": r.get("tier"),
+                               "overflow_ms": r.get("overflow_ms", 0),
+                               "issues": [f"tempo_match {r.get('tier')}"]})
+        if review:
+            try:
+                self._save_manual_review_queue(review)
+            except Exception:
+                pass
+
+        hist = {}
+        for r in records:
+            hist[r.get("tier", "?")] = hist.get(r.get("tier", "?"), 0) + 1
+        hist_s = ", ".join(f"{v} {k}" for k, v in sorted(hist.items()))
+        self._report("assemble", 0.14, f"[TempoFit] Done: {hist_s}")
+
+        for t in tts_data:
+            t["_tempo_fitted"] = True
+        tts_data.sort(key=lambda t: float(t.get("start", 0)))
+        return tts_data
+
+    @staticmethod
+    def _tempo_place(members, durs, p_start):
+        """Place children sequentially from the parent's REAL start anchor."""
+        pos = p_start
+        placed_any = False
+        for k, (oi, entry, seg) in enumerate(members):
+            d = durs[k] if k < len(durs) else 0.0
+            if placed_any and d >= Pipeline.TEMPO_STUB_SEC:
+                pos += Pipeline.TEMPO_INTER_PAUSE
+            entry["start"] = pos
+            entry["end"] = pos + d
+            entry["duration"] = d
+            if d >= Pipeline.TEMPO_STUB_SEC:
+                placed_any = True
+                pos += d
+
+    def _assemble_anchored(self, video_path, audio_raw, tts_data,
+                           total_video_duration):
+        """Tempo Match assembly: video untouched, audio anchored to original
+        timestamps, output duration == source duration by construction.
+
+        1. Fit ladder (if not already run) — audio fits its slots.
+        2. Timeline WAV, then FORCED to exactly the target length with
+           apad + -t (never trust amix arithmetic).
+        3. Optional original-background mix (also re-trimmed to length).
+        4. Mux with stream-copied video. No setpts. No per-segment encode.
+        """
+        print("[Assembly] Using: _assemble_anchored (Tempo Match)", flush=True)
+
+        if not any(t.get("_tempo_fitted") for t in tts_data):
+            segs = getattr(self, "_split_tts_segments", None) or self.segments
+            tts_data = self._tempo_fit_segments(tts_data, segs)
+
+        # dub_duration clips the OUTPUT — the canvas must match the window,
+        # not the full source (a 10-min window on a 95-min video must not
+        # produce 95 minutes of silent video).
+        dub_dur_min = getattr(self.cfg, "dub_duration", 0) or 0
+        effective = float(total_video_duration)
+        if dub_dur_min > 0:
+            effective = min(effective, dub_dur_min * 60.0)
+        # Never cut fitted speech: extend to the last placed segment if a
+        # boundary segment runs slightly past the window edge.
+        last_end = max((float(t.get("start", 0)) + float(t.get("duration", 0))
+                        for t in tts_data
+                        if t.get("wav") and Path(t["wav"]).exists()),
+                       default=0.0)
+        effective = min(max(effective, last_end + 0.25),
+                        float(total_video_duration))
+
+        self._report("assemble", 0.15,
+                     f"Anchored timeline ({effective:.1f}s, exact length)...")
+        timeline = self._build_timeline_no_cut(tts_data, effective,
+                                               prefix="anchored_", exact=True)
+
+        exact = self.cfg.work_dir / "anchored_exact.wav"
+        self._run_proc(
+            [self._ffmpeg, "-y", "-i", str(timeline),
+             "-af", "apad", "-t", f"{effective:.3f}",
+             "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+             "-acodec", "pcm_s16le", str(exact)],
+            check=True, capture_output=True,
+        )
+
+        final_audio = exact
+        if getattr(self.cfg, "mix_original", False):
+            mixed = self._mix_audio(audio_raw, exact,
+                                    getattr(self.cfg, "original_volume", 0.1))
+            mixed_exact = self.cfg.work_dir / "anchored_mixed_exact.wav"
+            self._run_proc(
+                [self._ffmpeg, "-y", "-i", str(mixed),
+                 "-af", "apad", "-t", f"{effective:.3f}",
+                 "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                 "-acodec", "pcm_s16le", str(mixed_exact)],
+                check=True, capture_output=True,
+            )
+            final_audio = mixed_exact
+
+        # Trim the video only when a dub window applies (stream copy; the
+        # cut lands on a keyframe — ±a fraction of a second of slop).
+        video_in = Path(video_path)
+        if effective < float(total_video_duration) - 0.5:
+            clip = self.cfg.work_dir / "anchored_video_clip.mp4"
+            self._run_proc(
+                [self._ffmpeg, "-y", "-i", str(video_path),
+                 "-t", f"{effective:.3f}", "-c", "copy", str(clip)],
+                check=True, capture_output=True,
+            )
+            if clip.exists() and clip.stat().st_size > 0:
+                video_in = clip
+
+        self._report("assemble", 0.85, "Muxing (video stream-copied, "
+                                       "no time changes)...")
+        self._mux_replace_audio(video_in, final_audio, self.cfg.output_path)
+
+        out_dur = self._get_duration(self.cfg.output_path)
+        delta_ms = (out_dur - effective) * 1000.0
+        self._report("assemble", 0.97,
+                     f"Sync check: output {out_dur:.2f}s vs target "
+                     f"{effective:.2f}s (Δ{delta_ms:+.0f}ms)")
+
+        try:
+            job_id = self.cfg.work_dir.parent.name if self.cfg.work_dir else "unknown"
+            self._write_tempo_qa_report(job_id, out_dur, effective)
+        except Exception as e:
+            print(f"[TempoQA] report failed: {e}", flush=True)
+
+    def _write_tempo_qa_report(self, job_id: str, out_dur: float,
+                               target_dur: float):
+        """Machine-readable per-run report: logs/tempo_qa_<job_id>.json."""
+        records = getattr(self, "_tempo_fit_records", None) or []
+        import json as _json
+        hist = {}
+        max_over = 0
+        for r in records:
+            hist[r.get("tier", "?")] = hist.get(r.get("tier", "?"), 0) + 1
+            max_over = max(max_over, int(r.get("overflow_ms", 0) or 0))
+        flagged = [r for r in records if r.get("flagged")]
+        report = {
+            "job_id": job_id,
+            "output_duration": round(out_dur, 3),
+            "target_duration": round(target_dur, 3),
+            "duration_delta_ms": round((out_dur - target_dur) * 1000, 1),
+            "tier_histogram": hist,
+            "max_overflow_ms": max_over,
+            "flagged_segments": flagged,
+            "segments": records,
+        }
+        log_dir = Path(__file__).parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        path = log_dir / f"tempo_qa_{job_id}.json"
+        path.write_text(_json.dumps(report, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+        hist_s = ", ".join(f"{v} {k}" for k, v in sorted(hist.items()))
+        self._report("assemble", 0.99,
+                     f"Tempo QA: {hist_s} | {len(flagged)} flagged | "
+                     f"Δ{(out_dur - target_dur) * 1000:+.0f}ms -> {path.name}")
 
     # ── Video-adapts-to-audio assembly ──────────────────────────────────
     # Maximum video slowdown: 1.1x (setpts=1.1*PTS makes it 10% slower)
@@ -7743,7 +8364,7 @@ class Pipeline:
         A segment like "यह अच्छा है। अब आगे बढ़ते हैं।" becomes two segments.
         """
         split = []
-        for seg in segments:
+        for pi, seg in enumerate(segments):
             text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 split.append(seg)
@@ -7760,7 +8381,8 @@ class Pipeline:
             # Distribute time proportionally by character count
             total_chars = sum(len(s) for s in sentences)
             seg_start = seg.get("start", 0)
-            seg_dur = seg.get("end", seg_start) - seg_start
+            seg_end = seg.get("end", seg_start)
+            seg_dur = seg_end - seg_start
             pos = seg_start
 
             for sent in sentences:
@@ -7771,6 +8393,17 @@ class Pipeline:
                 new_seg["text"] = sent
                 new_seg["start"] = pos
                 new_seg["end"] = pos + sent_dur
+                # Tempo Match: child start/end above are SYNTHETIC (char-count
+                # proportional). Stamp the parent's REAL Whisper anchors so the
+                # fit ladder works at parent granularity — children float
+                # inside the parent slot, drift can never cross a real anchor.
+                # If the segment is itself a chunk (_chunk_segments_for_tts),
+                # dict(seg) already carries the chunker's real anchors — keep
+                # them so all chunks + their sentences group to ONE slot.
+                if "_parent_idx" not in seg:
+                    new_seg["_parent_idx"] = pi
+                    new_seg["_parent_start"] = seg_start
+                    new_seg["_parent_end"] = seg_end
                 split.append(new_seg)
                 pos += sent_dur
 
@@ -11365,8 +11998,28 @@ class Pipeline:
         # output matches the original runtime. Capped at tts_rate_ceiling.
         # In manual mode, the user's Speech Rate slider value is used as-is.
         rate_mode = (getattr(self.cfg, "tts_rate_mode", "auto") or "auto").lower()
-        if rate_mode == "auto":
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: pass-1 is ALWAYS natural pace. The per-segment fit
+            # ladder (_tempo_fit_segments) measures each segment afterwards and
+            # computes any speedup per slot — a global rate would fight it.
+            self.cfg.tts_rate = "+0%"
+            self._report("synthesize", 0.05,
+                         "Tempo Match ON — pass-1 at natural rate "
+                         "(per-segment fit after synthesis)")
+        elif rate_mode == "auto":
             source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
+            # dub_duration clips the OUTPUT to the first N minutes, so the
+            # rate target must be that window — not the full source runtime.
+            # Otherwise a 95-min source with a 10-min window computes a
+            # massive slowdown (-50%) and assembly stretches the video 2x+.
+            dub_dur_min = getattr(self.cfg, "dub_duration", 0) or 0
+            if dub_dur_min > 0:
+                window_sec = float(dub_dur_min) * 60.0
+                if source_dur <= 0 or source_dur > window_sec:
+                    print(f"[RATE-AUTO] dub_duration={dub_dur_min}m — rate "
+                          f"target capped to {window_sec:.0f}s window "
+                          f"(full source is {source_dur:.0f}s)", flush=True)
+                    source_dur = window_sec
             if source_dur <= 0:
                 source_dur = float(budget.get("total_slot", 0.0) or 0.0)
             total_words = int(budget.get("total_words", 0) or 0)
@@ -13595,7 +14248,11 @@ class Pipeline:
                 # and assembly handles the overflow. We still flag silence
                 # (ratio < 0.15 = "only 15% of expected") because that
                 # indicates a real failure (TTS produced almost nothing).
-                no_pressure = getattr(self.cfg, 'tts_no_time_pressure', True)
+                # tempo_match implies full no-pressure QC semantics: the fit
+                # ladder handles duration AFTER this gate, so long pass-1
+                # audio must never trigger a text-rewriting re-render here.
+                no_pressure = (getattr(self.cfg, 'tts_no_time_pressure', True)
+                               or getattr(self.cfg, 'tempo_match', False))
                 if ratio > 2.5 and not no_pressure:
                     issues.append(f"TTS {ratio:.1f}x longer than slot")
                 elif ratio < 0.15:

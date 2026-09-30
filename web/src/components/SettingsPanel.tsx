@@ -82,6 +82,9 @@ export interface DubbingSettings {
     max_sentences_per_cue: number;   // max sentences per segment (default 2)
     tts_chunk_words: number;         // 0=off, 4/8/12=chunk size for TTS
     gap_mode: string;                // "none" | "micro" | "full"
+    // ── Tempo Match (per-segment fit) ──
+    tempo_match?: boolean;           // fit dubbed speech into each original slot (video never slowed)
+    tempo_max_speedup?: number;      // max speech speed-up (default 1.5)
     // ── SRT Direct mode ──
     sd_srt_content?: string;         // full SRT content (required for srtdub mode)
     sd_max_stretch?: number;         // 1.0 – 20.0
@@ -284,6 +287,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                 // ── Dependency flags ──
                 const isVoiceClone = settings.audio_untouchable && settings.use_coqui_xtts && !settings.use_edge_tts;
+                const tempoOn = settings.tempo_match ?? false;
                 const whisperDisabled = isOneFlow || isSrtDub || isSrtMode;
                 const translationDisabled = isOneFlow || isSrtDub || isSrtMode;
                 const simplifyDisabled = isOneFlow || isSrtDub || isSrtMode;
@@ -1360,6 +1364,50 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                     {!isSrtDub && (<>
                         {/* ── GROUP 5 — Audio & Video Assembly ── */}
                         <CollapsibleGroup title="Audio & Video Assembly" subtitle="Sync, sound processing, bitrate, encode">
+                            {/* Tempo Match (per-segment) — master fit switch */}
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="flex-1 pr-3">
+                                    <p className="text-sm text-text-primary">Tempo Match (per-segment)</p>
+                                    <p className="text-xs text-text-muted">Dubbed speech fits each original time slot. Video is never slowed; output length = source length.</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle Tempo Match" onClick={() => update({ tempo_match: !tempoOn })}
+                                    className={`
+                                    w-11 h-6 rounded-full transition-colors relative shrink-0
+                                    ${tempoOn ? 'bg-primary' : 'bg-white/10'}
+                                `}
+                                >
+                                    <div className={`
+                                    w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                    ${tempoOn ? 'translate-x-6' : 'translate-x-1'}
+                                `} />
+                                </button>
+                            </div>
+                            {tempoOn && (
+                                <div className="mb-3">
+                                    <p className="text-xs text-text-secondary mb-1.5">Max speech speed-up</p>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        {[
+                                            { value: 1.3, label: '1.3×', desc: 'Most natural' },
+                                            { value: 1.5, label: '1.5×', desc: 'Recommended' },
+                                            { value: 2.0, label: '2.0×', desc: 'Everything fits' },
+                                        ].map((m) => (
+                                            <button key={m.value} type="button"
+                                                onClick={() => update({ tempo_max_speedup: m.value })}
+                                                className={`
+                                                px-2 py-1.5 rounded-lg text-xs font-medium transition-all text-center
+                                                ${(settings.tempo_max_speedup ?? 1.5) === m.value
+                                                        ? 'bg-primary/20 text-primary border border-primary/30'
+                                                        : 'bg-white/5 text-text-muted border border-white/5 hover:border-white/20'}
+                                            `}
+                                            >
+                                                <div>{m.label}</div>
+                                                <div className="text-[10px] opacity-60">{m.desc}</div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                             <p className="text-sm font-medium text-text-primary mb-1">Step 4 — Audio &amp; Video Assembly</p>
                             {isVoiceClone && (
                                 <div className="rounded-lg p-2 mb-2 bg-violet-500/10 border border-violet-500/30">
@@ -1495,10 +1543,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </p>
 
                                     {/* ── Module 1: Per-Segment Slot Recompute ── */}
-                                    <div className="rounded-lg border border-white/10 p-3 mb-3">
+                                    <div className={`rounded-lg border border-white/10 p-3 mb-3 ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                         <div className="flex items-center justify-between mb-2">
                                             <div>
-                                                <p className="text-xs font-medium text-text-primary">Module 1 — Per-Segment Slot Recompute</p>
+                                                <p className="text-xs font-medium text-text-primary">Module 1 — Per-Segment Slot Recompute{tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}</p>
                                                 <p className="text-[10px] text-text-muted">Speed audio up to cap, then expand each segment&apos;s slot by word-weight. Each video segment gets its own speed.</p>
                                             </div>
                                         </div>
@@ -1568,10 +1616,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
 
                                     {/* ── Module 2: Global Stretch ── */}
-                                    <div className="rounded-lg border border-white/10 p-3 mb-3">
+                                    <div className={`rounded-lg border border-white/10 p-3 mb-3 ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                         <div className="flex items-center justify-between">
                                             <div>
-                                                <p className="text-xs font-medium text-text-primary">Module 2 — Global Stretch</p>
+                                                <p className="text-xs font-medium text-text-primary">Module 2 — Global Stretch{tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}</p>
                                                 <p className="text-[10px] text-text-muted">One uniform video speed for the whole video. Simple: total TTS audio at speed X vs original video length.</p>
                                             </div>
                                             <button
@@ -2098,11 +2146,12 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* No Time Pressure on TTS — master switch */}
-                                <div className="flex items-center justify-between">
+                                <div className={`flex items-center justify-between ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                     <div className="flex-1 pr-3">
                                         <p className="text-sm text-text-primary">
                                             TTS: No Time Pressure{' '}
                                             <span className="text-[10px] text-green-400">DEFAULT ON · RECOMMENDED</span>
+                                            {tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}
                                         </p>
                                         <p className="text-xs text-text-muted">
                                             Master switch: when ON, TTS produces full natural-pace audio for

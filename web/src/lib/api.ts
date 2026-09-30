@@ -94,6 +94,8 @@ export interface JobCreateRequest {
     max_sentences_per_cue?: number;
     tts_chunk_words?: number;
     gap_mode?: string;
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
     // ── SRT Direct mode ──
     sd_srt_content?: string;         // full SRT content (required for srtdub mode)
     sd_max_stretch?: number;         // 1.0 – 10.0
@@ -175,6 +177,8 @@ export interface JobConfig {
     max_sentences_per_cue?: number;
     tts_chunk_words?: number;
     gap_mode?: string;
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
 }
 
 export interface JobStatus {
@@ -481,6 +485,8 @@ export interface LinkPreset {
     max_sentences_per_cue?: number;
     tts_chunk_words?: number;
     gap_mode?: string;
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
 }
 
 export interface SavedLink {

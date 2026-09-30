@@ -99,6 +99,9 @@ export default function HomePage() {
         max_sentences_per_cue: 2,
         tts_chunk_words: 0,                  // 0=off, 4/8/12=chunk translated text before TTS
         gap_mode: 'micro',                   // "none" (0s) | "micro" (0.2s) | "full" (original gaps)
+        // ── Tempo Match (per-segment fit) ──
+        tempo_match: false,                  // OFF: dubbed speech fits each original slot, video never slowed
+        tempo_max_speedup: 1.5,              // max speech speed-up when Tempo Match is ON
         sd_srt_content: '',                  // SRT Direct mode: full SRT content (paste or file upload)
         sd_max_stretch: 10.0,                // SRT Direct mode: max video stretch (1.0-10.0×)
         sd_audio_speed: 1.25,                // SRT Direct mode: post-TTS audio speedup (atempo)
