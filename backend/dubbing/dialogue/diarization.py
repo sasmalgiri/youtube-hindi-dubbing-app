@@ -108,10 +108,16 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
                  num_speakers: Optional[int] = None,
                  min_speakers: Optional[int] = None,
                  max_speakers: Optional[int] = None,
-                 heartbeat: Optional[Callable[[float], None]] = None) -> DiarizationResult:
+                 heartbeat: Optional[Callable[[float], None]] = None,
+                 timeout: float = 3600.0) -> DiarizationResult:
     """Run pyannote with the requested model, falling back to the other one.
 
-    Raises DiarizationUnavailable with an actionable message if neither runs.
+    Each attempt runs in a spawned CHILD process (_pyannote_child): a native
+    crash or CUDA OOM kills only the child, all GPU memory is returned, and
+    the child can hide NeMo (pyannote imports it optionally, and NeMo 2.7
+    crashes at import on torch 2.4 with an AttributeError pyannote does not
+    catch). Raises DiarizationUnavailable with an actionable message if
+    neither model runs.
     """
     if not hf_token:
         raise DiarizationUnavailable(
@@ -119,14 +125,13 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
             "conditions of pyannote/speaker-diarization-community-1, and put "
             "HF_TOKEN=... in backend/.env.")
     try:
-        import pyannote.audio as pa
-        from pyannote.audio import Pipeline as PyannotePipeline
-    except ImportError as e:
+        from importlib.metadata import version as _pkg_version
+        version = _pkg_version("pyannote.audio")
+    except Exception as e:
         raise DiarizationUnavailable(
             "pyannote.audio is not installed (pip install -r backend/requirements-dialogue.txt)") from e
-
-    version = getattr(pa, "__version__", "0")
     major = int(version.split(".")[0]) if version[:1].isdigit() else 0
+
     order = [model] + [m for m in MODEL_IDS if m != model]
     errors: List[str] = []
     kwargs = {}
@@ -144,54 +149,131 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
             errors.append(f"{model_id} needs pyannote.audio>=4 (installed {version})")
             continue
         try:
+            data = _run_child(wav_path, hf_token, key, kwargs, heartbeat, timeout)
+            return DiarizationResult(
+                [tuple(x) for x in data["regular"]], [tuple(x) for x in data["exclusive"]],
+                data.get("embeddings") or {}, backend=f"pyannote-{key}",
+                detail=data.get("detail", ""))
+        except DiarizationUnavailable:
+            raise
+        except Exception as e:  # try next backend
+            errors.append(_hf_error_message(e, model_id))
+    raise DiarizationUnavailable("; ".join(errors) or "diarization failed")
+
+
+def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
+               heartbeat: Optional[Callable[[float], None]], timeout: float) -> Dict:
+    """Spawn _pyannote_child; heartbeat every 10 s; returns its JSON result."""
+    import json
+    import multiprocessing as mp
+    import tempfile
+
+    fd, result_path = tempfile.mkstemp(suffix=".json", prefix="dlg_diarize_")
+    os.close(fd)
+    try:
+        p = mp.get_context("spawn").Process(
+            target=_pyannote_child, args=(str(wav_path), hf_token, key, kwargs, result_path),
+            daemon=True)
+        p.start()
+        t0 = time.time()
+        next_beat = t0 + 10.0
+        while p.is_alive():
+            p.join(1.0)
+            now = time.time()
+            if now - t0 > timeout:
+                p.kill()
+                p.join(5)
+                raise RuntimeError(f"diarization timed out after {int(timeout)}s")
+            if heartbeat and now >= next_beat:
+                next_beat = now + 10.0
+                try:
+                    heartbeat(now - t0)
+                except Exception:
+                    pass
+        data = {}
+        try:
+            with open(result_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+        # A complete result is trusted whatever the exit code: it is written
+        # before the child exits (Windows CUDA teardown can fail-fast).
+        if data.get("error") is None and "regular" in data:
+            return data
+        raise RuntimeError(data.get("error") or f"diarization child exited with code {p.exitcode}")
+    finally:
+        try:
+            Path(result_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _pyannote_child(wav_path: str, hf_token: str, key: str, kwargs: Dict,
+                    result_path: str) -> None:
+    """Child-process body of run_pyannote (top level so spawn can pickle it)."""
+    import json
+    import sys
+    import warnings
+    try:
+        sys.modules["nemo"] = None  # see run_pyannote docstring
+        # Audio goes in memory, so pyannote 4's torchcodec warning is moot.
+        warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed")
+        import torch
+        import pyannote.audio as pa
+        major = int(pa.__version__.split(".")[0])
+        model_id = MODEL_IDS[key]
+        if key == "3.1" and major >= 4:
+            # 3.1's recipe (agglomerative clustering) needs no PLDA, but
+            # pyannote 4's from_pretrained would also fetch the gated
+            # community-1 PLDA. Build it explicitly from its config.yaml.
+            import pyannote.audio.pipelines.speaker_diarization as _sd
+            _orig_get_plda = _sd.get_plda
+            _sd.get_plda = (lambda plda, **kw:
+                            None if plda is None else _orig_get_plda(plda, **kw))
+            pipe = _sd.SpeakerDiarization(
+                segmentation="pyannote/segmentation-3.0",
+                embedding="pyannote/wespeaker-voxceleb-resnet34-LM",
+                embedding_exclude_overlap=True, clustering="AgglomerativeClustering",
+                plda=None, embedding_batch_size=32, segmentation_batch_size=32,
+                token=hf_token)
+            pipe.instantiate({"clustering": {"method": "centroid", "min_cluster_size": 12,
+                                             "threshold": 0.7045654963945799},
+                              "segmentation": {"min_duration_off": 0.0}})
+        else:
+            from pyannote.audio import Pipeline as PyannotePipeline
             if major >= 4:
                 pipe = PyannotePipeline.from_pretrained(model_id, token=hf_token)
             else:
                 pipe = PyannotePipeline.from_pretrained(model_id, use_auth_token=hf_token)
             if pipe is None:
                 raise RuntimeError("from_pretrained returned None (gated model not accepted?)")
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    pipe.to(torch.device("cuda"))
-            except Exception:
-                pass
-            audio_input = _audio_input(wav_path)
-            stop = threading.Event()
-            if heartbeat:
-                t0 = time.time()
-
-                def _hb():
-                    while not stop.wait(10.0):
-                        try:
-                            heartbeat(time.time() - t0)
-                        except Exception:
-                            pass
-                threading.Thread(target=_hb, daemon=True).start()
-            note = ""
-            try:
-                try:
-                    output = pipe(audio_input, **kwargs)
-                except RuntimeError as oom:
-                    if "out of memory" not in str(oom).lower():
-                        raise
-                    # Bounded, reported fallback: same model on CPU (slower).
-                    import torch
-                    torch.cuda.empty_cache()
-                    pipe.to(torch.device("cpu"))
-                    output = pipe(audio_input, **kwargs)
-                    note = "; CUDA OOM -> reran on CPU"
-            finally:
-                stop.set()
-            result = _convert_output(output, key)
-            result.detail += note
-            _release(pipe)
-            return result
-        except DiarizationUnavailable:
-            raise
-        except Exception as e:  # try next backend
-            errors.append(_hf_error_message(e, model_id))
-    raise DiarizationUnavailable("; ".join(errors) or "diarization failed")
+        note = ""
+        if torch.cuda.is_available():
+            pipe.to(torch.device("cuda"))
+        audio_input = _audio_input(Path(wav_path))
+        try:
+            output = pipe(audio_input, **kwargs)
+        except RuntimeError as oom:
+            if "out of memory" not in str(oom).lower():
+                raise
+            # Bounded, reported fallback: same model on CPU (slower).
+            torch.cuda.empty_cache()
+            pipe.to(torch.device("cpu"))
+            output = pipe(audio_input, **kwargs)
+            note = "; CUDA OOM -> reran on CPU"
+        res = _convert_output(output, key)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump({"regular": res.regular, "exclusive": res.exclusive,
+                       "embeddings": res.embeddings, "detail": res.detail + note,
+                       "error": None}, f)
+    except Exception as e:
+        try:
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump({"error": f"{type(e).__name__}: {e}"}, f)
+        except Exception:
+            pass
+        os._exit(1)
+    os._exit(0)
 
 
 def _audio_input(wav_path: Path):

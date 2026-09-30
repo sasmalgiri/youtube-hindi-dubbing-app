@@ -62,8 +62,13 @@ def curated_pools() -> Dict[str, Dict[str, Any]]:
         "edge": {
             "model": "edge-neural",
             "supports_pitch": True,
-            CATEGORY_MALE: ["hi-IN-MadhurNeural"],
-            CATEGORY_FEMALE: ["hi-IN-SwaraNeural"],
+            # Only two native hi-IN voices exist; extra same-gender speakers get
+            # Multilingual voices, which read Devanagari as intelligibly (Whisper
+            # word-match 85-88% vs Madhur 85% / Swara 79%, measured 2026-09-30).
+            CATEGORY_MALE: ["hi-IN-MadhurNeural", "en-US-BrianMultilingualNeural",
+                            "en-AU-WilliamMultilingualNeural", "de-DE-FlorianMultilingualNeural"],
+            CATEGORY_FEMALE: ["hi-IN-SwaraNeural", "en-US-EmmaMultilingualNeural",
+                              "de-DE-SeraphinaMultilingualNeural", "fr-FR-VivienneMultilingualNeural"],
             # No child voice exists; a raised-pitch female voice is used and flagged.
             CATEGORY_CHILD: ["hi-IN-SwaraNeural"],
         },

@@ -19,6 +19,15 @@ if _env_file.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
+# Load torch (and its bundled cuDNN 9) BEFORE anything in this process can
+# import faster-whisper/CTranslate2. If CTranslate2 runs on the GPU first, the
+# next cuDNN-heavy torch op (Demucs) dies with "Could not load symbol
+# cudnnGetLibConfig" (exit 127) -- reproduced 2026-10-01; torch-first fixes it.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 import asyncio
 import json
 import math

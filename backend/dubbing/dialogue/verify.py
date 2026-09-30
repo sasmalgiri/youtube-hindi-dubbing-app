@@ -6,6 +6,7 @@ duplicate clips can never compensate for a missing turn.
 from __future__ import annotations
 
 import gc
+import os
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -122,13 +123,25 @@ class WhisperHindiASR:
         self.device = "cpu"
 
     def load(self):
-        from faster_whisper import WhisperModel
+        # Put torch's bundled cuDNN first on the DLL path BEFORE CTranslate2
+        # (faster-whisper) loads. Otherwise CT2 can bind a different cuDNN and
+        # the next torch GPU op in this process (Demucs in the mix stage)
+        # dies with "Could not load symbol cudnnGetLibConfig" (exit 127).
+        # Same fix as pipeline._whisper_child_worker.
         try:
             import torch
             if torch.cuda.is_available():
                 self.device = "cuda"
+                _tlib = os.path.join(os.path.dirname(torch.__file__), "lib")
+                if os.path.isdir(_tlib):
+                    try:
+                        os.add_dll_directory(_tlib)
+                    except Exception:
+                        pass
+                    os.environ["PATH"] = _tlib + os.pathsep + os.environ.get("PATH", "")
         except Exception:
             pass
+        from faster_whisper import WhisperModel
         name = self.model_name
         if name == "auto":
             name = "large-v3-turbo" if self.device == "cuda" else "small"

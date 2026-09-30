@@ -37,9 +37,11 @@ def run_preflight(work_root: Path = None, providers: List[str] = ("edge",),
     checks: List[Dict] = []
 
     def add(name, ok, detail, level="blocking", ok_detail=None):
-        """`detail` explains a failure; `ok_detail` (default: the value) a pass."""
+        """`detail` explains a failure; `ok_detail` (default: the value) a pass.
+        Credential checks pass the secret itself as `ok` — never echo it."""
         if ok and ok_detail is None:
-            ok_detail = ok if isinstance(ok, str) else "yes"
+            secret = any(t in name.upper() for t in ("KEY", "TOKEN", "SECRET"))
+            ok_detail = "set" if secret else (ok if isinstance(ok, str) else "yes")
         checks.append({"check": name, "ok": bool(ok), "detail": ok_detail if ok else detail,
                        "level": "ok" if ok else level})
 

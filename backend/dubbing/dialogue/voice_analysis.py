@@ -146,3 +146,59 @@ def analyze_speaker(audio_path: Path, ranges: Sequence[Tuple[float, float]]
     cat, conf, ev = classify_f0(f0s, voiced_total)
     ev["clips_used"] = used
     return cat, conf, ev
+
+
+def classify_gender_ml(audio_path: Path, ranges_by_speaker: Dict[str, Sequence[Tuple[float, float]]],
+                       timeout: float = 900.0) -> Dict[str, float]:
+    """p(male) per speaker from the wav2vec2 gender classifier.
+
+    Runs in the same isolated child process as the legacy multi-speaker path
+    (pipeline._diarize_child_worker in gender-only mode). Pitch alone is
+    ambiguous for many voices (a male Edge voice measured 153 Hz, a female
+    180 Hz); the classifier is ~0.999 confident on both, also under music.
+    Returns {} if the classifier cannot run (callers fall back to F0).
+    """
+    import json
+    import multiprocessing as mp
+    import os
+    import tempfile
+    import time
+    try:
+        from pipeline import _diarize_child_worker
+    except Exception:
+        return {}
+    ranges = {k: [list(r) for r in v] for k, v in ranges_by_speaker.items() if v}
+    if not ranges:
+        return {}
+    fd, result_path = tempfile.mkstemp(suffix=".json", prefix="dlg_gender_")
+    os.close(fd)
+    try:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+        p = mp.get_context("spawn").Process(
+            target=_diarize_child_worker,
+            args=(str(audio_path), "", device, result_path, ranges), daemon=True)
+        p.start()
+        t0 = time.time()
+        while p.is_alive():
+            p.join(1.0)
+            if time.time() - t0 > timeout:
+                p.kill()
+                p.join(5)
+                return {}
+        try:
+            with open(result_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+        if data.get("error") is not None:
+            return {}
+        return {k: float(v) for k, v in (data.get("p_male") or {}).items()}
+    finally:
+        try:
+            Path(result_path).unlink(missing_ok=True)
+        except Exception:
+            pass

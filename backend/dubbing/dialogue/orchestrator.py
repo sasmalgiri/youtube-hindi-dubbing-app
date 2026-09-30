@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import audio, fit, mix, verify
 from .contracts import (STATUS_CANCELLED, STATUS_FAILED, UNKNOWN_SPEAKER,
-                        CATEGORY_UNKNOWN, Clip, JobReport, Turn)
+                        CATEGORY_FEMALE, CATEGORY_MALE, CATEGORY_UNKNOWN, Clip, JobReport, Turn)
 from .diarization import (DiarizationResult, DiarizationUnavailable,
                           assign_words, hf_token_from_env, run_pyannote)
 from .report import derive_status, write_report
@@ -38,7 +38,7 @@ from .tts import TTSFailure, TTSRouter, build_providers
 from .turns import (align_text_to_words, build_turns, cues_from_turn_like,
                     turns_from_translated_cues, words_from_asr_segments,
                     words_from_cues)
-from .voice_analysis import analyze_speaker
+from .voice_analysis import MIN_CONFIDENCE, analyze_speaker, classify_gender_ml
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 ProgressCB = Callable[[str, float, str], None]
@@ -501,18 +501,37 @@ class DialogueOrchestrator:
         diar = self.diar
         speech = diar.speech_seconds() if diar else {}
         refs = self.cfg.work_dir / "speaker_refs"
+        speaker_ranges = {}
         for spk in sorted({t.speaker_id for t in self.turns}):
             if spk == UNKNOWN_SPEAKER:
-                ensure_unknown_speaker(self.registry)
                 continue
             ranges = diar.clean_ranges(spk) if diar else []
             if not ranges:  # speaker from SRT label only: use its turn spans
                 ranges = [(t.source_start, t.source_end) for t in self.turns
                           if t.speaker_id == spk and "multi_speaker_cue" not in t.flags]
+            speaker_ranges[spk] = ranges
+        # Gender: wav2vec2 classifier first (one isolated child for all
+        # speakers); F0 is kept as evidence and is the explicit, reported
+        # fallback only when the classifier cannot run.
+        p_male = classify_gender_ml(self.audio_16k, speaker_ranges)
+        for spk in sorted({t.speaker_id for t in self.turns}):
+            if spk == UNKNOWN_SPEAKER:
+                ensure_unknown_speaker(self.registry)
+                continue
+            ranges = speaker_ranges[spk]
             try:
                 cat, conf, ev = analyze_speaker(self.audio_16k, ranges)
             except Exception as e:
                 cat, conf, ev = CATEGORY_UNKNOWN, None, {"reason": f"analysis_failed: {e}"}
+            if spk in p_male:
+                pm = p_male[spk]
+                ml_conf = round(abs(pm - 0.5) * 2, 3)
+                ev = dict(ev, f0_category=cat, classifier="wav2vec2-gender", p_male=round(pm, 4))
+                cat = ((CATEGORY_MALE if pm >= 0.5 else CATEGORY_FEMALE)
+                       if ml_conf >= MIN_CONFIDENCE else CATEGORY_UNKNOWN)
+                conf = ml_conf
+            else:
+                ev = dict(ev, classifier="unavailable (F0 decision used)")
             rec = self.registry.register(
                 spk, voice_category=cat, category_confidence=conf, category_evidence=ev,
                 total_speech_s=round(speech.get(spk, sum(e - s for s, e in ranges)), 2),

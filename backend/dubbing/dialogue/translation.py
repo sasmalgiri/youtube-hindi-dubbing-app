@@ -53,9 +53,9 @@ class OpenAICompatClient:
 
     ENDPOINTS = {
         "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-                   "GEMINI_API_KEY", "DIALOGUE_GEMINI_MODEL", "gemini-2.5-flash"),
+                   "GEMINI_API_KEY", "DIALOGUE_GEMINI_MODEL", "gemini-3.5-flash"),  # 2.5 retired Sept 2026
         "groq": ("https://api.groq.com/openai/v1/chat/completions",
-                 "GROQ_API_KEY", "DIALOGUE_GROQ_MODEL", "llama-3.3-70b-versatile"),
+                 "GROQ_API_KEY", "DIALOGUE_GROQ_MODEL", "openai/gpt-oss-120b"),  # llama-3.3-70b-versatile retired Sept 2026
         "cerebras": ("https://api.cerebras.ai/v1/chat/completions",
                      "CEREBRAS_API_KEY", "DIALOGUE_CEREBRAS_MODEL", "llama-3.3-70b"),
         "openai": ("https://api.openai.com/v1/chat/completions",

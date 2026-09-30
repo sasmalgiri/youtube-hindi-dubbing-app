@@ -14,6 +14,15 @@ import sys
 import time
 from pathlib import Path
 
+# Load torch (and its bundled cuDNN 9) BEFORE anything in this process can
+# import faster-whisper/CTranslate2. If CTranslate2 runs on the GPU first, the
+# next cuDNN-heavy torch op (Demucs) dies with "Could not load symbol
+# cudnnGetLibConfig" (exit 127) -- reproduced 2026-10-01; torch-first fixes it.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 BACKEND = Path(__file__).resolve().parents[2]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))

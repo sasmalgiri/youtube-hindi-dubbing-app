@@ -60,8 +60,10 @@ def test_two_male_two_female_four_identities_with_reported_reuse():
     edge = {s: reg.resolve_voice(s, "edge") for s in reg.speakers}
     keys = {(b["voice"], b["pitch"]) for b in edge.values()}
     assert len(keys) == 4, "each character needs a distinct (voice, variant)"
-    reuse = reg.voice_reuse("edge")
-    assert set(reuse) == {"hi-IN-MadhurNeural", "hi-IN-SwaraNeural"}
+    # Edge pool has Multilingual voices beyond Madhur/Swara: four distinct
+    # voices, no pitch-variant reuse.
+    assert len({b["voice"] for b in edge.values()}) == 4
+    assert reg.voice_reuse("edge") == {}
     # Sarvam has several voices per category -> unique voices, no reuse
     sarvam = {s: reg.resolve_voice(s, "sarvam")["voice"] for s in reg.speakers}
     assert len(set(sarvam.values())) == 4
@@ -70,8 +72,9 @@ def test_two_male_two_female_four_identities_with_reported_reuse():
 
 def test_main_speaker_gets_base_voice_regardless_of_id_order():
     reg = _registry([("SPEAKER_00", CATEGORY_MALE, 5), ("SPEAKER_01", CATEGORY_MALE, 50)])
-    assert reg.resolve_voice("SPEAKER_01", "edge")["pitch"] is None
-    assert reg.resolve_voice("SPEAKER_00", "edge")["pitch"] is not None
+    main, minor = reg.resolve_voice("SPEAKER_01", "edge"), reg.resolve_voice("SPEAKER_00", "edge")
+    assert main["voice"] == "hi-IN-MadhurNeural" and main["pitch"] is None
+    assert minor["voice"] != main["voice"]  # a different voice, not a pitch variant
 
 
 def test_unknown_speaker_strict_vs_register():
