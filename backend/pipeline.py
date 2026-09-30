@@ -728,100 +728,186 @@ _hindi_rules = HindiRuleEngine()
 # ── Hindi first-person gender agreement (female speakers) ────────────────────
 # Hindi verbs/adjectives agree with the subject's gender; machine translation
 # renders "I was tired" as the masculine "मैं थक गया था". For a female speaker
-# these must be feminine ("थक गई थी"). Only UNAMBIGUOUS first-person-singular
-# constructions are changed:
-#   1. anything agreeing with हूँ/हूं (1st-person-singular "am" — never 3rd person)
-#   2. 1st-person future endings -ऊँगा/-ूँगा (करूँगा → करूँगी)
-#   3. था / clause-final participles, only inside a clause whose subject is मैं
-#      (not मैंने: ergative verbs agree with the object, not the speaker)
+# these must be feminine ("थक गई थी"). Deliberately conservative: only CLOSED
+# classes of words are changed, so names ("मैं सारा हूँ"), nouns ("पता",
+# "रास्ता", "सफलता") and invariable words ("पैदा", "ज़्यादा") are never touched:
+#   * perfective/auxiliary forms (_HI_PAST_FINAL: गया→गई, रहा→रही, सका→सकी…)
+#   * a curated list of variable adjectives (_HI_VARIABLE_ADJ: थका, अकेला…)
+#   * imperfective participles in -ता (करता→करती; see _hi_is_ta_participle)
+# Where it applies (first-person singular only):
+#   1. the agreeing chain before हूँ/हूं (1st-person-singular "am")
+#   2. 1st-person future -ऊँगा/-ूँगा (करूँगा → करूँगी)
+#   3. the first था after मैं in a sentence (not मैंने: ergative verbs agree
+#      with the object), and a clause-final participle in a मैं sentence
+# Quoted speech ("…") belongs to someone else and is left alone.
 _HI_AM = {"हूँ", "हूं"}
 _HI_WAS = {"था"}
-# Masculine nouns ending in -ा/-ता that must not be "feminized" before हूँ.
-_HI_MASC_NOUNS = {
-    "राजा", "पिता", "दादा", "नाना", "चाचा", "मामा", "भैया", "नेता", "देवता",
-    "योद्धा", "कर्ता", "दाता", "वक्ता", "श्रोता", "अभिनेता", "विजेता", "प्रवक्ता",
-    "जनता", "कविता", "सफलता", "क्षमता", "गुणवत्ता", "आवश्यकता", "एकता", "सुंदरता",
-}
-_HI_CLAUSE_SPLIT = re.compile(
-    r"(\s*[।|,;:?!.]\s*|\s+(?:कि|और|लेकिन|पर|परंतु|किंतु|मगर|क्योंकि|जब|तो|इसलिए|या|जबकि|ताकि)\s+)")
-# Clause-final masculine simple-past/perfective forms (मैं वहाँ गया → गई).
+_HI_PARTICLES = {"नहीं", "न", "भी", "ही", "तो"}
 _HI_PAST_FINAL = {"गया": "गई", "आया": "आई", "हुआ": "हुई", "पाया": "पाई", "सका": "सकी",
-                  "चुका": "चुकी", "रहा": "रही", "लगा": "लगी", "बैठा": "बैठी", "उठा": "उठी"}
+                  "चुका": "चुकी", "रहा": "रही", "लगा": "लगी", "बैठा": "बैठी", "उठा": "उठी",
+                  "गयी": "गई"}
+_HI_VARIABLE_ADJ = {
+    "अच्छा", "बुरा", "बड़ा", "छोटा", "अकेला", "थका", "भूखा", "प्यासा", "नया", "पुराना",
+    "सच्चा", "झूठा", "मोटा", "पतला", "लंबा", "खड़ा", "लेटा", "डरा", "खोया", "सोया",
+    "का", "वाला", "जैसा", "ऐसा", "वैसा", "गीला", "सूखा", "ठंडा", "भरा", "पढ़ा", "लिखा",
+    "जागा", "रुका", "फँसा", "फंसा", "उलझा", "घबराया", "पहला", "दूसरा", "तीसरा", "अगला",
+    "पिछला", "सीधा", "टूटा", "बेचारा", "कितना", "इतना", "उतना", "जितना",
+}
+# -ता words that are not participles: nouns, names, verb stems.
+_HI_TA_NOUNS = {
+    "पता", "रास्ता", "जूता", "छाता", "गीता", "सीता", "माता", "पिता", "नेता", "देवता",
+    "सुनीता", "अनीता", "ममता", "कविता", "जनता", "बता", "बिता", "जता", "सता", "कर्ता",
+    "दाता", "वक्ता", "श्रोता", "अभिनेता", "विजेता", "प्रवक्ता", "नाता", "बस्ता", "सस्ता",
+    "आहिस्ता", "फरिश्ता", "रिश्ता", "नाश्ता", "गुलदस्ता", "दस्ता", "कलकत्ता", "अलबत्ता",
+}
+# Participles whose ending looks like an abstract noun's (…रता, …लता, …कता).
+_HI_TA_PARTICIPLES = {
+    "करता", "भरता", "मरता", "डरता", "गिरता", "फिरता", "तैरता", "सुधरता", "गुजरता", "गुज़रता",
+    "उतरता", "बिखरता", "सुनता", "मानता", "जानता", "बनता", "गिनता", "चुनता", "पहचानता",
+    "चलता", "मिलता", "पलता", "जलता", "बदलता", "निकलता", "संभलता", "फिसलता", "खुलता",
+    "हिलता", "टलता", "रमता", "थमता", "जमता", "घूमता", "झूमता", "सकता", "थकता", "चमकता",
+    "भटकता", "लटकता", "रुकता", "झुकता", "टपकता", "महकता", "झिझकता",
+    # more verbs in -ल/-न/-र/-क/-म + ता (same ending as सफलता, समानता, सुंदरता…)
+    "खेलता", "बोलता", "खोलता", "डालता", "पालता", "टालता", "संभालता", "उछलता",
+    "मचलता", "फलता", "उबलता", "पिघलता", "तौलता", "घोलता", "झेलता", "धकेलता",
+    "छानता", "तानता", "ठानता", "बुनता", "छीनता", "बीनता", "निखरता", "उभरता",
+    "ठहरता", "मुकरता", "पसरता", "चरता", "बकता", "छलकता", "धड़कता", "फेंकता",
+    "पकता", "ढकता", "चूकता", "टिकता", "बिकता", "चूमता",
+}
+_HI_ABSTRACT_TA_ENDINGS = ("लता", "मता", "कता", "वता", "नता", "यता", "रता",
+                           "त्ता", "न्ता", "स्ता", "श्ता", "ष्ता", "र्ता", "क्ता")
+_HI_NEVER = {"पैदा", "ज़िंदा", "जिंदा", "शर्मिंदा", "ज़्यादा", "ज्यादा", "ताज़ा", "ताजा", "जुदा",
+             "खफ़ा", "खफा", "आवारा", "शादीशुदा", "हिस्सा", "महिला", "छात्रा", "सारा",
+             "मेरा", "तेरा", "हमारा", "गूंगा", "गूँगा", "मूंगा", "मूँगा", "राजा", "दादा",
+             "नाना", "चाचा", "मामा", "भैया", "योद्धा", "दुनिया", "हवा", "दवा", "सभा", "कला",
+             "एक", "मैं", "था", "थी", "हूँ", "हूं"}
+_HI_SENT_END = re.compile(r"[।?!.]")
+_HI_CLAUSE_SPLIT = re.compile(
+    r"(\s*[।|,;:?!.]\s*|\s+(?:कि|और|लेकिन|परंतु|किंतु|मगर|क्योंकि|जब|इसलिए|या|जबकि|ताकि)\s+)")
+# A clause with its own explicit subject is not मैं's clause.
+_HI_OTHER_SUBJ = {"वह", "वो", "यह", "ये", "वे", "हम", "आप", "तुम", "तू"}
+_HI_QUOTES = "\"“”‘’«»"
+
+
+def _hi_strip(w: str) -> str:
+    return w.strip("।,;:?!.\"'“”‘’")
+
+
+def _hi_is_ta_participle(core: str) -> bool:
+    """करता/जाता/सकता… yes; पता, रास्ता, सफलता, स्वतंत्रता, कविता… no."""
+    if core in _HI_TA_PARTICIPLES:
+        return True
+    if not core.endswith("ता") or len(core) < 4 or core in _HI_TA_NOUNS:
+        return False
+    return not core.endswith(_HI_ABSTRACT_TA_ENDINGS)
 
 
 def _hi_feminize_word(w: str) -> str:
-    """Masculine agreeing form → feminine; '' if w is not a gendered form."""
-    core, tail = w, ""
-    while core and core[-1] in "।,;:?!.\"'":
-        core, tail = core[:-1], core[-1] + tail
-    if not core or core in _HI_MASC_NOUNS:
+    """Masculine agreeing form → feminine; '' if w is not in a closed class."""
+    core = _hi_strip(w)
+    if not core or core in _HI_NEVER:
         return ""
     if core in _HI_PAST_FINAL:
-        return _HI_PAST_FINAL[core] + tail
-    if core.endswith("या") and len(core) > 2:      # आया→आई, गया→गई
-        return core[:-2] + "ई" + tail
-    if core.endswith("ा") and len(core) > 1:       # करता→करती, बड़ा→बड़ी
-        return core[:-1] + "ी" + tail
-    return ""
+        fem = _HI_PAST_FINAL[core]
+    elif core in _HI_VARIABLE_ADJ and core.endswith("ा"):
+        fem = core[:-1] + "ी"
+    elif _hi_is_ta_participle(core):
+        fem = core[:-1] + "ी"
+    else:
+        return ""
+    return w.replace(core, fem, 1)
 
 
 def _hi_feminize_chain(tokens, end: int, max_len: int = 3) -> None:
-    """Feminize the gendered word at tokens[end] and, walking backwards, the
-    participles agreeing with it (in place). The walk continues only through
-    an imperfective participle (-ता: "खेलता रहा") or the adjective before
-    हुआ ("थका हुआ") — a bare stem or infinitive before रहा/सकता/चाहता
-    ("जा रहा", "बताना चाहता") doesn't inflect for gender."""
+    """Feminize the agreeing word at tokens[end] (skipping particles such as
+    नहीं/भी before it) and, walking back, only through हुआ ("थका हुआ") or a
+    -ता participle before रहा ("खेलता रहा"). A bare stem, infinitive or
+    object before रहा/सकता/चाहता/चुका is never touched."""
     k = end
-    while k >= 0 and end - k < max_len:
-        word = tokens[k]
-        fem = _hi_feminize_word(word)
+    while k >= 0 and _hi_strip(tokens[k]) in _HI_PARTICLES:
+        k -= 1
+    changed = 0
+    while k >= 0 and changed < max_len:
+        word = _hi_strip(tokens[k])
+        fem = _hi_feminize_word(tokens[k])
         if not fem:
             break
+        if k > 0 and _hi_strip(tokens[k - 1]) == "एक":
+            break  # "मैं एक बच्चा …": a noun phrase, leave it
         tokens[k] = fem
+        changed += 1
         if k == 0:
             break
-        prev = tokens[k - 1].strip("।,;:?!.\"'")
-        if not (word.strip("।,;:?!.\"'") == "हुआ" or prev.endswith("ता")):
-            break
-        k -= 1
+        prev = _hi_strip(tokens[k - 1])
+        if word == "हुआ" and prev in _HI_VARIABLE_ADJ:
+            k -= 1
+            continue
+        if word == "रहा" and _hi_is_ta_participle(prev):
+            k -= 1
+            continue
+        # "बड़ा हो गया" (became big): the adjective before हो agrees too.
+        if prev == "हो" and k >= 2 and _hi_strip(tokens[k - 2]) in _HI_VARIABLE_ADJ:
+            k -= 2
+            continue
+        break
+
+
+def _feminize_unquoted(text: str) -> str:
+    out = []
+    subj_mai = False   # carried across the clauses of one sentence
+    was_done = False   # only the first था after each मैं
+    for idx, part in enumerate(_HI_CLAUSE_SPLIT.split(text)):
+        if idx % 2 == 1:  # delimiter
+            out.append(part)
+            if _HI_SENT_END.search(part):
+                subj_mai, was_done = False, False
+            continue
+        tokens = part.split(" ")
+        bare = [_hi_strip(t) for t in tokens]
+        if "मैं" in bare:
+            subj_mai, was_done = True, False
+        elif set(bare) & _HI_OTHER_SUBJ or any(b.endswith("ने") and b != "मैंने" for b in bare):
+            subj_mai = False
+        if "मैंने" in bare:
+            subj_mai = False
+        for i, b in enumerate(bare):
+            # Rule 2: future 1st person singular (गूंगा/मूंगा are in _HI_NEVER).
+            if b not in _HI_NEVER and re.search(r"(ूँ|ूं|ऊँ|ऊं)गा$", b):
+                tokens[i] = re.sub(r"गा(?=[।,;:?!.\"'“”‘’]*$)", "गी", tokens[i])
+            # Rule 1: agreement with हूँ.
+            if b in _HI_AM and i > 0:
+                _hi_feminize_chain(tokens, i - 1)
+            # "मैं अकेला/थका हुआ महसूस कर…" (feel lonely/tired): the adjective agrees.
+            if b == "महसूस" and subj_mai and i > 0:
+                _hi_feminize_chain(tokens, i - 1)
+            # Rule 3a: the first था after मैं.
+            if b in _HI_WAS and subj_mai and not was_done:
+                tokens[i] = tokens[i].replace("था", "थी", 1)
+                was_done = True
+                if i > 0:
+                    _hi_feminize_chain(tokens, i - 1)
+        # Rule 3b: clause-final participle in a मैं sentence with no auxiliary
+        # (negated present "मैं नहीं जानता", simple past "… और सो गया").
+        if subj_mai and not was_done and bare and \
+                not (set(bare) & (_HI_AM | _HI_WAS | {"थी", "है", "हैं"})):
+            last = max((j for j, b in enumerate(bare) if b), default=-1)
+            if last > 0 and bare[last] != "मैं":
+                lb = bare[last]
+                negated = "नहीं" in bare or "न" in bare
+                if lb in _HI_PAST_FINAL or (negated and _hi_is_ta_participle(lb)):
+                    _hi_feminize_chain(tokens, last)
+        out.append(" ".join(tokens))
+    return "".join(out)
 
 
 def feminize_first_person_hi(text: str) -> str:
     """Rewrite masculine first-person-singular agreement to feminine."""
     if not text or not any(c in text for c in ("हूँ", "हूं", "ूँगा", "ूंगा", "ऊँगा", "ऊंगा", "मैं")):
         return text
-    parts = _HI_CLAUSE_SPLIT.split(text)
-    out = []
-    for idx, part in enumerate(parts):
-        if idx % 2 == 1:  # delimiter
-            out.append(part)
-            continue
-        tokens = part.split(" ")
-        bare = [t.strip("।,;:?!.\"'") for t in tokens]
-        subj_mai = "मैं" in bare
-        for i, b in enumerate(bare):
-            # Rule 2: future 1st person singular.
-            if re.search(r"(ूँ|ूं|ऊँ|ऊं)गा$", b):
-                tokens[i] = re.sub(r"गा(?=[।,;:?!.\"']*$)", "गी", tokens[i])
-            # Rule 1: agreement with हूँ.
-            if b in _HI_AM and i > 0:
-                _hi_feminize_chain(tokens, i - 1)
-            # Rule 3a: था in a मैं clause.
-            if b in _HI_WAS and subj_mai:
-                tokens[i] = tokens[i].replace("था", "थी", 1)
-                if i > 0:
-                    _hi_feminize_chain(tokens, i - 1)
-        # Rule 3b: clause-final participle in a मैं clause with no auxiliary
-        # (negated present "मैं नहीं जानता", simple past "मैं थक गया").
-        if subj_mai and bare and not (set(bare) & (_HI_AM | _HI_WAS | {"थी"})):
-            last = max((j for j, b in enumerate(bare) if b), default=-1)
-            if last > 0 and bare[last] != "मैं":
-                lb = bare[last]
-                negated = "नहीं" in bare or "न" in bare
-                if lb in _HI_PAST_FINAL or (negated and lb.endswith("ता")):
-                    _hi_feminize_chain(tokens, last)
-        out.append(" ".join(tokens))
-    return "".join(out)
+    # Quoted spans are someone else's words: leave them untouched.
+    parts = re.split(r"([\"“”‘’«»][^\"“”‘’«»]*[\"“”‘’«»])", text)
+    return "".join(p if (len(p) > 1 and p[0] in _HI_QUOTES) else _feminize_unquoted(p)
+                   for p in parts)
 
 
 # ── Types ────────────────────────────────────────────────────────────────────
@@ -1846,8 +1932,13 @@ class Pipeline:
     def _detect_speaker_genders(self, wav_path: Path, speakers: Dict[str, List[tuple]]) -> Dict[str, str]:
         """Gender per already-labelled speaker (e.g. speaker tags from an
         uploaded SRT) — runs only the gender half of the speaker worker."""
-        res = self._run_speaker_worker(wav_path, given_ranges=speakers)
-        genders = dict((res or {}).get("gender") or {})
+        res = self._run_speaker_worker(wav_path, given_ranges=speakers,
+                                       step="translate", p_lo=0.55, p_hi=0.78)
+        if res is None:
+            # Worker failed: return nothing so the caller keeps ONE voice
+            # (matching the warning) instead of guessing genders.
+            return {}
+        genders = dict(res.get("gender") or {})
         self._speaker_speech_sec = {s: sum(e - b for b, e in rs) for s, rs in speakers.items()}
         for s in speakers:
             genders.setdefault(s, self._default_voice_gender())
@@ -1859,10 +1950,13 @@ class Pipeline:
         pool = VOICE_POOL.get(self.cfg.target_language, {})
         return "female" if self.cfg.tts_voice in pool.get("female", []) else "male"
 
-    def _run_speaker_worker(self, wav_path: Path, given_ranges=None) -> Optional[Dict]:
+    def _run_speaker_worker(self, wav_path: Path, given_ranges=None, step: str = "transcribe",
+                            p_lo: float = 0.82, p_hi: float = 0.97) -> Optional[Dict]:
         """Spawn _diarize_child_worker; heartbeat every 10 s, honour cancel,
-        bound by a timeout. Returns the worker's result dict, or None after
-        reporting why (the job then continues with the single selected voice)."""
+        bound by a timeout. Progress is reported under `step` within
+        [p_lo, p_hi] (the SRT path runs inside "translate"). Returns the
+        worker's result dict, or None after reporting why (the job then
+        continues with the single selected voice)."""
         import multiprocessing as mp
         import json as _json
         import tempfile as _tmpmod
@@ -1873,7 +1967,7 @@ class Pipeline:
         if not hf_token and not given_ranges:
             self.speaker_warning = ("Multi-speaker skipped: HF_TOKEN is not set in backend/.env "
                                     "— the whole video used one voice")
-            self._report("transcribe", 0.85, self.speaker_warning)
+            self._report(step, p_lo, self.speaker_warning)
             return None
 
         try:
@@ -1892,8 +1986,24 @@ class Pipeline:
         fd, result_path = _tmpmod.mkstemp(suffix=".json", prefix="diarize_result_")
         os.close(fd)
         p = None
+
+        def _load() -> Optional[Dict]:
+            """The child's result if complete (written before it exits)."""
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    d = _json.load(f)
+            except Exception:
+                return None
+            return d if (d.get("error") is None and "ranges" in d) else None
+
+        def _stage() -> str:
+            try:
+                return Path(result_path + ".stage").read_text(encoding="utf-8").strip()
+            except Exception:
+                return ""
+
         try:
-            self._report("transcribe", 0.82,
+            self._report(step, p_lo,
                          f"Detecting {what} on {device.upper()} (isolated process)...")
             p = mp.Process(target=_diarize_child_worker,
                            args=(str(wav_path), hf_token, device, result_path, given_ranges),
@@ -1901,6 +2011,7 @@ class Pipeline:
             p.start()
             t0 = _time.time()
             next_beat = t0 + 10.0
+            done_at = None
             while p.is_alive():
                 p.join(1.0)
                 if self._cancel_check():
@@ -1908,32 +2019,41 @@ class Pipeline:
                     p.join(5)
                     self._check_cancelled()
                 now = _time.time()
+                # Result written but the child is stuck unloading CUDA DLLs:
+                # give it 20 s, then take the result instead of waiting out
+                # the whole timeout.
+                if done_at is None and _stage() == "done":
+                    done_at = now
+                if done_at is not None and now - done_at > 20 and _load():
+                    p.kill()
+                    p.join(5)
+                    break
                 if now - t0 > timeout:
                     p.kill()
                     p.join(5)
+                    data = _load()
+                    if data:
+                        return data
                     raise RuntimeError(f"timed out after {timeout}s")
                 if now >= next_beat:
                     next_beat = now + 10.0
-                    self._report("transcribe", 0.86,
+                    self._report(step, p_lo + (p_hi - p_lo) * 0.3,
                                  f"Detecting {what}... ({int(now - t0)}s elapsed)")
-            data = {}
-            try:
-                with open(result_path, "r", encoding="utf-8") as f:
-                    data = _json.load(f)
-            except Exception:
-                pass
             # A complete result is trusted whatever the exit code — the
             # child writes it before exiting, so a crash after that point
             # can't have corrupted it.
-            if data.get("error") is None and "ranges" in data:
+            data = _load()
+            if data:
                 return data
-            if data.get("error"):
-                raise RuntimeError(data["error"])
-            stage = ""
+            err = None
             try:
-                stage = Path(result_path + ".stage").read_text(encoding="utf-8").strip()
+                with open(result_path, "r", encoding="utf-8") as f:
+                    err = _json.load(f).get("error")
             except Exception:
                 pass
+            if err:
+                raise RuntimeError(err)
+            stage = _stage()
             raise RuntimeError(f"child crashed (exit {p.exitcode:#x})"
                                + (f" during '{stage}'" if stage else ""))
         except RuntimeError as e:
@@ -1941,7 +2061,7 @@ class Pipeline:
                 raise
             self.speaker_warning = (f"Multi-speaker failed ({str(e)[:160]}) "
                                     f"— the whole video used one voice")
-            self._report("transcribe", 0.97, self.speaker_warning)
+            self._report(step, p_hi, self.speaker_warning)
             return None
         finally:
             for _f in (result_path, result_path + ".stage"):
@@ -1990,6 +2110,9 @@ class Pipeline:
             near = min(turns, key=lambda tr: _gap(t0, t1, tr))
             return near[2] if _gap(t0, t1, near) <= MAX_NEAREST_SEC else None
 
+        def _norm(t: str) -> List[str]:
+            return re.sub(r"[^\w']+", " ", str(t).lower()).split()
+
         def _stamp(seg: Dict, spk: Optional[str]) -> None:
             if spk:
                 seg["speaker_id"] = spk
@@ -2004,8 +2127,13 @@ class Pipeline:
             words = [w for w in (seg.get("words") or [])
                      if w.get("start") is not None and w.get("end") is not None
                      and str(w.get("word", "")).strip()]
+            # Split only when `words` still match the segment text: dedup and
+            # noise filters edit `text` but not `words` (the ASR cache keeps
+            # them), and rebuilding pieces from stale words would bring back
+            # a removed repeat or a "[Music]" tag.
             if len(words) < 2 * MIN_RUN_WORDS or not any(
-                    b > seg["start"] and a < seg["end"] for a, b, _ in turns):
+                    b > seg["start"] and a < seg["end"] for a, b, _ in turns) \
+                    or _norm(" ".join(str(w["word"]) for w in words)) != _norm(seg.get("text", "")):
                 _stamp(seg, _segment_speaker(seg["start"], seg["end"]))
                 out.append(seg)
                 continue
@@ -2018,26 +2146,32 @@ class Pipeline:
                     runs[-1][1].append(w)
                 else:
                     runs.append([spk, [w]])
-            # Absorb short runs (jitter) into the previous run, or the next
-            # one when it's the first run; re-join neighbours that now match.
-            changed = True
-            while changed and len(runs) > 1:
-                changed = False
-                for k, (spk, ws) in enumerate(runs):
-                    if len(ws) < MIN_RUN_WORDS:
-                        if k > 0:
-                            runs[k - 1][1].extend(ws)
-                        else:
-                            runs[1][1][:0] = ws
-                        del runs[k]
-                        changed = True
-                        break
+            # Absorb short runs (jitter, a listener's "mm-hmm" over the first
+            # words). A short run sandwiched between two runs of the same
+            # speaker goes first, then the shortest; it joins the LONGER
+            # neighbour, so A2/B2/A5 -> A9 instead of the forward cascade
+            # that handed the main speaker's opening words to the listener.
+            while len(runs) > 1:
+                short = [k for k in range(len(runs)) if len(runs[k][1]) < MIN_RUN_WORDS]
+                if not short:
+                    break
+                k = min(short, key=lambda k: (
+                    not (0 < k < len(runs) - 1 and runs[k - 1][0] == runs[k + 1][0]),
+                    len(runs[k][1])))
+                ws = runs[k][1]
+                if k == 0:
+                    runs[1][1][:0] = ws
+                elif k == len(runs) - 1 or len(runs[k - 1][1]) >= len(runs[k + 1][1]):
+                    runs[k - 1][1].extend(ws)
+                else:
+                    runs[k + 1][1][:0] = ws
+                del runs[k]
                 merged_runs: List[List] = []
-                for spk, ws in runs:
+                for spk, w_ in runs:
                     if merged_runs and merged_runs[-1][0] == spk:
-                        merged_runs[-1][1].extend(ws)
+                        merged_runs[-1][1].extend(w_)
                     else:
-                        merged_runs.append([spk, ws])
+                        merged_runs.append([spk, w_])
                 runs = merged_runs
 
             if len(runs) == 1:
@@ -2084,10 +2218,14 @@ class Pipeline:
                 piece["words"] = ws
                 piece["text"] = " ".join(str(w["word"]).strip() for w in ws)
                 piece["speaker_id"] = spk
-                piece["start"] = (seg["start"] if k == 0 else
-                                  (float(runs[k - 1][1][-1]["end"]) + float(ws[0]["start"])) / 2)
-                piece["end"] = (seg["end"] if k == len(runs) - 1 else
-                                (float(ws[-1]["end"]) + float(runs[k + 1][1][0]["start"])) / 2)
+                start = (seg["start"] if k == 0 else
+                         (float(runs[k - 1][1][-1]["end"]) + float(ws[0]["start"])) / 2)
+                end = (seg["end"] if k == len(runs) - 1 else
+                       (float(ws[-1]["end"]) + float(runs[k + 1][1][0]["start"])) / 2)
+                # Word timings can drift outside the segment: clamp, monotonic.
+                lo = out[-1]["end"] if k > 0 else seg["start"]
+                piece["start"] = min(max(start, lo, seg["start"]), seg["end"])
+                piece["end"] = min(max(end, piece["start"]), seg["end"])
                 out.append(piece)
         if n_split:
             self._report("transcribe", 0.985,
@@ -2498,13 +2636,14 @@ class Pipeline:
                 for ref_seg in self._ref_english_subs:
                     ref_seg["text"] = ref_seg.get("text", "")
                 ref_copy = [dict(s) for s in self._ref_english_subs]
+                if self._voice_map and getattr(self, "_speaker_ranges", None):
+                    # Reference subs carry no speaker_id — stamp them BEFORE
+                    # translating, so the dub keeps each speaker's voice and
+                    # the female-grammar pass in _translate_segments applies.
+                    ref_copy = self._assign_speaker_to_segments(ref_copy, self._speaker_ranges)
                 self._glossary_mask(ref_copy)
                 self._translate_segments(ref_copy)
                 self._glossary_unmask(ref_copy)
-                if self._voice_map and getattr(self, "_speaker_ranges", None):
-                    # Reference subs carry no speaker_id — re-stamp them so
-                    # the dub keeps each speaker's voice.
-                    ref_copy = self._assign_speaker_to_segments(ref_copy, self._speaker_ranges)
                 self.segments = ref_copy
                 text_segments = ref_copy
                 # Re-run QA against original English subs
@@ -2981,10 +3120,13 @@ class Pipeline:
             _wav16 = self.cfg.work_dir / "audio_16k.wav"
             speaker_genders = self._detect_speaker_genders(
                 _wav16 if _wav16.exists() else audio_raw, speaker_ranges)
-            self._voice_map = self._assign_voices_to_speakers(speaker_genders)
-            self._build_speaker_summary(speaker_genders)
-            self._report("translate", 0.8,
-                         f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
+            if speaker_genders:
+                self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                self._speaker_genders = speaker_genders
+                self._build_speaker_summary(speaker_genders)
+                self._report("translate", 0.8,
+                             f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
+            # else: gender detection failed → one voice; speaker_warning says so
 
         # Write the translated SRT to standard location
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
@@ -6745,26 +6887,40 @@ class Pipeline:
                     or "that's an error" in low or "<html" in low
                     or "<!doctype" in low)
 
+        import threading as _th
         failed = []            # segments left in the source language
         rate_limited = [False]
+        consecutive_429 = [0]
+        stop = _th.Event()     # set once the job can't succeed, or on cancel
+        fail_limit = max(2, 0.05 * total)
 
         def translate_one(idx_seg):
-            import time
             idx, seg = idx_seg
+            text = seg.get("text", "")
+            # Symbols / punctuation only ("♪", "..."): nothing to translate,
+            # and not a failure.
+            if not any(c.isalpha() for c in text):
+                seg["text_translated"] = text
+                return idx
             retries = 4
             for attempt in range(retries):
+                if stop.is_set() or self._cancel_check():
+                    seg["text_translated"] = text
+                    failed.append(idx)
+                    return idx
                 try:
                     translator = GoogleTranslator(source=src, target=self.cfg.target_language)
-                    result = translator.translate(seg["text"])
+                    result = translator.translate(text)
+                    consecutive_429[0] = 0
                     if _is_garbage(result):
                         if attempt < retries - 1:
-                            time.sleep(1.5 * (attempt + 1))
+                            stop.wait(1.5 * (attempt + 1))
                             continue
                         # All retries returned garbage — keep original
-                        seg["text_translated"] = seg["text"]
+                        seg["text_translated"] = text
                         failed.append(idx)
                     else:
-                        seg["text_translated"] = result or seg["text"]
+                        seg["text_translated"] = result or text
                     break
                 except Exception as e:
                     # Google answers bursts with "Too many requests" (429); a
@@ -6772,21 +6928,37 @@ class Pipeline:
                     too_many = "too many requests" in str(e).lower() or "TooManyRequests" in type(e).__name__
                     if too_many:
                         rate_limited[0] = True
+                        consecutive_429[0] += 1
+                        # A sustained block: every worker is hitting 429.
+                        # Retrying only prolongs the block and the wait.
+                        if consecutive_429[0] >= 40:
+                            stop.set()
                     if attempt < retries - 1:
-                        time.sleep((5, 15, 30)[attempt] if too_many else 1.5 * (attempt + 1))
+                        # stop.wait ends early on cancel / a doomed job
+                        stop.wait((5, 15, 30)[attempt] if too_many else 1.5 * (attempt + 1))
                     else:
-                        seg["text_translated"] = seg["text"]
+                        seg["text_translated"] = text
                         failed.append(idx)
+            if len(failed) > fail_limit:
+                stop.set()
             return idx
 
         # 20 parallel workers — Google Translate handles this fine
-        with ThreadPoolExecutor(max_workers=20) as pool:
+        pool = ThreadPoolExecutor(max_workers=20)
+        try:
             futures = {pool.submit(translate_one, (i, s)): i for i, s in enumerate(segments)}
             for future in as_completed(futures):
                 completed[0] += 1
+                if self._cancel_check():
+                    stop.set()
                 if completed[0] % 20 == 0 or completed[0] == total:
                     self._report("translate", 0.05 + 0.90 * (completed[0] / total),
                                  f"Google Translate: {completed[0]}/{total}")
+        finally:
+            if self._cancel_check():
+                stop.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+        self._check_cancelled()
 
         # Untranslated lines would be voiced in English by the Hindi voice and
         # the job would still say "Complete" — fail loudly instead.

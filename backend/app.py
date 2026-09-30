@@ -1287,10 +1287,26 @@ def _run_job(job: Job, req: JobCreateRequest):
                 }
                 whisper_model_size = _whisper_size_map.get(_asr_choice, "large-v3")
 
+                _untranslated_run = [0]
+
                 def translate_fn(text, hints):
+                    pipeline._check_cancelled()
                     segs = [{"text": text, "start": 0, "end": hints.get("duration_ms", 3000) / 1000}]
                     pipeline._translate_segments(segs)
-                    return segs[0].get("text_translated", text)
+                    out = segs[0].get("text_translated", text)
+                    # One cue per call, so the engine's own ">5% failed" guard
+                    # never fires here: stop after 5 English cues in a row
+                    # instead of voicing untranslated English as "Hindi".
+                    if out.strip() == text.strip() and any(c.isalpha() for c in text):
+                        _untranslated_run[0] += 1
+                        if _untranslated_run[0] >= 5:
+                            raise RuntimeError(
+                                "Translation is failing (5 cues in a row came back untranslated; "
+                                "Google may be rate-limiting this PC). Retry later or pick "
+                                "another Translation engine (Groq/Gemini) in Settings.")
+                    else:
+                        _untranslated_run[0] = 0
+                    return out
 
                 segments = runner.run_full(
                     wav_path, translate_fn=translate_fn,
@@ -1805,6 +1821,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
 
     # Step 3: Process each part
     output_parts = []
+    # Titled output folders (sanitized for Windows); parts are saved as they finish.
+    base_title = _sanitize_filename(job.video_title or "Untitled")
+    saved_parts = []
     for part_idx, part_path in enumerate(parts):
         part_num = part_idx + 1
         part_label = f"Part {part_num}/{num_parts}"
@@ -1955,21 +1974,21 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         if part_out.exists():
             output_parts.append((part_num, part_out))
             print(f"[SPLIT] Part {part_num}/{num_parts} complete: {part_out}", flush=True)
+            # Save each finished part NOW: if a later part fails (e.g. Google
+            # rate-limits part 5 of 6), the error path must not take hours of
+            # already-dubbed parts down with it.
+            part_title = f"{base_title} - Part {part_num}"
+            dest_dir = SAVED_DIR / part_title
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / f"{part_title}.mp4"
+            shutil.copy2(part_out, dest_path)
+            saved_parts.append(str(dest_path))
+            job.saved_video = job.saved_video or str(dest_path)
+            _store.save(job)
+            print(f"[SPLIT] Saved: {dest_path}", flush=True)
 
     if not output_parts:
         raise RuntimeError("No parts were produced")
-
-    # Save all parts to titled folders — sanitize title for Windows filesystem
-    base_title = _sanitize_filename(job.video_title or "Untitled")
-    saved_parts = []
-    for part_num, part_out in output_parts:
-        part_title = f"{base_title} - Part {part_num}"
-        dest_dir = SAVED_DIR / part_title
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = dest_dir / f"{part_title}.mp4"
-        shutil.copy2(part_out, dest_path)
-        saved_parts.append(str(dest_path))
-        print(f"[SPLIT] Saved: {dest_path}", flush=True)
 
     job.result_path = output_parts[0][1]  # First part for preview
     job.saved_folder = str(SAVED_DIR / base_title) if len(output_parts) == 1 else str(SAVED_DIR)
@@ -2772,6 +2791,9 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
 
         job.result_path = out_path
         job.segments = pipeline.segments
+        # SRT speaker labels -> per-speaker voices (or a failure warning)
+        job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(pipeline, "speaker_warning", None)
 
         # Auto-save to titled folder
         try:
@@ -3561,6 +3583,9 @@ def _run_resume(job: Job):
 
         job.result_path = out_path
         job.segments = pipeline.segments
+        # Overwrite phase-1 (transcribe-only) speakers with what was dubbed
+        job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(pipeline, "speaker_warning", None)
         job.video_title = job.video_title or "Untitled"
 
         # Auto-save to titled folder
