@@ -231,6 +231,10 @@ class Job:
     saved_video: Optional[str] = None   # Path to saved video file
     description: Optional[str] = None   # YouTube description
     qa_score: Optional[float] = None    # Transcription QA score (0-1)
+    # Multi-speaker outcome: [{speaker, gender, voice, seconds, part?}] and a
+    # sticky warning when it was requested but fell back to one voice.
+    speakers: List[Dict] = field(default_factory=list)
+    speaker_warning: Optional[str] = None
     # Word/sentence budget — populated from pipeline._tts_budget after a
     # successful run() so the UI can show "X words across Y sentences"
     total_words: int = 0
@@ -567,7 +571,7 @@ def _generate_youtube_description(job: Job) -> str:
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                 json={
-                    "model": "llama-3.3-70b-versatile",
+                    "model": "openai/gpt-oss-120b",  # llama-3.3-70b-versatile retired Sept 2026
                     "messages": [
                         {"role": "system", "content": "You are a professional YouTube description writer."},
                         {"role": "user", "content": prompt},
@@ -1104,6 +1108,8 @@ def _run_job(job: Job, req: JobCreateRequest):
                 job.video_title = pipeline.video_title or "Untitled"
                 job.segments = pipeline.segments
                 job.qa_score = pipeline.qa_score
+                job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+                job.speaker_warning = getattr(pipeline, "speaker_warning", None)
                 _budget = getattr(pipeline, "_tts_budget", None)
                 if _budget:
                     job.total_words = int(_budget.get("total_words", 0))
@@ -1329,6 +1335,8 @@ def _run_job(job: Job, req: JobCreateRequest):
             job.video_title = pipeline.video_title or "Untitled"
             job.segments = pipeline.segments
             job.qa_score = pipeline.qa_score
+            job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+            job.speaker_warning = getattr(pipeline, "speaker_warning", None)
             # Copy TTS budget metrics (computed by _pretts_word_budget) onto
             # the Job so they show up in the API response and the UI.
             _budget = getattr(pipeline, "_tts_budget", None)
@@ -1501,6 +1509,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
     work_dir.mkdir(exist_ok=True)
     split_dir = work_dir / "splits"
     split_dir.mkdir(exist_ok=True)
+    job.speakers = []          # parts append to this; start clean on re-runs
+    job.speaker_warning = None
 
     callback = _make_progress_callback(job)
 
@@ -1615,6 +1625,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         job.segments = p.segments
         job.video_title = p.video_title or job.video_title
         job.qa_score = p.qa_score
+        job.speakers = list(getattr(p, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(p, "speaker_warning", None)
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
@@ -1752,6 +1764,12 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         job.pipeline_ref = pipeline   # cancel handler can kill in-flight subprocesses
         pipeline.video_title = f"{job.video_title} - Part {part_num}"
         pipeline.run()
+
+        # Each part diarizes its own audio; keep every part's speakers.
+        job.speakers.extend({**d, "part": part_num}
+                            for d in (getattr(pipeline, "speaker_summary", []) or []))
+        if getattr(pipeline, "speaker_warning", None):
+            job.speaker_warning = f"Part {part_num}: {pipeline.speaker_warning}"
 
         # Accumulate per-part TTS budget into the Job totals so the UI shows
         # the cumulative count across the whole split job, not just one part.
@@ -2962,6 +2980,8 @@ def get_job(job_id: str):
         "saved_video": job.saved_video,
         "description": job.description,
         "qa_score": job.qa_score,
+        "speakers": getattr(job, "speakers", []),
+        "speaker_warning": getattr(job, "speaker_warning", None),
         "chain_languages": job.chain_languages,
         "chain_parent_id": job.chain_parent_id,
         # Word/sentence budget — populated by _pretts_word_budget after TTS finishes

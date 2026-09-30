@@ -985,7 +985,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                                 <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
-                                <p className="text-xs text-text-muted">Detect speakers & assign distinct voices (needs HF_TOKEN, adds ~30s)</p>
+                                <p className="text-xs text-text-muted">Detect each speaker, give men male and women female Hindi voices (GPU ~20-40s per 10 min; first run downloads ~1.5 GB)</p>
                             </div>
                             <button
                                 type="button" title="Toggle Multi-speaker" onClick={() => update({ multi_speaker: !settings.multi_speaker })}

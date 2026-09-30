@@ -63,6 +63,13 @@ def _hardened_cuda_cleanup():
         pass
 
 
+# ── Hosted LLM model IDs (translation) ──
+# Providers retire models: llama-3.3-70b-versatile (Groq) and gemini-2.5-*
+# (Gemini) started returning 404 in Sept 2026. Change them here only.
+GROQ_LLM_MODEL = "openai/gpt-oss-120b"
+GEMINI_LLM_MODEL = "gemini-3.5-flash"
+
+
 # ── Subprocess worker for local Whisper transcription ────────────────────────
 # Runs in a child process so that C-level crashes (SIGABRT, CUDA OOM that
 # bypasses Python try/except) only kill the child — the server stays alive.
@@ -148,6 +155,169 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
             pass
         import sys
         sys.exit(1)
+
+
+# ── Subprocess worker for speaker diarization + gender ──────────────────────
+# Same isolation as Whisper: pyannote / wav2vec2 run in a child so a native
+# crash or CUDA OOM kills only the child, and all GPU memory is returned when
+# it exits.
+DIARIZE_GENDER_MODEL = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+
+
+def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
+                          result_path: str, given_ranges=None):
+    """Diarize (pyannote speaker-diarization-3.1) then classify each speaker's
+    gender (wav2vec2 classifier). With given_ranges ({speaker: [(s, e)]},
+    e.g. from an uploaded SRT) diarization is skipped and only gender runs.
+
+    Writes {"ranges", "embeddings", "gender", "p_male", "error"} as JSON, and
+    the stage it is in to <result_path>.stage (so a native crash can be
+    located). Exits with os._exit right after the result is written: CUDA
+    libraries on Windows can fail-fast (0xC0000409) while unloading at
+    interpreter shutdown, after the work is already done."""
+    import json as _json
+    import os as _os
+
+    def _stage(name):
+        try:
+            with open(result_path + ".stage", "w", encoding="utf-8") as sf_:
+                sf_.write(name)
+        except Exception:
+            pass
+
+    try:
+        import sys as _sys
+        _stage("import")
+        # pyannote optionally imports NeMo and only catches ImportError; NeMo
+        # 2.7 on torch 2.4 raises AttributeError at import (needs torch 2.5's
+        # nn.Buffer). Hide it in this child so pyannote skips it cleanly —
+        # the embedding model used here is WeSpeaker, not NeMo.
+        _sys.modules["nemo"] = None
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        # Decode in memory: pyannote 4 decodes files with torchcodec, whose
+        # FFmpeg DLLs don't load on this Windows install.
+        _stage("load audio")
+        data, sr = sf.read(wav_path_str, dtype="float32", always_2d=True)
+        mono = data.mean(axis=1)
+        del data
+        if sr != 16000:
+            import librosa
+            mono = librosa.resample(mono, orig_sr=sr, target_sr=16000)
+            sr = 16000
+        dev = torch.device(device)
+
+        ranges, emb_map = {}, {}
+        if given_ranges:
+            ranges = {k: [tuple(r) for r in v] for k, v in given_ranges.items()}
+        else:
+            import warnings as _warnings
+            # Audio is passed in memory, so pyannote's torchcodec-missing
+            # warning (a page of DLL tracebacks per job) is irrelevant.
+            _warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed")
+            import pyannote.audio
+            seg_model = "pyannote/segmentation-3.0"
+            emb_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
+            params = {  # pyannote/speaker-diarization-3.1 config.yaml
+                "clustering": {"method": "centroid", "min_cluster_size": 12,
+                               "threshold": 0.7045654963945799},
+                "segmentation": {"min_duration_off": 0.0},
+            }
+            waveform = torch.from_numpy(mono[None, :].copy())
+            major = int(pyannote.audio.__version__.split(".")[0])
+            _stage("load diarization model")
+            if major >= 4:
+                # Built explicitly (not from_pretrained) so pyannote 4 doesn't
+                # also fetch the gated community-1 PLDA, which agglomerative
+                # clustering never uses.
+                import pyannote.audio.pipelines.speaker_diarization as _sd
+                _orig_get_plda = _sd.get_plda
+                _sd.get_plda = (lambda plda, **kw:
+                                None if plda is None else _orig_get_plda(plda, **kw))
+                pipe = _sd.SpeakerDiarization(
+                    segmentation=seg_model, embedding=emb_model,
+                    embedding_exclude_overlap=True,
+                    clustering="AgglomerativeClustering", plda=None,
+                    embedding_batch_size=32, segmentation_batch_size=32,
+                    token=hf_token,
+                )
+                pipe.instantiate(params)
+                pipe.to(dev)
+                _stage("diarize")
+                out = pipe({"waveform": waveform, "sample_rate": sr})
+                # exclusive = no overlapping turns, so every instant belongs
+                # to exactly one speaker (what per-segment voices need).
+                ann = out.exclusive_speaker_diarization
+                labels = out.speaker_diarization.labels()
+                embs = out.speaker_embeddings
+            else:
+                from pyannote.audio import Pipeline as _PyannotePipeline
+                pipe = _PyannotePipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+                pipe.to(dev)
+                _stage("diarize")
+                ann, embs = pipe({"waveform": waveform, "sample_rate": sr},
+                                 return_embeddings=True)
+                labels = ann.labels()
+            for turn, _, spk in ann.itertracks(yield_label=True):
+                ranges.setdefault(spk, []).append((float(turn.start), float(turn.end)))
+            if embs is not None:
+                for i, lab in enumerate(labels):
+                    if i < len(embs) and np.all(np.isfinite(embs[i])):
+                        emb_map[lab] = [float(x) for x in embs[i]]
+            del pipe, waveform
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+        # Gender: wav2vec2 classifier over up to 30 s of each speaker's
+        # longest turns, averaged over 8 s windows. Pitch thresholds were
+        # tried first and are ambiguous (a male voice measured 153 Hz vs a
+        # female at 180 Hz); this model is ~0.999 confident on both.
+        _stage("load gender model")
+        from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+        fe = AutoFeatureExtractor.from_pretrained(DIARIZE_GENDER_MODEL)
+        clf = AutoModelForAudioClassification.from_pretrained(DIARIZE_GENDER_MODEL).to(dev).eval()
+        male_idx = {v.lower(): int(k) for k, v in clf.config.id2label.items()}["male"]
+        _stage("classify gender")
+        gender, p_male = {}, {}
+        for spk, rs in ranges.items():
+            chunks, total = [], 0.0
+            for a, b in sorted(rs, key=lambda r: r[0] - r[1]):  # longest first
+                if total >= 30.0:
+                    break
+                if b - a < 0.5:
+                    continue
+                chunks.append(mono[int(a * sr):int(b * sr)])
+                total += b - a
+            if total < 1.0:
+                continue  # too little audio to judge; caller merges/defaults
+            x = np.concatenate(chunks)
+            probs = []
+            for i in range(0, len(x), sr * 8):
+                win = x[i:i + sr * 8]
+                if len(win) < sr:
+                    continue
+                inp = fe(win, sampling_rate=sr, return_tensors="pt").to(dev)
+                with torch.no_grad():
+                    probs.append(float(torch.softmax(clf(**inp).logits, -1)[0][male_idx]))
+            if probs:
+                p_male[spk] = sum(probs) / len(probs)
+                gender[spk] = "male" if p_male[spk] >= 0.5 else "female"
+
+        with open(result_path, "w", encoding="utf-8") as f:
+            _json.dump({"ranges": ranges, "embeddings": emb_map, "gender": gender,
+                        "p_male": p_male, "error": None}, f)
+        _stage("done")
+    except Exception as exc:
+        try:
+            with open(result_path, "w", encoding="utf-8") as f:
+                _json.dump({"error": f"{type(exc).__name__}: {exc}"}, f)
+        except Exception:
+            pass
+        _os._exit(1)
+    _os._exit(0)
 
 
 # ── Groq API Key Rotator ────────────────────────────────────────────────────
@@ -555,6 +725,105 @@ class HindiRuleEngine:
 _hindi_rules = HindiRuleEngine()
 
 
+# ── Hindi first-person gender agreement (female speakers) ────────────────────
+# Hindi verbs/adjectives agree with the subject's gender; machine translation
+# renders "I was tired" as the masculine "मैं थक गया था". For a female speaker
+# these must be feminine ("थक गई थी"). Only UNAMBIGUOUS first-person-singular
+# constructions are changed:
+#   1. anything agreeing with हूँ/हूं (1st-person-singular "am" — never 3rd person)
+#   2. 1st-person future endings -ऊँगा/-ूँगा (करूँगा → करूँगी)
+#   3. था / clause-final participles, only inside a clause whose subject is मैं
+#      (not मैंने: ergative verbs agree with the object, not the speaker)
+_HI_AM = {"हूँ", "हूं"}
+_HI_WAS = {"था"}
+# Masculine nouns ending in -ा/-ता that must not be "feminized" before हूँ.
+_HI_MASC_NOUNS = {
+    "राजा", "पिता", "दादा", "नाना", "चाचा", "मामा", "भैया", "नेता", "देवता",
+    "योद्धा", "कर्ता", "दाता", "वक्ता", "श्रोता", "अभिनेता", "विजेता", "प्रवक्ता",
+    "जनता", "कविता", "सफलता", "क्षमता", "गुणवत्ता", "आवश्यकता", "एकता", "सुंदरता",
+}
+_HI_CLAUSE_SPLIT = re.compile(
+    r"(\s*[।|,;:?!.]\s*|\s+(?:कि|और|लेकिन|पर|परंतु|किंतु|मगर|क्योंकि|जब|तो|इसलिए|या|जबकि|ताकि)\s+)")
+# Clause-final masculine simple-past/perfective forms (मैं वहाँ गया → गई).
+_HI_PAST_FINAL = {"गया": "गई", "आया": "आई", "हुआ": "हुई", "पाया": "पाई", "सका": "सकी",
+                  "चुका": "चुकी", "रहा": "रही", "लगा": "लगी", "बैठा": "बैठी", "उठा": "उठी"}
+
+
+def _hi_feminize_word(w: str) -> str:
+    """Masculine agreeing form → feminine; '' if w is not a gendered form."""
+    core, tail = w, ""
+    while core and core[-1] in "।,;:?!.\"'":
+        core, tail = core[:-1], core[-1] + tail
+    if not core or core in _HI_MASC_NOUNS:
+        return ""
+    if core in _HI_PAST_FINAL:
+        return _HI_PAST_FINAL[core] + tail
+    if core.endswith("या") and len(core) > 2:      # आया→आई, गया→गई
+        return core[:-2] + "ई" + tail
+    if core.endswith("ा") and len(core) > 1:       # करता→करती, बड़ा→बड़ी
+        return core[:-1] + "ी" + tail
+    return ""
+
+
+def _hi_feminize_chain(tokens, end: int, max_len: int = 3) -> None:
+    """Feminize the gendered word at tokens[end] and, walking backwards, the
+    participles agreeing with it (in place). The walk continues only through
+    an imperfective participle (-ता: "खेलता रहा") or the adjective before
+    हुआ ("थका हुआ") — a bare stem or infinitive before रहा/सकता/चाहता
+    ("जा रहा", "बताना चाहता") doesn't inflect for gender."""
+    k = end
+    while k >= 0 and end - k < max_len:
+        word = tokens[k]
+        fem = _hi_feminize_word(word)
+        if not fem:
+            break
+        tokens[k] = fem
+        if k == 0:
+            break
+        prev = tokens[k - 1].strip("।,;:?!.\"'")
+        if not (word.strip("।,;:?!.\"'") == "हुआ" or prev.endswith("ता")):
+            break
+        k -= 1
+
+
+def feminize_first_person_hi(text: str) -> str:
+    """Rewrite masculine first-person-singular agreement to feminine."""
+    if not text or not any(c in text for c in ("हूँ", "हूं", "ूँगा", "ूंगा", "ऊँगा", "ऊंगा", "मैं")):
+        return text
+    parts = _HI_CLAUSE_SPLIT.split(text)
+    out = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:  # delimiter
+            out.append(part)
+            continue
+        tokens = part.split(" ")
+        bare = [t.strip("।,;:?!.\"'") for t in tokens]
+        subj_mai = "मैं" in bare
+        for i, b in enumerate(bare):
+            # Rule 2: future 1st person singular.
+            if re.search(r"(ूँ|ूं|ऊँ|ऊं)गा$", b):
+                tokens[i] = re.sub(r"गा(?=[।,;:?!.\"']*$)", "गी", tokens[i])
+            # Rule 1: agreement with हूँ.
+            if b in _HI_AM and i > 0:
+                _hi_feminize_chain(tokens, i - 1)
+            # Rule 3a: था in a मैं clause.
+            if b in _HI_WAS and subj_mai:
+                tokens[i] = tokens[i].replace("था", "थी", 1)
+                if i > 0:
+                    _hi_feminize_chain(tokens, i - 1)
+        # Rule 3b: clause-final participle in a मैं clause with no auxiliary
+        # (negated present "मैं नहीं जानता", simple past "मैं थक गया").
+        if subj_mai and bare and not (set(bare) & (_HI_AM | _HI_WAS | {"थी"})):
+            last = max((j for j, b in enumerate(bare) if b), default=-1)
+            if last > 0 and bare[last] != "मैं":
+                lb = bare[last]
+                negated = "नहीं" in bare or "न" in bare
+                if lb in _HI_PAST_FINAL or (negated and lb.endswith("ता")):
+                    _hi_feminize_chain(tokens, last)
+        out.append(" ".join(tokens))
+    return "".join(out)
+
+
 # ── Types ────────────────────────────────────────────────────────────────────
 ProgressCallback = Callable[[str, float, str], None]
 
@@ -644,9 +913,14 @@ VOICE_POOL = {
         "female": ["en-US-JennyNeural", "en-US-AriaNeural", "en-US-SaraNeural"],
         "male":   ["en-US-GuyNeural", "en-US-ChristopherNeural", "en-US-EricNeural"],
     },
+    # Edge has only two native Hindi voices; extra same-gender speakers get
+    # Multilingual voices, which read Devanagari as intelligibly (Whisper
+    # word-match 85-88% vs Madhur 85% / Swara 79%). Ordered best-first.
     "hi": {
-        "female": ["hi-IN-SwaraNeural"],
-        "male":   ["hi-IN-MadhurNeural"],
+        "female": ["hi-IN-SwaraNeural", "en-US-EmmaMultilingualNeural",
+                   "de-DE-SeraphinaMultilingualNeural", "fr-FR-VivienneMultilingualNeural"],
+        "male":   ["hi-IN-MadhurNeural", "en-US-BrianMultilingualNeural",
+                   "en-AU-WilliamMultilingualNeural", "de-DE-FlorianMultilingualNeural"],
     },
     "es": {
         "female": ["es-ES-ElviraNeural", "es-MX-DaliaNeural"],
@@ -1013,6 +1287,13 @@ class Pipeline:
         self.video_title: str = ""
         self.qa_score: Optional[float] = None
         self._voice_map = None
+        self._speaker_speech_sec: Dict[str, float] = {}
+        self._speaker_ranges: Dict[str, List[tuple]] = {}
+        self._speaker_genders: Dict[str, str] = {}
+        # Shown on the job page: who spoke, detected gender, assigned voice;
+        # and a sticky warning when multi-speaker was requested but failed.
+        self.speaker_summary: List[Dict] = []
+        self.speaker_warning: Optional[str] = None
         self._whisper_audio = None  # Lightweight 16kHz mono audio for transcription
         self._has_nvenc: Optional[bool] = None  # Cached NVENC availability
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
@@ -1509,201 +1790,337 @@ class Pipeline:
     # ── Speaker Diarization ───────────────────────────────────────────────
 
     def _diarize(self, wav_path: Path) -> tuple:
-        """Run pyannote speaker diarization.
+        """Run speaker diarization + per-speaker gender in an isolated child.
         Returns (speaker_genders, speaker_ranges) or ({}, {}) on failure.
-        """
-        hf_token = os.environ.get("HF_TOKEN", "").strip()
-        if not hf_token:
-            self._report("transcribe", 0.85, "HF_TOKEN not set — skipping speaker diarization")
+
+        Speakers with under MIN_SPEAKER_SEC of speech (pyannote's spurious
+        clusters from laughter / music / crosstalk) are folded into the most
+        similar real speaker, so a stray 2-second "speaker" never gets its
+        own random voice."""
+        MIN_SPEAKER_SEC = 3.0
+        res = self._run_speaker_worker(wav_path)
+        if not res:
+            return {}, {}
+        ranges = {k: [tuple(r) for r in v] for k, v in res["ranges"].items()}
+        genders = dict(res.get("gender") or {})
+        embs = res.get("embeddings") or {}
+        if not ranges:
+            self.speaker_warning = "Multi-speaker: no speech turns found — the whole video used one voice"
+            self._report("transcribe", 0.97, self.speaker_warning)
             return {}, {}
 
-        try:
-            from pyannote.audio import Pipeline as PyannotePipeline
-        except ImportError:
-            self._report("transcribe", 0.85, "pyannote-audio not installed — skipping diarization")
-            return {}, {}
+        speech = {s: sum(e - b for b, e in rs) for s, rs in ranges.items()}
+        big = [s for s in ranges if speech[s] >= MIN_SPEAKER_SEC and s in genders]
+        small = [s for s in ranges if s not in big]
+        if big and small:
+            import numpy as _np
 
-        try:
-            self._report("transcribe", 0.82, "Loading speaker diarization model...")
-            diarize_pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
+            def _cos(a, b):
+                a, b = _np.asarray(a), _np.asarray(b)
+                return float(a @ b / (_np.linalg.norm(a) * _np.linalg.norm(b) + 1e-9))
 
-            # Move to GPU if available
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    diarize_pipeline.to(torch.device("cuda"))
-            except Exception:
-                pass
+            for s in small:
+                if s in embs and all(b in embs for b in big):
+                    target = max(big, key=lambda b: _cos(embs[s], embs[b]))
+                else:
+                    target = max(big, key=lambda b: speech[b])
+                ranges[target] = sorted(ranges[target] + ranges.pop(s))
+                speech[target] += speech.pop(s)
+                genders.pop(s, None)
+            self._report("transcribe", 0.97,
+                         f"Merged {len(small)} tiny speaker cluster(s) (<{MIN_SPEAKER_SEC:.0f}s) "
+                         f"into the closest real speaker")
+        for s in ranges:
+            genders.setdefault(s, self._default_voice_gender())
 
-            self._report("transcribe", 0.86, "Running speaker diarization...")
-            # Heartbeat: pyannote processes the entire audio in one blocking
-            # call with no progress hooks. On long videos this looks like a
-            # 5-15 minute freeze. Spawn a daemon thread that emits a _report
-            # tick every 10 seconds so the UI knows we're still alive.
-            import threading as _th
-            import time as _time
-            _heartbeat_stop = _th.Event()
-            def _heartbeat():
-                t0 = _time.time()
-                tick = 0
-                while not _heartbeat_stop.is_set():
-                    if _heartbeat_stop.wait(timeout=10.0):
-                        break
-                    tick += 1
-                    elapsed = int(_time.time() - t0)
-                    try:
-                        self._report("transcribe", 0.86,
-                                     f"Diarizing speakers... ({elapsed}s elapsed)")
-                    except Exception:
-                        pass
-            _hb_thread = _th.Thread(target=_heartbeat, daemon=True,
-                                    name="diarize-heartbeat")
-            _hb_thread.start()
-            try:
-                diarization = diarize_pipeline(str(wav_path))
-            finally:
-                _heartbeat_stop.set()
-
-            # Extract unique speakers and their time ranges
-            speaker_ranges: Dict[str, List[tuple]] = {}
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                if speaker not in speaker_ranges:
-                    speaker_ranges[speaker] = []
-                speaker_ranges[speaker].append((turn.start, turn.end))
-
-            if not speaker_ranges:
-                return {}, {}
-
-            self._report("transcribe", 0.92,
-                         f"Found {len(speaker_ranges)} speakers, detecting genders...")
-
-            # Detect gender via pitch analysis
-            speaker_genders = self._detect_speaker_genders(wav_path, speaker_ranges)
-            self._report("transcribe", 0.98,
-                         f"Speakers: {', '.join(f'{k}={v}' for k, v in speaker_genders.items())}")
-            return speaker_genders, speaker_ranges
-
-        except Exception as e:
-            self._report("transcribe", 0.85,
-                         f"Diarization failed ({e}) — using single voice")
-            return {}, {}
+        self._speaker_speech_sec = speech
+        self._report("transcribe", 0.98, "Speakers: " + ", ".join(
+            f"{s}={genders[s]} ({speech[s]:.0f}s)"
+            for s in sorted(ranges, key=lambda k: -speech[k])))
+        return genders, ranges
 
     def _detect_speaker_genders(self, wav_path: Path, speakers: Dict[str, List[tuple]]) -> Dict[str, str]:
-        """Detect gender per speaker using pitch (F0) analysis. Male < 165Hz, Female >= 165Hz.
-        Reads only needed time ranges to avoid OOM on long videos."""
-        import struct
+        """Gender per already-labelled speaker (e.g. speaker tags from an
+        uploaded SRT) — runs only the gender half of the speaker worker."""
+        res = self._run_speaker_worker(wav_path, given_ranges=speakers)
+        genders = dict((res or {}).get("gender") or {})
+        self._speaker_speech_sec = {s: sum(e - b for b, e in rs) for s, rs in speakers.items()}
+        for s in speakers:
+            genders.setdefault(s, self._default_voice_gender())
+        return genders
 
-        with wave.open(str(wav_path), "rb") as wf:
-            n_channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            sample_rate = wf.getframerate()
-            n_frames = wf.getnframes()
-            max_val = float(2 ** (8 * sample_width - 1))
-            fmt_char = "h" if sample_width == 2 else "i"
+    def _default_voice_gender(self) -> str:
+        """Gender of the job's selected voice — used for any speaker whose
+        gender couldn't be judged (under 1 s of usable audio)."""
+        pool = VOICE_POOL.get(self.cfg.target_language, {})
+        return "female" if self.cfg.tts_voice in pool.get("female", []) else "male"
 
-            result = {}
-            for speaker, time_ranges in speakers.items():
-                speaker_samples: list = []
-                for t_start, t_end in time_ranges[:10]:
-                    s_start = max(0, min(int(t_start * sample_rate), n_frames - 1))
-                    s_end = max(0, min(int(t_end * sample_rate), n_frames))
-                    count = s_end - s_start
-                    if count < 1:
-                        continue
-                    wf.setpos(s_start)
-                    raw = wf.readframes(count)
-                    try:
-                        chunk = struct.unpack(f"<{count * n_channels}{fmt_char}", raw)
-                    except struct.error:
-                        continue
-                    if n_channels > 1:
-                        chunk = chunk[::n_channels]
-                    speaker_samples.extend(s / max_val for s in chunk)
+    def _run_speaker_worker(self, wav_path: Path, given_ranges=None) -> Optional[Dict]:
+        """Spawn _diarize_child_worker; heartbeat every 10 s, honour cancel,
+        bound by a timeout. Returns the worker's result dict, or None after
+        reporting why (the job then continues with the single selected voice)."""
+        import multiprocessing as mp
+        import json as _json
+        import tempfile as _tmpmod
+        import time as _time
 
-                if len(speaker_samples) < sample_rate * 0.5:
-                    result[speaker] = "female"
-                    continue
+        what = "speaker genders" if given_ranges else "speakers"
+        hf_token = os.environ.get("HF_TOKEN", "").strip()
+        if not hf_token and not given_ranges:
+            self.speaker_warning = ("Multi-speaker skipped: HF_TOKEN is not set in backend/.env "
+                                    "— the whole video used one voice")
+            self._report("transcribe", 0.85, self.speaker_warning)
+            return None
 
-                pitch = self._estimate_pitch_autocorrelation(speaker_samples, sample_rate)
-                result[speaker] = "male" if pitch < 165 else "female"
+        try:
+            import torch as _torch_mod
+            device = "cuda" if _torch_mod.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+        try:
+            dur = self._get_duration(wav_path) or 600.0
+        except Exception:
+            dur = 600.0
+        # GPU diarizes ~40x realtime; CPU is far slower. First run also
+        # downloads ~1.5 GB of models.
+        timeout = int(min(3600, max(600, dur * (0.5 if device == "cuda" else 2.0))))
 
-        return result
+        fd, result_path = _tmpmod.mkstemp(suffix=".json", prefix="diarize_result_")
+        os.close(fd)
+        p = None
+        try:
+            self._report("transcribe", 0.82,
+                         f"Detecting {what} on {device.upper()} (isolated process)...")
+            p = mp.Process(target=_diarize_child_worker,
+                           args=(str(wav_path), hf_token, device, result_path, given_ranges),
+                           daemon=True)
+            p.start()
+            t0 = _time.time()
+            next_beat = t0 + 10.0
+            while p.is_alive():
+                p.join(1.0)
+                if self._cancel_check():
+                    p.kill()
+                    p.join(5)
+                    self._check_cancelled()
+                now = _time.time()
+                if now - t0 > timeout:
+                    p.kill()
+                    p.join(5)
+                    raise RuntimeError(f"timed out after {timeout}s")
+                if now >= next_beat:
+                    next_beat = now + 10.0
+                    self._report("transcribe", 0.86,
+                                 f"Detecting {what}... ({int(now - t0)}s elapsed)")
+            data = {}
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+            except Exception:
+                pass
+            # A complete result is trusted whatever the exit code — the
+            # child writes it before exiting, so a crash after that point
+            # can't have corrupted it.
+            if data.get("error") is None and "ranges" in data:
+                return data
+            if data.get("error"):
+                raise RuntimeError(data["error"])
+            stage = ""
+            try:
+                stage = Path(result_path + ".stage").read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+            raise RuntimeError(f"child crashed (exit {p.exitcode:#x})"
+                               + (f" during '{stage}'" if stage else ""))
+        except RuntimeError as e:
+            if "cancelled" in str(e).lower():
+                raise
+            self.speaker_warning = (f"Multi-speaker failed ({str(e)[:160]}) "
+                                    f"— the whole video used one voice")
+            self._report("transcribe", 0.97, self.speaker_warning)
+            return None
+        finally:
+            for _f in (result_path, result_path + ".stage"):
+                try:
+                    Path(_f).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    def _estimate_pitch_autocorrelation(self, samples: list, sample_rate: int) -> float:
-        """Lightweight autocorrelation pitch estimator. Returns average F0 in Hz."""
-        window_size = int(0.03 * sample_rate)  # 30ms windows
-        hop = window_size // 2
-        min_lag = int(sample_rate / 350)  # Max 350Hz
-        max_lag = int(sample_rate / 60)   # Min 60Hz
+    def _assign_speaker_to_segments(self, segments: List[Dict],
+                                    diarization_speakers: Dict[str, List[tuple]]) -> List[Dict]:
+        """Stamp speaker_id on every segment; returns the (possibly longer) list.
 
-        pitches = []
-        for start in range(0, len(samples) - window_size, hop * 4):  # Skip windows for speed
-            window = samples[start:start + window_size]
-            # Simple energy check — skip silence
-            energy = sum(s * s for s in window) / len(window)
-            if energy < 0.001:
+        With word timings (WhisperX / local Whisper), each word takes the
+        speaker whose turn contains its midpoint, and a segment that spans a
+        speaker change is SPLIT there — otherwise the second person's words
+        would be voiced by the first. Runs shorter than MIN_RUN_WORDS are
+        absorbed into their neighbour (diarization boundaries jitter by a
+        word or two). Without words, the whole segment goes to the speaker
+        with the most overlap. Anything outside every turn (music, crosstalk)
+        takes the nearest turn's speaker."""
+        MIN_RUN_WORDS = 3
+        turns = sorted((float(a), float(b), spk)
+                       for spk, rs in diarization_speakers.items() for a, b in rs)
+        if not turns:
+            return segments
+
+        def _nearest(t0: float, t1: float) -> str:
+            return min(turns, key=lambda tr: max(tr[0] - t1, t0 - tr[1], 0.0))[2]
+
+        def _by_overlap(t0: float, t1: float) -> str:
+            ov: Dict[str, float] = {}
+            for a, b, spk in turns:
+                if b > t0 and a < t1:
+                    ov[spk] = ov.get(spk, 0.0) + min(b, t1) - max(a, t0)
+            return max(ov, key=ov.get) if ov else _nearest(t0, t1)
+
+        out: List[Dict] = []
+        n_split = 0
+        for seg in segments:
+            words = [w for w in (seg.get("words") or [])
+                     if w.get("start") is not None and w.get("end") is not None
+                     and str(w.get("word", "")).strip()]
+            if len(words) < 2 * MIN_RUN_WORDS:
+                seg["speaker_id"] = _by_overlap(seg["start"], seg["end"])
+                out.append(seg)
                 continue
 
-            # Autocorrelation for pitch detection
-            best_lag = min_lag
-            best_corr = -1.0
-            for lag in range(min_lag, min(max_lag, len(window))):
-                corr = 0.0
-                for j in range(len(window) - lag):
-                    corr += window[j] * window[j + lag]
-                corr /= (len(window) - lag)
-                if corr > best_corr:
-                    best_corr = corr
-                    best_lag = lag
+            # Runs of consecutive words with the same speaker.
+            runs: List[List] = []
+            for w in words:
+                spk = _by_overlap(float(w["start"]), float(w["end"]))
+                if runs and runs[-1][0] == spk:
+                    runs[-1][1].append(w)
+                else:
+                    runs.append([spk, [w]])
+            # Absorb short runs (jitter) into the previous run, or the next
+            # one when it's the first run; re-join neighbours that now match.
+            changed = True
+            while changed and len(runs) > 1:
+                changed = False
+                for k, (spk, ws) in enumerate(runs):
+                    if len(ws) < MIN_RUN_WORDS:
+                        if k > 0:
+                            runs[k - 1][1].extend(ws)
+                        else:
+                            runs[1][1][:0] = ws
+                        del runs[k]
+                        changed = True
+                        break
+                merged_runs: List[List] = []
+                for spk, ws in runs:
+                    if merged_runs and merged_runs[-1][0] == spk:
+                        merged_runs[-1][1].extend(ws)
+                    else:
+                        merged_runs.append([spk, ws])
+                runs = merged_runs
 
-            if best_corr > energy * 0.3:  # Confidence threshold
-                pitches.append(sample_rate / best_lag)
+            if len(runs) == 1:
+                seg["speaker_id"] = runs[0][0]
+                out.append(seg)
+                continue
 
-        if not pitches:
-            return 200.0  # Default to ambiguous range
+            # Diarization boundaries land a word or two off; real turns
+            # change at a sentence end. Snap each cut to the nearest word
+            # ending in . ? ! within MIN_RUN_WORDS words, if there is one.
+            labels = [spk for spk, ws in runs for _ in ws]
+            flat = [w for _, ws in runs for w in ws]
+            cut, b = [], 0
+            for _, ws in runs[:-1]:
+                b += len(ws)
+                cands = [j for j in range(b - MIN_RUN_WORDS, b + MIN_RUN_WORDS + 1)
+                         if 0 < j < len(flat)
+                         and str(flat[j - 1]["word"]).strip()[-1:] in ".?!"]
+                j = min(cands, key=lambda j: abs(j - b)) if cands else b
+                cut.append(max(j, cut[-1]) if cut else j)  # keep cuts in order
+            bounds = [0] + cut + [len(flat)]
+            runs = []
+            for k in range(len(bounds) - 1):
+                ws = flat[bounds[k]:bounds[k + 1]]
+                if not ws:
+                    continue
+                piece_labels = labels[bounds[k]:bounds[k + 1]]
+                # Majority speaker of the snapped piece (first-seen wins ties).
+                spk = max(dict.fromkeys(piece_labels), key=piece_labels.count)
+                if runs and runs[-1][0] == spk:
+                    runs[-1][1].extend(ws)
+                else:
+                    runs.append([spk, ws])
+            if len(runs) == 1:
+                seg["speaker_id"] = runs[0][0]
+                out.append(seg)
+                continue
 
-        # Return median pitch
-        pitches.sort()
-        return pitches[len(pitches) // 2]
+            # Split at each speaker change; pieces stay contiguous (the cut
+            # sits midway between the two words) and cover the original span.
+            n_split += 1
+            for k, (spk, ws) in enumerate(runs):
+                piece = dict(seg)
+                piece["words"] = ws
+                piece["text"] = " ".join(str(w["word"]).strip() for w in ws)
+                piece["speaker_id"] = spk
+                piece["start"] = (seg["start"] if k == 0 else
+                                  (float(runs[k - 1][1][-1]["end"]) + float(ws[0]["start"])) / 2)
+                piece["end"] = (seg["end"] if k == len(runs) - 1 else
+                                (float(ws[-1]["end"]) + float(runs[k + 1][1][0]["start"])) / 2)
+                out.append(piece)
+        if n_split:
+            self._report("transcribe", 0.985,
+                         f"Split {n_split} segment(s) at a mid-sentence speaker change")
+        return out
 
-    def _assign_speaker_to_segments(self, segments: List[Dict], diarization_speakers: Dict[str, List[tuple]]):
-        """Assign speaker labels to transcription segments by max temporal overlap."""
+    def _build_speaker_summary(self, genders: Dict[str, str]) -> None:
+        """Fill self.speaker_summary (most-talkative first) for the job page."""
+        speech = getattr(self, "_speaker_speech_sec", None) or {}
+        self.speaker_summary = [
+            {"speaker": spk, "gender": genders.get(spk, ""),
+             "voice": (self._voice_map or {}).get(spk, self.cfg.tts_voice),
+             "seconds": round(float(speech.get(spk, 0.0)), 1)}
+            for spk in sorted(genders, key=lambda k: (-speech.get(k, 0.0), k))
+        ]
+
+    def _apply_speaker_gender_grammar(self, segments: List[Dict]) -> None:
+        """Female speakers' Hindi: masculine first-person agreement → feminine
+        (see feminize_first_person_hi). Runs after every translation pass;
+        a no-op unless multi-speaker found a female speaker."""
+        if self.cfg.target_language.split("-")[0] != "hi":
+            return
+        female = {s for s, g in (getattr(self, "_speaker_genders", None) or {}).items()
+                  if g == "female"}
+        if not female:
+            return
+        changed = 0
         for seg in segments:
-            seg_start = seg["start"]
-            seg_end = seg["end"]
-            best_speaker = None
-            best_overlap = 0.0
-
-            for speaker, time_ranges in diarization_speakers.items():
-                overlap = 0.0
-                for t_start, t_end in time_ranges:
-                    ov_start = max(seg_start, t_start)
-                    ov_end = min(seg_end, t_end)
-                    if ov_end > ov_start:
-                        overlap += ov_end - ov_start
-
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = speaker
-
-            seg["speaker_id"] = best_speaker or "SPEAKER_00"
+            if seg.get("speaker_id") in female and seg.get("text_translated"):
+                new = feminize_first_person_hi(seg["text_translated"])
+                if new != seg["text_translated"]:
+                    seg["text_translated"] = new
+                    changed += 1
+        if changed:
+            self._report("translate", 0.97,
+                         f"Female-speaker grammar: {changed} line(s) set to feminine first person")
 
     def _assign_voices_to_speakers(self, speaker_genders: Dict[str, str]) -> Dict[str, str]:
-        """Map each speaker to a distinct Edge-TTS voice from VOICE_POOL."""
+        """Map each speaker to a distinct voice from VOICE_POOL. Speakers are
+        taken in order of how much they talk, so the main speaker of each
+        gender gets that gender's primary voice (the job's selected voice
+        when it is in the pool)."""
         lang = self.cfg.target_language
         pool = VOICE_POOL.get(lang, {})
         female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
         male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
+        for voices in (female_voices, male_voices):
+            if self.cfg.tts_voice in voices:
+                voices.remove(self.cfg.tts_voice)
+                voices.insert(0, self.cfg.tts_voice)
 
+        speech = getattr(self, "_speaker_speech_sec", None) or {}
         voice_map = {}
         female_idx = 0
         male_idx = 0
 
-        for speaker, gender in sorted(speaker_genders.items()):
-            if gender == "male":
+        for speaker in sorted(speaker_genders, key=lambda s: (-speech.get(s, 0.0), s)):
+            if speaker_genders[speaker] == "male":
                 voice_map[speaker] = male_voices[male_idx % len(male_voices)]
                 male_idx += 1
             else:
@@ -1919,14 +2336,22 @@ class Pipeline:
         # Multi-speaker diarization (runs within "transcribe" step progress 82-98%)
         self._voice_map = None
         if self.cfg.multi_speaker:
-            speaker_genders, speaker_ranges = self._diarize(audio_raw)
+            # 16 kHz mono (what pyannote/wav2vec2 use) — 6x less RAM than the
+            # 48 kHz stereo audio_raw on long videos.
+            speaker_genders, speaker_ranges = self._diarize(self._whisper_audio or audio_raw)
             if speaker_genders and speaker_ranges:
-                self._assign_speaker_to_segments(text_segments, speaker_ranges)
+                text_segments = self._assign_speaker_to_segments(text_segments, speaker_ranges)
+                self._speaker_ranges = speaker_ranges
+                self._speaker_genders = speaker_genders
                 self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                self._build_speaker_summary(speaker_genders)
                 if self.cfg.use_coqui_xtts:
                     self._save_speaker_refs(audio_raw, text_segments)
                 self._report("transcribe", 0.99,
-                             f"Assigned {len(self._voice_map)} distinct voices")
+                             f"{len(self._voice_map)} speakers → {len(set(self._voice_map.values()))} "
+                             f"distinct voices: " + ", ".join(
+                                 f"{d['speaker']}={d['gender']}/{d['voice'].split('-')[-1].replace('Neural', '')}"
+                                 for d in self.speaker_summary))
 
         # Transcribe-only mode: save source SRT, extract per-speaker refs, and stop
         if self.cfg.transcribe_only:
@@ -2031,6 +2456,10 @@ class Pipeline:
                 self._glossary_mask(ref_copy)
                 self._translate_segments(ref_copy)
                 self._glossary_unmask(ref_copy)
+                if self._voice_map and getattr(self, "_speaker_ranges", None):
+                    # Reference subs carry no speaker_id — re-stamp them so
+                    # the dub keeps each speaker's voice.
+                    ref_copy = self._assign_speaker_to_segments(ref_copy, self._speaker_ranges)
                 self.segments = ref_copy
                 text_segments = ref_copy
                 # Re-run QA against original English subs
@@ -2471,40 +2900,6 @@ class Pipeline:
 
         self.segments = translated
 
-        # Check for speaker labels from SRT and rebuild voice map
-        speakers_found = set(s.get("speaker_id") for s in translated if s.get("speaker_id"))
-        if speakers_found and self.cfg.multi_speaker:
-            self._report("translate", 0.5,
-                         f"Found {len(speakers_found)} speakers in SRT, assigning voices...")
-            # Re-run gender detection from original audio if available
-            audio_raw = self.cfg.work_dir / "audio_raw.wav"
-            if audio_raw.exists():
-                speaker_ranges = {}
-                for seg in translated:
-                    spk = seg.get("speaker_id")
-                    if spk:
-                        if spk not in speaker_ranges:
-                            speaker_ranges[spk] = []
-                        speaker_ranges[spk].append((seg["start"], seg["end"]))
-                speaker_genders = self._detect_speaker_genders(audio_raw, speaker_ranges)
-                self._voice_map = self._assign_voices_to_speakers(speaker_genders)
-                self._report("translate", 0.8,
-                             f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
-            else:
-                # No audio for gender detection — alternate male/female
-                self._voice_map = {}
-                lang = self.cfg.target_language
-                pool = VOICE_POOL.get(lang, {})
-                female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
-                male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
-                for i, spk in enumerate(sorted(speakers_found)):
-                    if i % 2 == 0:
-                        self._voice_map[spk] = female_voices[i // 2 % len(female_voices)]
-                    else:
-                        self._voice_map[spk] = male_voices[i // 2 % len(male_voices)]
-        else:
-            self._voice_map = None
-
         self._report("translate", 1.0, f"Loaded {len(translated)} translated segments")
 
         # Find existing video and audio from first run
@@ -2524,6 +2919,27 @@ class Pipeline:
         if not audio_raw.exists():
             self._report("extract", 0.0, "Re-extracting audio...")
             audio_raw = self._extract_audio(video_path)
+
+        # [SPEAKER_xx] labels in the SRT → one voice per speaker, whatever the
+        # Multi-Speaker toggle says (it's hidden in SRT mode, and labels are an
+        # explicit request). Gender comes from each speaker's lines in the
+        # original audio — which is why this runs after the audio exists.
+        speakers_found = set(s.get("speaker_id") for s in translated if s.get("speaker_id"))
+        self._voice_map = None
+        if speakers_found:
+            self._report("translate", 0.5,
+                         f"Found {len(speakers_found)} speakers in SRT, detecting genders...")
+            speaker_ranges: Dict[str, List[tuple]] = {}
+            for seg in translated:
+                if seg.get("speaker_id"):
+                    speaker_ranges.setdefault(seg["speaker_id"], []).append((seg["start"], seg["end"]))
+            _wav16 = self.cfg.work_dir / "audio_16k.wav"
+            speaker_genders = self._detect_speaker_genders(
+                _wav16 if _wav16.exists() else audio_raw, speaker_ranges)
+            self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+            self._build_speaker_summary(speaker_genders)
+            self._report("translate", 0.8,
+                         f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
 
         # Write the translated SRT to standard location
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
@@ -3724,6 +4140,12 @@ class Pipeline:
                     i += 1
                     continue
 
+                # Never join two different speakers (multi-speaker): the
+                # merged segment keeps ONE speaker_id, so the second
+                # person's words would be spoken in the first one's voice.
+                if next_seg.get("speaker_id") != current.get("speaker_id"):
+                    break
+
                 # Check gap between segments
                 gap = next_seg.get("start", 0) - current.get("end", 0)
                 if gap > MAX_GAP:
@@ -4350,7 +4772,7 @@ class Pipeline:
             self._report("translate", 0.25, "Using Gemini for translation...")
             translated_text = self._translate_with_gemini(full_text, gemini_key, speech_duration)
         elif engine == "groq" and groq_key:
-            self._report("translate", 0.25, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.25, "Using Groq (gpt-oss-120b) for translation...")
             translated_text = self._translate_with_groq(full_text, groq_key, speech_duration)
         elif engine == "ollama" and self._ollama_available():
             self._report("translate", 0.25, "Using Ollama (local LLM) for translation...")
@@ -4362,7 +4784,7 @@ class Pipeline:
         elif gemini_key:
             translated_text = self._translate_with_gemini(full_text, gemini_key, speech_duration)
         elif groq_key:
-            self._report("translate", 0.25, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.25, "Using Groq (gpt-oss-120b) for translation...")
             translated_text = self._translate_with_groq(full_text, groq_key, speech_duration)
         elif self._ollama_available():
             self._report("translate", 0.25, "Using Ollama (local LLM) for translation...")
@@ -4425,7 +4847,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-pro",
+                        model=GEMINI_LLM_MODEL,
                         contents=prompt,
                     )
                     translated_parts.append((response.text or "").strip())
@@ -4567,7 +4989,7 @@ class Pipeline:
 
 
     def _translate_with_groq(self, full_text: str, api_key: str, speech_duration: float = 0) -> str:
-        """Translate using Groq (Llama 3.3 70B) for natural, fluent output."""
+        """Translate using Groq (gpt-oss-120b) for natural, fluent output."""
         import requests as _requests
 
         target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
@@ -4603,7 +5025,7 @@ class Pipeline:
                     resp = _requests.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}]},
+                        json={"model": GROQ_LLM_MODEL, "messages": [{"role": "user", "content": prompt}]},
                         timeout=60,
                     )
                     data = resp.json()
@@ -5329,6 +5751,10 @@ class Pipeline:
             if prev_ends_with_terminal:
                 i += 1
                 continue
+            # Different speakers are never one sentence (multi-speaker).
+            if segments[i].get("speaker_id") != segments[i - 1].get("speaker_id"):
+                i += 1
+                continue
 
             first_word = text.split()[0] if text else ""
             word_count = len(text.split())
@@ -5382,6 +5808,9 @@ class Pipeline:
                           f"may contain placeholder tokens like __KEEP_SUBJ_0__",
                           flush=True)
 
+        # Hindi verbs agree with the speaker's gender; MT defaults to masculine.
+        self._apply_speaker_gender_grammar(segments)
+
     def _dispatch_translation_engine(self, segments):
         """Engine-routing helper extracted from _translate_segments.
 
@@ -5416,7 +5845,7 @@ class Pipeline:
             self._translate_segments_sambanova(segments, sambanova_key)
             return
         elif engine == "groq" and groq_key:
-            self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.05, "Using Groq (gpt-oss-120b) for translation...")
             self._translate_segments_groq(segments, groq_key)
             return
         elif engine == "gemma4" and gemini_key:
@@ -5515,7 +5944,7 @@ class Pipeline:
             self._report("translate", 0.05, "Using GPT-4o for premium translation...")
             self._translate_segments_openai(segments, openai_key)
         elif groq_key:
-            self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.05, "Using Groq (gpt-oss-120b) for translation...")
             self._translate_segments_groq(segments, groq_key)
         elif sambanova_key:
             self._report("translate", 0.05, "Using SambaNova (Llama 3.3 70B) for translation...")
@@ -5561,7 +5990,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-pro", contents=prompt)
+                        model=GEMINI_LLM_MODEL, contents=prompt)
                     translations = self._parse_numbered_translations(response.text, len(batch))
                     for i, seg in enumerate(batch):
                         seg["text_translated"] = translations[i] if translations[i] else seg["text"]
@@ -5716,7 +6145,7 @@ class Pipeline:
                              f"Translated batch {completed[0]}/{total_batches} (Gemma 4 parallel)")
 
     def _translate_segments_groq(self, segments, api_key):
-        """Translate segments using Groq (Llama 3.3 70B) — fast, free, context-aware."""
+        """Translate segments using Groq (gpt-oss-120b) — fast, free, context-aware."""
         from groq import Groq
         client = Groq(api_key=api_key)
 
@@ -5737,7 +6166,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model=GROQ_LLM_MODEL,
                         messages=[
                             {"role": "system", "content": system_msg},
                             {"role": "user", "content": user_msg},
@@ -5804,7 +6233,7 @@ class Pipeline:
 
     # Engine configs for OpenAI-compatible APIs (all using Llama 3.3 70B)
     TURBO_ENGINE_CONFIG = {
-        "Groq": ("https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
+        "Groq": ("https://api.groq.com/openai/v1/chat/completions", GROQ_LLM_MODEL),
         "SambaNova": ("https://api.sambanova.ai/v1/chat/completions", "Meta-Llama-3.3-70B-Instruct"),
     }
 
@@ -6257,27 +6686,38 @@ class Pipeline:
                     or "that's an error" in low or "<html" in low
                     or "<!doctype" in low)
 
+        failed = []            # segments left in the source language
+        rate_limited = [False]
+
         def translate_one(idx_seg):
+            import time
             idx, seg = idx_seg
-            retries = 3
+            retries = 4
             for attempt in range(retries):
                 try:
                     translator = GoogleTranslator(source=src, target=self.cfg.target_language)
                     result = translator.translate(seg["text"])
                     if _is_garbage(result):
                         if attempt < retries - 1:
-                            import time; time.sleep(1.5 * (attempt + 1))
+                            time.sleep(1.5 * (attempt + 1))
                             continue
                         # All retries returned garbage — keep original
                         seg["text_translated"] = seg["text"]
+                        failed.append(idx)
                     else:
                         seg["text_translated"] = result or seg["text"]
                     break
-                except Exception:
+                except Exception as e:
+                    # Google answers bursts with "Too many requests" (429); a
+                    # 1.5 s retry just hits the same wall, so back off longer.
+                    too_many = "too many requests" in str(e).lower() or "TooManyRequests" in type(e).__name__
+                    if too_many:
+                        rate_limited[0] = True
                     if attempt < retries - 1:
-                        import time; time.sleep(1.5 * (attempt + 1))
+                        time.sleep((5, 15, 30)[attempt] if too_many else 1.5 * (attempt + 1))
                     else:
                         seg["text_translated"] = seg["text"]
+                        failed.append(idx)
             return idx
 
         # 20 parallel workers — Google Translate handles this fine
@@ -6289,6 +6729,17 @@ class Pipeline:
                     self._report("translate", 0.05 + 0.90 * (completed[0] / total),
                                  f"Google Translate: {completed[0]}/{total}")
 
+        # Untranslated lines would be voiced in English by the Hindi voice and
+        # the job would still say "Complete" — fail loudly instead.
+        if failed and len(failed) > max(2, 0.05 * total):
+            why = ("Google is rate-limiting this PC ('Too many requests')" if rate_limited[0]
+                   else "Google returned errors")
+            raise RuntimeError(
+                f"Google Translate failed for {len(failed)}/{total} segments — {why}. "
+                f"Wait 30-60 min and retry, or pick another Translation engine (Groq/Gemini) in Settings.")
+        if failed:
+            self._report("translate", 0.97,
+                         f"Google Translate: {len(failed)} segment(s) left untranslated after retries")
         self._report("translate", 1.0, f"Google Translate complete: {total} segments")
 
     def _translate_segments_google_polish(self, segments):
@@ -6411,7 +6862,7 @@ class Pipeline:
                         from google import genai
                         client = genai.Client(api_key=key)
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash-preview-05-20",
+                            model=GEMINI_LLM_MODEL,
                             contents=polish_system + "\n\n" + user_msg)
                         polished = self._parse_numbered_translations(response.text, len(batch))
                     except Exception:
@@ -6597,7 +7048,7 @@ class Pipeline:
                             from google import genai
                             client = genai.Client(api_key=key)
                             r = client.models.generate_content(
-                                model="gemini-2.5-flash-preview-05-20",
+                                model=GEMINI_LLM_MODEL,
                                 contents=polish_system + "\n\n" + user_msg)
                             return self._parse_numbered_translations(r.text, len(batch))
                         except Exception:
@@ -9468,7 +9919,7 @@ class Pipeline:
                         json={
                             "text": text,
                             "target_language_code": lang_code,
-                            "speaker": speaker,
+                            "speaker": self._sarvam_speaker_for_seg(seg),
                             "model": "bulbul:v3",
                             "pace": 1.0,
                             "temperature": 0.6,
@@ -9613,7 +10064,7 @@ class Pipeline:
                         json={
                             "text": text,
                             "target_language_code": lang_code,
-                            "speaker": speaker,
+                            "speaker": self._sarvam_speaker_for_seg(seg),
                             "model": "bulbul:v3",
                             "pace": 1.0,
                             "temperature": 0.6,
@@ -10258,11 +10709,27 @@ class Pipeline:
         except Exception:
             pass
 
-    def _sarvam_tts_single_mp3(self, text: str, mp3_path) -> bool:
+    # Sarvam Bulbul v3 speaker per gender, so a rescued line keeps the
+    # speaker's gender (valid names from the API's speaker list).
+    SARVAM_SPEAKER_MALE = "shubh"
+    SARVAM_SPEAKER_FEMALE = "priya"
+
+    def _sarvam_speaker_for(self, voice: Optional[str]) -> str:
+        """Sarvam speaker matching the gender of an Edge voice name."""
+        female = VOICE_POOL.get(self.cfg.target_language, {}).get("female", [])
+        return self.SARVAM_SPEAKER_FEMALE if voice in female else self.SARVAM_SPEAKER_MALE
+
+    def _sarvam_speaker_for_seg(self, seg: Dict) -> str:
+        voice = (self._voice_map or {}).get(seg.get("speaker_id"), self.cfg.tts_voice)
+        return self._sarvam_speaker_for(voice)
+
+    def _sarvam_tts_single_mp3(self, text: str, mp3_path, voice: Optional[str] = None) -> bool:
         """Synthesize a single segment via Sarvam Bulbul v3 → MP3.
 
-        Returns True if the file was written successfully, False otherwise.
-        Uses API key rotation with auto-failover on quota errors.
+        voice: the Edge voice this segment should have had; picks a Sarvam
+        speaker of the same gender. Returns True if the file was written
+        successfully, False otherwise. Uses API key rotation with
+        auto-failover on quota errors.
         """
         import requests as _requests
         import base64
@@ -10301,7 +10768,7 @@ class Pipeline:
                     json={
                         "text": text,
                         "target_language_code": lang_code,
-                        "speaker": "shubh",
+                        "speaker": self._sarvam_speaker_for(voice or self.cfg.tts_voice),
                         "model": "bulbul:v3",
                         "pace": 1.0,
                         "temperature": 0.6,
@@ -10807,7 +11274,9 @@ class Pipeline:
                 if not raw_text:
                     return None
                 text = self._prepare_tts_text(raw_text)
-                voice = self.cfg.tts_voice  # still Madhur — consistent voice
+                # Same voice as pass 1 — the speaker's mapped voice in
+                # multi-speaker jobs, else the job voice.
+                voice = (self._voice_map or {}).get(seg.get("speaker_id"), self.cfg.tts_voice)
                 rate = self.cfg.tts_rate
                 retry_dir = self.cfg.work_dir / "tts_word_verify_retry"
                 retry_dir.mkdir(exist_ok=True)
@@ -11091,6 +11560,13 @@ class Pipeline:
             retried_total = 0
 
             for ord_, idx in enumerate(mismatched_indices):
+                self._check_cancelled()
+                # Each segment can take up to 4 Edge calls + Whisper passes;
+                # report per segment so the UI never sits frozen at 93%.
+                self._report("synthesize",
+                             0.93 + 0.05 * ord_ / max(1, len(mismatched_indices)),
+                             f"Word verification: retry {ord_ + 1}/{len(mismatched_indices)} "
+                             f"(recovered {recovered})")
                 tts = tts_data[idx]
                 seg_idx = tts.get("_seg_idx", idx)
                 if not (0 <= seg_idx < len(segments)):
@@ -12006,6 +12482,14 @@ class Pipeline:
             self._report("synthesize", 0.05,
                          "Tempo Match ON — pass-1 at natural rate "
                          "(per-segment fit after synthesis)")
+        elif rate_mode == "auto" and getattr(self, "_auto_rate_locked", False):
+            # Auto rate is a per-JOB decision made on the first full pass.
+            # Retry passes call _tts_edge with only the failed segments;
+            # recomputing from that tiny word count against the full source
+            # duration clamps to -50% (half-speed speech) and would overwrite
+            # the job's rate for every later retry.
+            print(f"[RATE-AUTO] Reusing job rate {self.cfg.tts_rate} for "
+                  f"{len(segments)}-segment retry pass", flush=True)
         elif rate_mode == "auto":
             source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
             # dub_duration clips the OUTPUT to the first N minutes, so the
@@ -12043,6 +12527,7 @@ class Pipeline:
                          f"Auto rate: {auto_rate} (calibrated {calibrated_wpm:.0f} WPM, "
                          f"matches {source_dur:.0f}s source, {total_words} words)")
             self.cfg.tts_rate = auto_rate
+            self._auto_rate_locked = True
         else:
             print(f"[RATE-AUTO] Mode=manual — using user rate "
                   f"{self.cfg.tts_rate} as-is", flush=True)
@@ -12263,7 +12748,7 @@ class Pipeline:
 
                 # ── Sarvam Bulbul v3 fallback (no more Edge retries) ──
                 if _sarvam_fallback_available:
-                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3)
+                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3, voice=seg_voice)
                     if sarvam_ok:
                         _sarvam_fallback_count[0] += 1
                         if _sarvam_fallback_count[0] <= 10:
@@ -12388,7 +12873,8 @@ class Pipeline:
 
                 rescued = False
                 if _sarvam_fallback_available:
-                    rescued = self._sarvam_tts_single_mp3(text, mp3)
+                    rescued = self._sarvam_tts_single_mp3(
+                        text, mp3, voice=(voice_map or {}).get(seg.get("speaker_id"), default_voice))
                     if rescued:
                         sarvam_rescued += 1
 

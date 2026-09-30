@@ -246,6 +246,39 @@ export default function JobPage() {
                     </div>
                 )}
 
+                {/* Multi-speaker outcome: who spoke, detected gender, Hindi voice */}
+                {status?.speaker_warning && (
+                    <div className="glass-card p-4 border border-amber-500/30">
+                        <p className="text-sm font-medium text-amber-400">Multi-speaker did not run</p>
+                        <p className="text-xs text-text-muted mt-1">{status.speaker_warning}</p>
+                    </div>
+                )}
+                {status?.speakers && status.speakers.length > 0 && (
+                    <div className="glass-card p-4">
+                        <p className="text-sm font-medium text-text-primary mb-2">
+                            Speakers ({new Set(status.speakers.map((s) => s.voice)).size} voices)
+                        </p>
+                        <div className="space-y-1.5">
+                            {status.speakers.map((s, i) => (
+                                <div key={`${s.part ?? 0}-${s.speaker}-${i}`} className="flex items-center justify-between text-xs">
+                                    <div className="flex items-center gap-2">
+                                        <span className={`px-1.5 py-0.5 rounded font-medium ${s.gender === 'female' ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'}`}>
+                                            {s.gender === 'female' ? 'F' : 'M'}
+                                        </span>
+                                        <span className="text-text-secondary">
+                                            {s.part != null ? `Part ${s.part} · ` : ''}{s.speaker}
+                                        </span>
+                                        <span className="text-text-muted">{Math.round(s.seconds)}s</span>
+                                    </div>
+                                    <span className="text-text-primary">
+                                        {s.voice.split('-').pop()?.replace('Neural', '')}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
                 {/* QA Score Badge */}
                 {status?.qa_score != null && (
                     <div className="glass-card p-4">

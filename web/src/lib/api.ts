@@ -199,6 +199,9 @@ export interface JobStatus {
     saved_video?: string | null;
     description?: string | null;
     qa_score?: number | null;
+    // Multi-speaker outcome (per part in split jobs) + sticky failure warning
+    speakers?: { speaker: string; gender: string; voice: string; seconds: number; part?: number }[];
+    speaker_warning?: string | null;
     chain_languages?: string[];
     chain_parent_id?: string | null;
     // TTS budget metrics — populated after _pretts_word_budget runs
