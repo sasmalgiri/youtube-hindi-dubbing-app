@@ -20,6 +20,23 @@ The result is a dubbed MP4, a Hindi audio track, and subtitle files — all down
 
 ---
 
+## Hindi Dialogue profile (multi-speaker)
+
+For videos with conversation, choose the **Hindi Dialogue** mode in the UI, or run
+`cd backend && python -m dubbing.dialogue dub <link-or-file>`. It works as follows:
+
+- **Speakers:** each speaker is detected from the audio and keeps one voice throughout.
+- **Translation:** dialogue is translated with context, turn by turn.
+- **Timing:** the video keeps its original speed.
+- **Honest result:** every job ends with a `report.md` and one of these statuses: `completed`,
+  `completed_with_warnings` or `draft_incomplete`.
+
+Setup, the doctor/preflight check, options and troubleshooting are in
+[docs/dialogue/README.md](docs/dialogue/README.md). The requirement matrix, including which checks
+were not run, is in [docs/dialogue/requirements_matrix.md](docs/dialogue/requirements_matrix.md).
+
+---
+
 ## Highlights
 
 - **Four pipeline modes** — switchable from the UI (fast / balanced / high-fidelity / studio), each trading speed against accuracy of lip-timing and prosody.

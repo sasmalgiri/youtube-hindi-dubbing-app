@@ -47,8 +47,6 @@ export interface BatchSettings {
     post_tts_level?: string;
     audio_bitrate?: string;
     encode_preset?: string;
-    prefer_youtube_subs?: boolean;
-    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     fast_assemble?: boolean;
@@ -252,8 +250,6 @@ export function useBatchManager(): UseBatchManagerReturn {
                     post_tts_level: settings.post_tts_level,
                     audio_bitrate: settings.audio_bitrate,
                     encode_preset: settings.encode_preset,
-                    prefer_youtube_subs: settings.prefer_youtube_subs,
-                    use_yt_translate: settings.use_yt_translate,
                     multi_speaker: settings.multi_speaker,
                     transcribe_only: settings.transcribe_only,
                     fast_assemble: settings.fast_assemble,

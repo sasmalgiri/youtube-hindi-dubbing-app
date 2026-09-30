@@ -63,6 +63,13 @@ def _hardened_cuda_cleanup():
         pass
 
 
+# ── Hosted LLM model IDs (translation) ──
+# Providers retire models: llama-3.3-70b-versatile (Groq) and gemini-2.5-*
+# (Gemini) started returning 404 in Sept 2026. Change them here only.
+GROQ_LLM_MODEL = "openai/gpt-oss-120b"
+GEMINI_LLM_MODEL = "gemini-3.5-flash"
+
+
 # ── Subprocess worker for local Whisper transcription ────────────────────────
 # Runs in a child process so that C-level crashes (SIGABRT, CUDA OOM that
 # bypasses Python try/except) only kill the child — the server stays alive.
@@ -71,6 +78,25 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
     """Top-level function for multiprocessing — must be picklable."""
     import json as _json
     try:
+        # Expose torch's bundled cuDNN/cuBLAS DLLs to CTranslate2 (faster-whisper)
+        # BEFORE importing it — CT2 can otherwise fail or hard-crash on Windows
+        # when the DLL load order points it at a system cuDNN that differs from
+        # torch's bundled cuDNN 9 ("Could not load symbol cudnnGetLibConfig").
+        if device == "cuda":
+            try:
+                import torch, os as _os
+                _tlib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+                if _os.path.isdir(_tlib):
+                    try:
+                        _os.add_dll_directory(_tlib)   # Windows py3.8+
+                    except Exception:
+                        pass
+                    _os.environ["PATH"] = _tlib + _os.pathsep + _os.environ.get("PATH", "")
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
         from faster_whisper import WhisperModel
         import wave
 
@@ -82,15 +108,6 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
                 long_audio = duration_sec > 1200
         except Exception:
             pass
-
-        # Pre-clean GPU
-        if device == "cuda":
-            try:
-                import torch
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
 
         _model = WhisperModel(model_name, device=device, compute_type=compute)
         try:
@@ -138,6 +155,169 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
             pass
         import sys
         sys.exit(1)
+
+
+# ── Subprocess worker for speaker diarization + gender ──────────────────────
+# Same isolation as Whisper: pyannote / wav2vec2 run in a child so a native
+# crash or CUDA OOM kills only the child, and all GPU memory is returned when
+# it exits.
+DIARIZE_GENDER_MODEL = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+
+
+def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
+                          result_path: str, given_ranges=None):
+    """Diarize (pyannote speaker-diarization-3.1) then classify each speaker's
+    gender (wav2vec2 classifier). With given_ranges ({speaker: [(s, e)]},
+    e.g. from an uploaded SRT) diarization is skipped and only gender runs.
+
+    Writes {"ranges", "embeddings", "gender", "p_male", "error"} as JSON, and
+    the stage it is in to <result_path>.stage (so a native crash can be
+    located). Exits with os._exit right after the result is written: CUDA
+    libraries on Windows can fail-fast (0xC0000409) while unloading at
+    interpreter shutdown, after the work is already done."""
+    import json as _json
+    import os as _os
+
+    def _stage(name):
+        try:
+            with open(result_path + ".stage", "w", encoding="utf-8") as sf_:
+                sf_.write(name)
+        except Exception:
+            pass
+
+    try:
+        import sys as _sys
+        _stage("import")
+        # pyannote optionally imports NeMo and only catches ImportError; NeMo
+        # 2.7 on torch 2.4 raises AttributeError at import (needs torch 2.5's
+        # nn.Buffer). Hide it in this child so pyannote skips it cleanly —
+        # the embedding model used here is WeSpeaker, not NeMo.
+        _sys.modules["nemo"] = None
+        import numpy as np
+        import soundfile as sf
+        import torch
+
+        # Decode in memory: pyannote 4 decodes files with torchcodec, whose
+        # FFmpeg DLLs don't load on this Windows install.
+        _stage("load audio")
+        data, sr = sf.read(wav_path_str, dtype="float32", always_2d=True)
+        mono = data.mean(axis=1)
+        del data
+        if sr != 16000:
+            import librosa
+            mono = librosa.resample(mono, orig_sr=sr, target_sr=16000)
+            sr = 16000
+        dev = torch.device(device)
+
+        ranges, emb_map = {}, {}
+        if given_ranges:
+            ranges = {k: [tuple(r) for r in v] for k, v in given_ranges.items()}
+        else:
+            import warnings as _warnings
+            # Audio is passed in memory, so pyannote's torchcodec-missing
+            # warning (a page of DLL tracebacks per job) is irrelevant.
+            _warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed")
+            import pyannote.audio
+            seg_model = "pyannote/segmentation-3.0"
+            emb_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
+            params = {  # pyannote/speaker-diarization-3.1 config.yaml
+                "clustering": {"method": "centroid", "min_cluster_size": 12,
+                               "threshold": 0.7045654963945799},
+                "segmentation": {"min_duration_off": 0.0},
+            }
+            waveform = torch.from_numpy(mono[None, :].copy())
+            major = int(pyannote.audio.__version__.split(".")[0])
+            _stage("load diarization model")
+            if major >= 4:
+                # Built explicitly (not from_pretrained) so pyannote 4 doesn't
+                # also fetch the gated community-1 PLDA, which agglomerative
+                # clustering never uses.
+                import pyannote.audio.pipelines.speaker_diarization as _sd
+                _orig_get_plda = _sd.get_plda
+                _sd.get_plda = (lambda plda, **kw:
+                                None if plda is None else _orig_get_plda(plda, **kw))
+                pipe = _sd.SpeakerDiarization(
+                    segmentation=seg_model, embedding=emb_model,
+                    embedding_exclude_overlap=True,
+                    clustering="AgglomerativeClustering", plda=None,
+                    embedding_batch_size=32, segmentation_batch_size=32,
+                    token=hf_token,
+                )
+                pipe.instantiate(params)
+                pipe.to(dev)
+                _stage("diarize")
+                out = pipe({"waveform": waveform, "sample_rate": sr})
+                # exclusive = no overlapping turns, so every instant belongs
+                # to exactly one speaker (what per-segment voices need).
+                ann = out.exclusive_speaker_diarization
+                labels = out.speaker_diarization.labels()
+                embs = out.speaker_embeddings
+            else:
+                from pyannote.audio import Pipeline as _PyannotePipeline
+                pipe = _PyannotePipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+                pipe.to(dev)
+                _stage("diarize")
+                ann, embs = pipe({"waveform": waveform, "sample_rate": sr},
+                                 return_embeddings=True)
+                labels = ann.labels()
+            for turn, _, spk in ann.itertracks(yield_label=True):
+                ranges.setdefault(spk, []).append((float(turn.start), float(turn.end)))
+            if embs is not None:
+                for i, lab in enumerate(labels):
+                    if i < len(embs) and np.all(np.isfinite(embs[i])):
+                        emb_map[lab] = [float(x) for x in embs[i]]
+            del pipe, waveform
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+        # Gender: wav2vec2 classifier over up to 30 s of each speaker's
+        # longest turns, averaged over 8 s windows. Pitch thresholds were
+        # tried first and are ambiguous (a male voice measured 153 Hz vs a
+        # female at 180 Hz); this model is ~0.999 confident on both.
+        _stage("load gender model")
+        from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+        fe = AutoFeatureExtractor.from_pretrained(DIARIZE_GENDER_MODEL)
+        clf = AutoModelForAudioClassification.from_pretrained(DIARIZE_GENDER_MODEL).to(dev).eval()
+        male_idx = {v.lower(): int(k) for k, v in clf.config.id2label.items()}["male"]
+        _stage("classify gender")
+        gender, p_male = {}, {}
+        for spk, rs in ranges.items():
+            chunks, total = [], 0.0
+            for a, b in sorted(rs, key=lambda r: r[0] - r[1]):  # longest first
+                if total >= 30.0:
+                    break
+                if b - a < 0.5:
+                    continue
+                chunks.append(mono[int(a * sr):int(b * sr)])
+                total += b - a
+            if total < 1.0:
+                continue  # too little audio to judge; caller merges/defaults
+            x = np.concatenate(chunks)
+            probs = []
+            for i in range(0, len(x), sr * 8):
+                win = x[i:i + sr * 8]
+                if len(win) < sr:
+                    continue
+                inp = fe(win, sampling_rate=sr, return_tensors="pt").to(dev)
+                with torch.no_grad():
+                    probs.append(float(torch.softmax(clf(**inp).logits, -1)[0][male_idx]))
+            if probs:
+                p_male[spk] = sum(probs) / len(probs)
+                gender[spk] = "male" if p_male[spk] >= 0.5 else "female"
+
+        with open(result_path, "w", encoding="utf-8") as f:
+            _json.dump({"ranges": ranges, "embeddings": emb_map, "gender": gender,
+                        "p_male": p_male, "error": None}, f)
+        _stage("done")
+    except Exception as exc:
+        try:
+            with open(result_path, "w", encoding="utf-8") as f:
+                _json.dump({"error": f"{type(exc).__name__}: {exc}"}, f)
+        except Exception:
+            pass
+        _os._exit(1)
+    _os._exit(0)
 
 
 # ── Groq API Key Rotator ────────────────────────────────────────────────────
@@ -545,6 +725,191 @@ class HindiRuleEngine:
 _hindi_rules = HindiRuleEngine()
 
 
+# ── Hindi first-person gender agreement (female speakers) ────────────────────
+# Hindi verbs/adjectives agree with the subject's gender; machine translation
+# renders "I was tired" as the masculine "मैं थक गया था". For a female speaker
+# these must be feminine ("थक गई थी"). Deliberately conservative: only CLOSED
+# classes of words are changed, so names ("मैं सारा हूँ"), nouns ("पता",
+# "रास्ता", "सफलता") and invariable words ("पैदा", "ज़्यादा") are never touched:
+#   * perfective/auxiliary forms (_HI_PAST_FINAL: गया→गई, रहा→रही, सका→सकी…)
+#   * a curated list of variable adjectives (_HI_VARIABLE_ADJ: थका, अकेला…)
+#   * imperfective participles in -ता (करता→करती; see _hi_is_ta_participle)
+# Where it applies (first-person singular only):
+#   1. the agreeing chain before हूँ/हूं (1st-person-singular "am")
+#   2. 1st-person future -ऊँगा/-ूँगा (करूँगा → करूँगी)
+#   3. the first था after मैं in a sentence (not मैंने: ergative verbs agree
+#      with the object), and a clause-final participle in a मैं sentence
+# Quoted speech ("…") belongs to someone else and is left alone.
+_HI_AM = {"हूँ", "हूं"}
+_HI_WAS = {"था"}
+_HI_PARTICLES = {"नहीं", "न", "भी", "ही", "तो"}
+_HI_PAST_FINAL = {"गया": "गई", "आया": "आई", "हुआ": "हुई", "पाया": "पाई", "सका": "सकी",
+                  "चुका": "चुकी", "रहा": "रही", "लगा": "लगी", "बैठा": "बैठी", "उठा": "उठी",
+                  "गयी": "गई"}
+_HI_VARIABLE_ADJ = {
+    "अच्छा", "बुरा", "बड़ा", "छोटा", "अकेला", "थका", "भूखा", "प्यासा", "नया", "पुराना",
+    "सच्चा", "झूठा", "मोटा", "पतला", "लंबा", "खड़ा", "लेटा", "डरा", "खोया", "सोया",
+    "का", "वाला", "जैसा", "ऐसा", "वैसा", "गीला", "सूखा", "ठंडा", "भरा", "पढ़ा", "लिखा",
+    "जागा", "रुका", "फँसा", "फंसा", "उलझा", "घबराया", "पहला", "दूसरा", "तीसरा", "अगला",
+    "पिछला", "सीधा", "टूटा", "बेचारा", "कितना", "इतना", "उतना", "जितना",
+}
+# -ता words that are not participles: nouns, names, verb stems.
+_HI_TA_NOUNS = {
+    "पता", "रास्ता", "जूता", "छाता", "गीता", "सीता", "माता", "पिता", "नेता", "देवता",
+    "सुनीता", "अनीता", "ममता", "कविता", "जनता", "बता", "बिता", "जता", "सता", "कर्ता",
+    "दाता", "वक्ता", "श्रोता", "अभिनेता", "विजेता", "प्रवक्ता", "नाता", "बस्ता", "सस्ता",
+    "आहिस्ता", "फरिश्ता", "रिश्ता", "नाश्ता", "गुलदस्ता", "दस्ता", "कलकत्ता", "अलबत्ता",
+}
+# Participles whose ending looks like an abstract noun's (…रता, …लता, …कता).
+_HI_TA_PARTICIPLES = {
+    "करता", "भरता", "मरता", "डरता", "गिरता", "फिरता", "तैरता", "सुधरता", "गुजरता", "गुज़रता",
+    "उतरता", "बिखरता", "सुनता", "मानता", "जानता", "बनता", "गिनता", "चुनता", "पहचानता",
+    "चलता", "मिलता", "पलता", "जलता", "बदलता", "निकलता", "संभलता", "फिसलता", "खुलता",
+    "हिलता", "टलता", "रमता", "थमता", "जमता", "घूमता", "झूमता", "सकता", "थकता", "चमकता",
+    "भटकता", "लटकता", "रुकता", "झुकता", "टपकता", "महकता", "झिझकता",
+    # more verbs in -ल/-न/-र/-क/-म + ता (same ending as सफलता, समानता, सुंदरता…)
+    "खेलता", "बोलता", "खोलता", "डालता", "पालता", "टालता", "संभालता", "उछलता",
+    "मचलता", "फलता", "उबलता", "पिघलता", "तौलता", "घोलता", "झेलता", "धकेलता",
+    "छानता", "तानता", "ठानता", "बुनता", "छीनता", "बीनता", "निखरता", "उभरता",
+    "ठहरता", "मुकरता", "पसरता", "चरता", "बकता", "छलकता", "धड़कता", "फेंकता",
+    "पकता", "ढकता", "चूकता", "टिकता", "बिकता", "चूमता",
+}
+_HI_ABSTRACT_TA_ENDINGS = ("लता", "मता", "कता", "वता", "नता", "यता", "रता",
+                           "त्ता", "न्ता", "स्ता", "श्ता", "ष्ता", "र्ता", "क्ता")
+_HI_NEVER = {"पैदा", "ज़िंदा", "जिंदा", "शर्मिंदा", "ज़्यादा", "ज्यादा", "ताज़ा", "ताजा", "जुदा",
+             "खफ़ा", "खफा", "आवारा", "शादीशुदा", "हिस्सा", "महिला", "छात्रा", "सारा",
+             "मेरा", "तेरा", "हमारा", "गूंगा", "गूँगा", "मूंगा", "मूँगा", "राजा", "दादा",
+             "नाना", "चाचा", "मामा", "भैया", "योद्धा", "दुनिया", "हवा", "दवा", "सभा", "कला",
+             "एक", "मैं", "था", "थी", "हूँ", "हूं"}
+_HI_SENT_END = re.compile(r"[।?!.]")
+_HI_CLAUSE_SPLIT = re.compile(
+    r"(\s*[।|,;:?!.]\s*|\s+(?:कि|और|लेकिन|परंतु|किंतु|मगर|क्योंकि|जब|इसलिए|या|जबकि|ताकि)\s+)")
+# A clause with its own explicit subject is not मैं's clause.
+_HI_OTHER_SUBJ = {"वह", "वो", "यह", "ये", "वे", "हम", "आप", "तुम", "तू"}
+_HI_QUOTES = "\"“”‘’«»"
+
+
+def _hi_strip(w: str) -> str:
+    return w.strip("।,;:?!.\"'“”‘’")
+
+
+def _hi_is_ta_participle(core: str) -> bool:
+    """करता/जाता/सकता… yes; पता, रास्ता, सफलता, स्वतंत्रता, कविता… no."""
+    if core in _HI_TA_PARTICIPLES:
+        return True
+    if not core.endswith("ता") or len(core) < 4 or core in _HI_TA_NOUNS:
+        return False
+    return not core.endswith(_HI_ABSTRACT_TA_ENDINGS)
+
+
+def _hi_feminize_word(w: str) -> str:
+    """Masculine agreeing form → feminine; '' if w is not in a closed class."""
+    core = _hi_strip(w)
+    if not core or core in _HI_NEVER:
+        return ""
+    if core in _HI_PAST_FINAL:
+        fem = _HI_PAST_FINAL[core]
+    elif core in _HI_VARIABLE_ADJ and core.endswith("ा"):
+        fem = core[:-1] + "ी"
+    elif _hi_is_ta_participle(core):
+        fem = core[:-1] + "ी"
+    else:
+        return ""
+    return w.replace(core, fem, 1)
+
+
+def _hi_feminize_chain(tokens, end: int, max_len: int = 3) -> None:
+    """Feminize the agreeing word at tokens[end] (skipping particles such as
+    नहीं/भी before it) and, walking back, only through हुआ ("थका हुआ") or a
+    -ता participle before रहा ("खेलता रहा"). A bare stem, infinitive or
+    object before रहा/सकता/चाहता/चुका is never touched."""
+    k = end
+    while k >= 0 and _hi_strip(tokens[k]) in _HI_PARTICLES:
+        k -= 1
+    changed = 0
+    while k >= 0 and changed < max_len:
+        word = _hi_strip(tokens[k])
+        fem = _hi_feminize_word(tokens[k])
+        if not fem:
+            break
+        if k > 0 and _hi_strip(tokens[k - 1]) == "एक":
+            break  # "मैं एक बच्चा …": a noun phrase, leave it
+        tokens[k] = fem
+        changed += 1
+        if k == 0:
+            break
+        prev = _hi_strip(tokens[k - 1])
+        if word == "हुआ" and prev in _HI_VARIABLE_ADJ:
+            k -= 1
+            continue
+        if word == "रहा" and _hi_is_ta_participle(prev):
+            k -= 1
+            continue
+        # "बड़ा हो गया" (became big): the adjective before हो agrees too.
+        if prev == "हो" and k >= 2 and _hi_strip(tokens[k - 2]) in _HI_VARIABLE_ADJ:
+            k -= 2
+            continue
+        break
+
+
+def _feminize_unquoted(text: str) -> str:
+    out = []
+    subj_mai = False   # carried across the clauses of one sentence
+    was_done = False   # only the first था after each मैं
+    for idx, part in enumerate(_HI_CLAUSE_SPLIT.split(text)):
+        if idx % 2 == 1:  # delimiter
+            out.append(part)
+            if _HI_SENT_END.search(part):
+                subj_mai, was_done = False, False
+            continue
+        tokens = part.split(" ")
+        bare = [_hi_strip(t) for t in tokens]
+        if "मैं" in bare:
+            subj_mai, was_done = True, False
+        elif set(bare) & _HI_OTHER_SUBJ or any(b.endswith("ने") and b != "मैंने" for b in bare):
+            subj_mai = False
+        if "मैंने" in bare:
+            subj_mai = False
+        for i, b in enumerate(bare):
+            # Rule 2: future 1st person singular (गूंगा/मूंगा are in _HI_NEVER).
+            if b not in _HI_NEVER and re.search(r"(ूँ|ूं|ऊँ|ऊं)गा$", b):
+                tokens[i] = re.sub(r"गा(?=[।,;:?!.\"'“”‘’]*$)", "गी", tokens[i])
+            # Rule 1: agreement with हूँ.
+            if b in _HI_AM and i > 0:
+                _hi_feminize_chain(tokens, i - 1)
+            # "मैं अकेला/थका हुआ महसूस कर…" (feel lonely/tired): the adjective agrees.
+            if b == "महसूस" and subj_mai and i > 0:
+                _hi_feminize_chain(tokens, i - 1)
+            # Rule 3a: the first था after मैं.
+            if b in _HI_WAS and subj_mai and not was_done:
+                tokens[i] = tokens[i].replace("था", "थी", 1)
+                was_done = True
+                if i > 0:
+                    _hi_feminize_chain(tokens, i - 1)
+        # Rule 3b: clause-final participle in a मैं sentence with no auxiliary
+        # (negated present "मैं नहीं जानता", simple past "… और सो गया").
+        if subj_mai and not was_done and bare and \
+                not (set(bare) & (_HI_AM | _HI_WAS | {"थी", "है", "हैं"})):
+            last = max((j for j, b in enumerate(bare) if b), default=-1)
+            if last > 0 and bare[last] != "मैं":
+                lb = bare[last]
+                negated = "नहीं" in bare or "न" in bare
+                if lb in _HI_PAST_FINAL or (negated and _hi_is_ta_participle(lb)):
+                    _hi_feminize_chain(tokens, last)
+        out.append(" ".join(tokens))
+    return "".join(out)
+
+
+def feminize_first_person_hi(text: str) -> str:
+    """Rewrite masculine first-person-singular agreement to feminine."""
+    if not text or not any(c in text for c in ("हूँ", "हूं", "ूँगा", "ूंगा", "ऊँगा", "ऊंगा", "मैं")):
+        return text
+    # Quoted spans are someone else's words: leave them untouched.
+    parts = re.split(r"([\"“”‘’«»][^\"“”‘’«»]*[\"“”‘’«»])", text)
+    return "".join(p if (len(p) > 1 and p[0] in _HI_QUOTES) else _feminize_unquoted(p)
+                   for p in parts)
+
+
 # ── Types ────────────────────────────────────────────────────────────────────
 ProgressCallback = Callable[[str, float, str], None]
 
@@ -634,9 +999,14 @@ VOICE_POOL = {
         "female": ["en-US-JennyNeural", "en-US-AriaNeural", "en-US-SaraNeural"],
         "male":   ["en-US-GuyNeural", "en-US-ChristopherNeural", "en-US-EricNeural"],
     },
+    # Edge has only two native Hindi voices; extra same-gender speakers get
+    # Multilingual voices, which read Devanagari as intelligibly (Whisper
+    # word-match 85-88% vs Madhur 85% / Swara 79%). Ordered best-first.
     "hi": {
-        "female": ["hi-IN-SwaraNeural"],
-        "male":   ["hi-IN-MadhurNeural"],
+        "female": ["hi-IN-SwaraNeural", "en-US-EmmaMultilingualNeural",
+                   "de-DE-SeraphinaMultilingualNeural", "fr-FR-VivienneMultilingualNeural"],
+        "male":   ["hi-IN-MadhurNeural", "en-US-BrianMultilingualNeural",
+                   "en-AU-WilliamMultilingualNeural", "de-DE-FlorianMultilingualNeural"],
     },
     "es": {
         "female": ["es-ES-ElviraNeural", "es-MX-DaliaNeural"],
@@ -732,8 +1102,16 @@ class PipelineConfig:
     translation_engine: str = "google"  # Google Translate (parallel x20, fastest free)
     tts_voice: str = "hi-IN-SwaraNeural"
     tts_rate: str = "+0%"
-    mix_original: bool = False   # SUSPENDED — always False until explicitly reactivated
+    mix_original: bool = False   # keep original background music/SFX (Demucs) under the Hindi voice
     original_volume: float = 0.10
+    # Fingerprint-break the retained background bed so the kept music is less
+    # likely to trip YouTube Content ID. DURATION-PRESERVING only (pitch + EQ,
+    # never tempo) so the bed stays aligned to the per-segment-stretched video.
+    # HONEST CAVEAT: Content ID audio matching is robust to pitch/EQ shifts —
+    # this REDUCES but does NOT guarantee evasion on copyrighted music. The only
+    # sure way to avoid a music match is to drop the music (mix_original=False).
+    bg_alter: bool = True
+    bg_pitch: float = 1.03       # rubberband pitch scale (1.03 ≈ +3%, duration preserved)
     use_cosyvoice: bool = False          # OFF: slow GPU, not needed for SRT upload
     use_chatterbox: bool = False
     use_fish_speech: bool = False
@@ -743,11 +1121,6 @@ class PipelineConfig:
     use_google_tts: bool = False
     use_coqui_xtts: bool = False        # OFF: slow GPU, not needed for SRT upload
     use_edge_tts: bool = True
-    prefer_youtube_subs: bool = True     # ON: skip Whisper if YouTube has subs
-    # ON by default (2026-04-12): YouTube's auto-translated Hindi is higher
-    # quality than Google Translate API for narrative content. If 429 or
-    # unavailable, cascade falls back to English subs + Google Translate.
-    use_yt_translate: bool = True
     multi_speaker: bool = False
     transcribe_only: bool = False
     simplify_english: bool = False
@@ -767,6 +1140,17 @@ class PipelineConfig:
     audio_bitrate: str = "192k"
     # Video encode speed: NVENC GPU encoding
     encode_preset: str = "fast"
+    # ── Visual transforms (Content-ID / duplicate evasion) — classic mode ──
+    # Applied ONCE at the final mux as a single re-encode pass (the video is
+    # normally stream-copied there). Gives a uniform fingerprint break across
+    # the whole video. hflip is OFF by default because mirroring flips any
+    # on-screen text/logos (a visible tell); hue+zoom are imperceptible yet
+    # change the visual hash. Set visual_transforms=False for a bit-faithful cut.
+    visual_transforms: bool = True
+    vx_hflip: bool = False               # horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: float = 4.0                  # hue shift in degrees (imperceptible, breaks color hash)
+    vx_zoom: float = 1.04                # zoom-in then crop back (1.0 = off, 1.04 = 4%)
+    vx_strip_metadata: bool = True       # drop container metadata (-map_metadata -1)
     # Download mode for yt-dlp:
     #   "remux"  — current default. Uses --remux-video mp4. Instant container
     #              swap (no re-encode). ~2x faster but fails if YouTube serves
@@ -792,6 +1176,12 @@ class PipelineConfig:
     enable_manual_review: bool = False
     # WhisperX forced alignment: refine word-level timestamps after transcription
     use_whisperx: bool = True
+    # When WhisperX is unavailable or produces an unhealthy alignment ("not
+    # proper"), re-transcribe locally on the GPU with faster-whisper to get
+    # native word-level timestamps instead of dropping to coarse segment timing.
+    # See backend/dubbing/word_timing.py for the tiered strategy + health check.
+    whisper_gpu_fallback: bool = True
+    whisper_fallback_model: str = "large-v3"   # local model for the word-timing fallback
     # TTS verify retry loop: re-generates segments that fail duration/energy check.
     # OFF by default — Hindi WPM variance causes 70%+ false positives, making the
     # loop take hours on long videos. Turn ON for short videos where you want the
@@ -877,6 +1267,16 @@ class PipelineConfig:
     # The slot timing is then handled ENTIRELY in assembly via the
     # _assemble_video_adapts_to_audio path (which is the audio_priority path).
     tts_no_time_pressure: bool = True
+    # ── Tempo Match (per-segment) ──
+    # Match the ORIGINAL speaker's tempo segment by segment: dubbed speech is
+    # fitted INTO each original Whisper time slot (per-segment Edge-TTS rate
+    # re-synthesis + one pitch-preserving atempo fine-fit), the video is NEVER
+    # slowed, and output duration == source duration by construction (anchored
+    # assembly). When enabled it supersedes tts_no_time_pressure, the auto
+    # global rate, and the video-stretch assembly path.
+    tempo_match: bool = False
+    tempo_max_speedup: float = 1.5       # total speech speedup ceiling (engine rate x atempo)
+    tempo_gap_borrow_ms: int = 500       # max trailing-silence borrow per segment (ms)
     # Dynamic worker scaling for Edge-TTS — adjusts concurrency based on
     # observed failure rate. Starts at tts_dynamic_min, grows to tts_dynamic_max
     # when no failures, halves on rate-limit / WebSocket errors.
@@ -912,13 +1312,6 @@ class PipelineConfig:
     segmenter: str = "dp"                # "dp" | "sentence"
     segmenter_buffer_pct: float = 0.20   # Hindi expansion buffer
     max_sentences_per_cue: int = 2       # max sentences per segment
-    # YouTube transcript structuring mode:
-    #   "yt_timeline"      — YouTube text + YouTube timelines (fast, no Whisper)
-    #   "whisper_timeline" — YouTube text + Whisper timestamps (precise, slower)
-    yt_transcript_mode: str = "yt_timeline"
-    yt_segment_mode: str = "sentence"    # "sentence" | "wordcount"
-    yt_text_correction: bool = True      # correct Whisper text using YouTube subs
-    yt_replace_mode: str = "diff"        # "full" (total replace) | "diff" (word-level fix)
     tts_chunk_words: int = 0             # 0=off, 4/8/12=chunk translated text before TTS
     gap_mode: str = "micro"              # "none" | "micro" | "full"
     # ── Wav2Lip lip-sync post-processing ──
@@ -968,8 +1361,10 @@ class Pipeline:
                  cancel_check: Optional[Callable[[], bool]] = None,
                  pause_event=None):
         self.cfg = cfg
-        # SUSPENDED: mix_original is permanently disabled until explicitly reactivated
-        self.cfg.mix_original = False
+        # mix_original (keep the original background music/SFX under the Hindi
+        # voice) is now RESPECTED — Demucs isolates the vocal-free bed and
+        # _mix_audio ducks it beneath the TTS. Re-enabled per user request; the
+        # value flows through from the request/UI toggle.
         self._on_progress = on_progress or (lambda *_: None)
         self._cancel_check = cancel_check or (lambda: False)
         self._pause_event = pause_event
@@ -978,6 +1373,17 @@ class Pipeline:
         self.video_title: str = ""
         self.qa_score: Optional[float] = None
         self._voice_map = None
+        self._speaker_speech_sec: Dict[str, float] = {}
+        self._speaker_ranges: Dict[str, List[tuple]] = {}
+        self._speaker_genders: Dict[str, str] = {}
+        # Shown on the job page: who spoke, detected gender, assigned voice;
+        # and a sticky warning when multi-speaker was requested but failed.
+        self.speaker_summary: List[Dict] = []
+        self.speaker_warning: Optional[str] = None
+        # Honest-outcome bookkeeping surfaced to the job (app.py):
+        #   missing segment audio, shortened retry text, failed separation, ...
+        self.result_warnings: List[str] = []
+        self.result_status: str = "completed"
         self._whisper_audio = None  # Lightweight 16kHz mono audio for transcription
         self._has_nvenc: Optional[bool] = None  # Cached NVENC availability
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
@@ -1317,9 +1723,14 @@ class Pipeline:
                 text = text.replace(src, entries[src])
         return text
 
-    @staticmethod
-    def _find_executable(name: str) -> str:
-        """Find an executable by checking venv, PATH, WinGet packages, and system PATH."""
+    def _find_executable(self, name: str) -> str:
+        """Find an executable by checking venv, PATH, WinGet packages, and system PATH.
+
+        NOTE: must be an instance method (not @staticmethod) — the inner _works()
+        helper calls self._run_proc to verify a candidate actually runs. As a
+        staticmethod that raised NameError('self'), so _works() always returned
+        False and this fell through to the bare name — which left node unresolved
+        and yt-dlp's --js-runtimes empty (breaking newer YouTube downloads)."""
         ext = ".exe" if sys.platform == "win32" else ""
         full_name = name + ext
 
@@ -1469,201 +1880,430 @@ class Pipeline:
     # ── Speaker Diarization ───────────────────────────────────────────────
 
     def _diarize(self, wav_path: Path) -> tuple:
-        """Run pyannote speaker diarization.
+        """Run speaker diarization + per-speaker gender in an isolated child.
         Returns (speaker_genders, speaker_ranges) or ({}, {}) on failure.
-        """
-        hf_token = os.environ.get("HF_TOKEN", "").strip()
-        if not hf_token:
-            self._report("transcribe", 0.85, "HF_TOKEN not set — skipping speaker diarization")
+
+        Speakers with under MIN_SPEAKER_SEC of speech (pyannote's spurious
+        clusters from laughter / music / crosstalk) are folded into the most
+        similar real speaker, so a stray 2-second "speaker" never gets its
+        own random voice."""
+        MIN_SPEAKER_SEC = 3.0
+        res = self._run_speaker_worker(wav_path)
+        if not res:
+            return {}, {}
+        ranges = {k: [tuple(r) for r in v] for k, v in res["ranges"].items()}
+        genders = dict(res.get("gender") or {})
+        embs = res.get("embeddings") or {}
+        if not ranges:
+            self.speaker_warning = "Multi-speaker: no speech turns found — the whole video used one voice"
+            self._report("transcribe", 0.97, self.speaker_warning)
             return {}, {}
 
-        try:
-            from pyannote.audio import Pipeline as PyannotePipeline
-        except ImportError:
-            self._report("transcribe", 0.85, "pyannote-audio not installed — skipping diarization")
-            return {}, {}
+        speech = {s: sum(e - b for b, e in rs) for s, rs in ranges.items()}
+        big = [s for s in ranges if speech[s] >= MIN_SPEAKER_SEC and s in genders]
+        small = [s for s in ranges if s not in big]
+        if big and small:
+            import numpy as _np
 
-        try:
-            self._report("transcribe", 0.82, "Loading speaker diarization model...")
-            diarize_pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
+            def _cos(a, b):
+                a, b = _np.asarray(a), _np.asarray(b)
+                return float(a @ b / (_np.linalg.norm(a) * _np.linalg.norm(b) + 1e-9))
 
-            # Move to GPU if available
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    diarize_pipeline.to(torch.device("cuda"))
-            except Exception:
-                pass
+            for s in small:
+                if s in embs and all(b in embs for b in big):
+                    target = max(big, key=lambda b: _cos(embs[s], embs[b]))
+                else:
+                    target = max(big, key=lambda b: speech[b])
+                ranges[target] = sorted(ranges[target] + ranges.pop(s))
+                speech[target] += speech.pop(s)
+                genders.pop(s, None)
+            self._report("transcribe", 0.97,
+                         f"Merged {len(small)} tiny speaker cluster(s) (<{MIN_SPEAKER_SEC:.0f}s) "
+                         f"into the closest real speaker")
+        for s in ranges:
+            genders.setdefault(s, self._default_voice_gender())
 
-            self._report("transcribe", 0.86, "Running speaker diarization...")
-            # Heartbeat: pyannote processes the entire audio in one blocking
-            # call with no progress hooks. On long videos this looks like a
-            # 5-15 minute freeze. Spawn a daemon thread that emits a _report
-            # tick every 10 seconds so the UI knows we're still alive.
-            import threading as _th
-            import time as _time
-            _heartbeat_stop = _th.Event()
-            def _heartbeat():
-                t0 = _time.time()
-                tick = 0
-                while not _heartbeat_stop.is_set():
-                    if _heartbeat_stop.wait(timeout=10.0):
-                        break
-                    tick += 1
-                    elapsed = int(_time.time() - t0)
-                    try:
-                        self._report("transcribe", 0.86,
-                                     f"Diarizing speakers... ({elapsed}s elapsed)")
-                    except Exception:
-                        pass
-            _hb_thread = _th.Thread(target=_heartbeat, daemon=True,
-                                    name="diarize-heartbeat")
-            _hb_thread.start()
-            try:
-                diarization = diarize_pipeline(str(wav_path))
-            finally:
-                _heartbeat_stop.set()
-
-            # Extract unique speakers and their time ranges
-            speaker_ranges: Dict[str, List[tuple]] = {}
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                if speaker not in speaker_ranges:
-                    speaker_ranges[speaker] = []
-                speaker_ranges[speaker].append((turn.start, turn.end))
-
-            if not speaker_ranges:
-                return {}, {}
-
-            self._report("transcribe", 0.92,
-                         f"Found {len(speaker_ranges)} speakers, detecting genders...")
-
-            # Detect gender via pitch analysis
-            speaker_genders = self._detect_speaker_genders(wav_path, speaker_ranges)
-            self._report("transcribe", 0.98,
-                         f"Speakers: {', '.join(f'{k}={v}' for k, v in speaker_genders.items())}")
-            return speaker_genders, speaker_ranges
-
-        except Exception as e:
-            self._report("transcribe", 0.85,
-                         f"Diarization failed ({e}) — using single voice")
-            return {}, {}
+        self._speaker_speech_sec = speech
+        self._report("transcribe", 0.98, "Speakers: " + ", ".join(
+            f"{s}={genders[s]} ({speech[s]:.0f}s)"
+            for s in sorted(ranges, key=lambda k: -speech[k])))
+        return genders, ranges
 
     def _detect_speaker_genders(self, wav_path: Path, speakers: Dict[str, List[tuple]]) -> Dict[str, str]:
-        """Detect gender per speaker using pitch (F0) analysis. Male < 165Hz, Female >= 165Hz.
-        Reads only needed time ranges to avoid OOM on long videos."""
-        import struct
+        """Gender per already-labelled speaker (e.g. speaker tags from an
+        uploaded SRT) — runs only the gender half of the speaker worker."""
+        res = self._run_speaker_worker(wav_path, given_ranges=speakers,
+                                       step="translate", p_lo=0.55, p_hi=0.78)
+        if res is None:
+            # Worker failed: return nothing so the caller keeps ONE voice
+            # (matching the warning) instead of guessing genders.
+            return {}
+        genders = dict(res.get("gender") or {})
+        self._speaker_speech_sec = {s: sum(e - b for b, e in rs) for s, rs in speakers.items()}
+        for s in speakers:
+            genders.setdefault(s, self._default_voice_gender())
+        return genders
 
-        with wave.open(str(wav_path), "rb") as wf:
-            n_channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            sample_rate = wf.getframerate()
-            n_frames = wf.getnframes()
-            max_val = float(2 ** (8 * sample_width - 1))
-            fmt_char = "h" if sample_width == 2 else "i"
+    def _default_voice_gender(self) -> str:
+        """Gender of the job's selected voice — used for any speaker whose
+        gender couldn't be judged (under 1 s of usable audio)."""
+        pool = VOICE_POOL.get(self.cfg.target_language, {})
+        return "female" if self.cfg.tts_voice in pool.get("female", []) else "male"
 
-            result = {}
-            for speaker, time_ranges in speakers.items():
-                speaker_samples: list = []
-                for t_start, t_end in time_ranges[:10]:
-                    s_start = max(0, min(int(t_start * sample_rate), n_frames - 1))
-                    s_end = max(0, min(int(t_end * sample_rate), n_frames))
-                    count = s_end - s_start
-                    if count < 1:
-                        continue
-                    wf.setpos(s_start)
-                    raw = wf.readframes(count)
-                    try:
-                        chunk = struct.unpack(f"<{count * n_channels}{fmt_char}", raw)
-                    except struct.error:
-                        continue
-                    if n_channels > 1:
-                        chunk = chunk[::n_channels]
-                    speaker_samples.extend(s / max_val for s in chunk)
+    def _run_speaker_worker(self, wav_path: Path, given_ranges=None, step: str = "transcribe",
+                            p_lo: float = 0.82, p_hi: float = 0.97) -> Optional[Dict]:
+        """Spawn _diarize_child_worker; heartbeat every 10 s, honour cancel,
+        bound by a timeout. Progress is reported under `step` within
+        [p_lo, p_hi] (the SRT path runs inside "translate"). Returns the
+        worker's result dict, or None after reporting why (the job then
+        continues with the single selected voice)."""
+        import multiprocessing as mp
+        import json as _json
+        import tempfile as _tmpmod
+        import time as _time
 
-                if len(speaker_samples) < sample_rate * 0.5:
-                    result[speaker] = "female"
-                    continue
+        what = "speaker genders" if given_ranges else "speakers"
+        hf_token = os.environ.get("HF_TOKEN", "").strip()
+        if not hf_token and not given_ranges:
+            self.speaker_warning = ("Multi-speaker skipped: HF_TOKEN is not set in backend/.env "
+                                    "— the whole video used one voice")
+            self._report(step, p_lo, self.speaker_warning)
+            return None
 
-                pitch = self._estimate_pitch_autocorrelation(speaker_samples, sample_rate)
-                result[speaker] = "male" if pitch < 165 else "female"
+        try:
+            import torch as _torch_mod
+            device = "cuda" if _torch_mod.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+        try:
+            dur = self._get_duration(wav_path) or 600.0
+        except Exception:
+            dur = 600.0
+        # GPU diarizes ~40x realtime; CPU is far slower. First run also
+        # downloads ~1.5 GB of models.
+        timeout = int(min(3600, max(600, dur * (0.5 if device == "cuda" else 2.0))))
 
-        return result
+        fd, result_path = _tmpmod.mkstemp(suffix=".json", prefix="diarize_result_")
+        os.close(fd)
+        p = None
 
-    def _estimate_pitch_autocorrelation(self, samples: list, sample_rate: int) -> float:
-        """Lightweight autocorrelation pitch estimator. Returns average F0 in Hz."""
-        window_size = int(0.03 * sample_rate)  # 30ms windows
-        hop = window_size // 2
-        min_lag = int(sample_rate / 350)  # Max 350Hz
-        max_lag = int(sample_rate / 60)   # Min 60Hz
+        def _load() -> Optional[Dict]:
+            """The child's result if complete (written before it exits)."""
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    d = _json.load(f)
+            except Exception:
+                return None
+            return d if (d.get("error") is None and "ranges" in d) else None
 
-        pitches = []
-        for start in range(0, len(samples) - window_size, hop * 4):  # Skip windows for speed
-            window = samples[start:start + window_size]
-            # Simple energy check — skip silence
-            energy = sum(s * s for s in window) / len(window)
-            if energy < 0.001:
+        def _stage() -> str:
+            try:
+                return Path(result_path + ".stage").read_text(encoding="utf-8").strip()
+            except Exception:
+                return ""
+
+        try:
+            self._report(step, p_lo,
+                         f"Detecting {what} on {device.upper()} (isolated process)...")
+            p = mp.Process(target=_diarize_child_worker,
+                           args=(str(wav_path), hf_token, device, result_path, given_ranges),
+                           daemon=True)
+            p.start()
+            t0 = _time.time()
+            next_beat = t0 + 10.0
+            done_at = None
+            while p.is_alive():
+                p.join(1.0)
+                if self._cancel_check():
+                    p.kill()
+                    p.join(5)
+                    self._check_cancelled()
+                now = _time.time()
+                # Result written but the child is stuck unloading CUDA DLLs:
+                # give it 20 s, then take the result instead of waiting out
+                # the whole timeout.
+                if done_at is None and _stage() == "done":
+                    done_at = now
+                if done_at is not None and now - done_at > 20 and _load():
+                    p.kill()
+                    p.join(5)
+                    break
+                if now - t0 > timeout:
+                    p.kill()
+                    p.join(5)
+                    data = _load()
+                    if data:
+                        return data
+                    raise RuntimeError(f"timed out after {timeout}s")
+                if now >= next_beat:
+                    next_beat = now + 10.0
+                    self._report(step, p_lo + (p_hi - p_lo) * 0.3,
+                                 f"Detecting {what}... ({int(now - t0)}s elapsed)")
+            # A complete result is trusted whatever the exit code — the
+            # child writes it before exiting, so a crash after that point
+            # can't have corrupted it.
+            data = _load()
+            if data:
+                return data
+            err = None
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    err = _json.load(f).get("error")
+            except Exception:
+                pass
+            if err:
+                raise RuntimeError(err)
+            stage = _stage()
+            raise RuntimeError(f"child crashed (exit {p.exitcode:#x})"
+                               + (f" during '{stage}'" if stage else ""))
+        except RuntimeError as e:
+            if "cancelled" in str(e).lower():
+                raise
+            self.speaker_warning = (f"Multi-speaker failed ({str(e)[:160]}) "
+                                    f"— the whole video used one voice")
+            self._report(step, p_hi, self.speaker_warning)
+            return None
+        finally:
+            for _f in (result_path, result_path + ".stage"):
+                try:
+                    Path(_f).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _assign_speaker_to_segments(self, segments: List[Dict],
+                                    diarization_speakers: Dict[str, List[tuple]]) -> List[Dict]:
+        """Stamp speaker_id on every segment; returns the (possibly longer) list.
+
+        With word timings (WhisperX / local Whisper), each word takes the
+        speaker whose turn contains its midpoint, and a segment that spans a
+        speaker change is SPLIT there — otherwise the second person's words
+        would be voiced by the first. Runs shorter than MIN_RUN_WORDS are
+        absorbed into their neighbour (diarization boundaries jitter by a
+        word or two). Without words, the whole segment goes to the speaker
+        with the most overlap. A segment outside every turn (music,
+        crosstalk) takes the nearest turn's speaker when that turn is within
+        MAX_NEAREST_SEC; farther away it stays explicitly unknown
+        (_speaker_unknown, default voice) rather than being guessed."""
+        MIN_RUN_WORDS = 3
+        MAX_NEAREST_SEC = 2.0
+        turns = sorted((float(a), float(b), spk)
+                       for spk, rs in diarization_speakers.items() for a, b in rs)
+        if not turns:
+            return segments
+
+        def _nearest(t0: float, t1: float) -> str:
+            return min(turns, key=lambda tr: max(tr[0] - t1, t0 - tr[1], 0.0))[2]
+
+        def _gap(t0: float, t1: float, tr) -> float:
+            return max(tr[0] - t1, t0 - tr[1], 0.0)
+
+        def _by_overlap(t0: float, t1: float) -> str:
+            ov: Dict[str, float] = {}
+            for a, b, spk in turns:
+                if b > t0 and a < t1:
+                    ov[spk] = ov.get(spk, 0.0) + min(b, t1) - max(a, t0)
+            return max(ov, key=ov.get) if ov else _nearest(t0, t1)
+
+        def _segment_speaker(t0: float, t1: float) -> Optional[str]:
+            if any(b > t0 and a < t1 for a, b, _ in turns):
+                return _by_overlap(t0, t1)
+            near = min(turns, key=lambda tr: _gap(t0, t1, tr))
+            return near[2] if _gap(t0, t1, near) <= MAX_NEAREST_SEC else None
+
+        def _norm(t: str) -> List[str]:
+            return re.sub(r"[^\w']+", " ", str(t).lower()).split()
+
+        def _stamp(seg: Dict, spk: Optional[str]) -> None:
+            if spk:
+                seg["speaker_id"] = spk
+                seg.pop("_speaker_unknown", None)
+            else:
+                seg.pop("speaker_id", None)
+                seg["_speaker_unknown"] = True
+
+        out: List[Dict] = []
+        n_split = 0
+        for seg in segments:
+            words = [w for w in (seg.get("words") or [])
+                     if w.get("start") is not None and w.get("end") is not None
+                     and str(w.get("word", "")).strip()]
+            # Split only when `words` still match the segment text: dedup and
+            # noise filters edit `text` but not `words` (the ASR cache keeps
+            # them), and rebuilding pieces from stale words would bring back
+            # a removed repeat or a "[Music]" tag.
+            if len(words) < 2 * MIN_RUN_WORDS or not any(
+                    b > seg["start"] and a < seg["end"] for a, b, _ in turns) \
+                    or _norm(" ".join(str(w["word"]) for w in words)) != _norm(seg.get("text", "")):
+                _stamp(seg, _segment_speaker(seg["start"], seg["end"]))
+                out.append(seg)
                 continue
 
-            # Autocorrelation for pitch detection
-            best_lag = min_lag
-            best_corr = -1.0
-            for lag in range(min_lag, min(max_lag, len(window))):
-                corr = 0.0
-                for j in range(len(window) - lag):
-                    corr += window[j] * window[j + lag]
-                corr /= (len(window) - lag)
-                if corr > best_corr:
-                    best_corr = corr
-                    best_lag = lag
+            # Runs of consecutive words with the same speaker.
+            runs: List[List] = []
+            for w in words:
+                spk = _by_overlap(float(w["start"]), float(w["end"]))
+                if runs and runs[-1][0] == spk:
+                    runs[-1][1].append(w)
+                else:
+                    runs.append([spk, [w]])
+            # Absorb short runs (jitter, a listener's "mm-hmm" over the first
+            # words). A short run sandwiched between two runs of the same
+            # speaker goes first, then the shortest; it joins the LONGER
+            # neighbour, so A2/B2/A5 -> A9 instead of the forward cascade
+            # that handed the main speaker's opening words to the listener.
+            while len(runs) > 1:
+                short = [k for k in range(len(runs)) if len(runs[k][1]) < MIN_RUN_WORDS]
+                if not short:
+                    break
+                k = min(short, key=lambda k: (
+                    not (0 < k < len(runs) - 1 and runs[k - 1][0] == runs[k + 1][0]),
+                    len(runs[k][1])))
+                ws = runs[k][1]
+                if k == 0:
+                    runs[1][1][:0] = ws
+                elif k == len(runs) - 1 or len(runs[k - 1][1]) >= len(runs[k + 1][1]):
+                    runs[k - 1][1].extend(ws)
+                else:
+                    runs[k + 1][1][:0] = ws
+                del runs[k]
+                merged_runs: List[List] = []
+                for spk, w_ in runs:
+                    if merged_runs and merged_runs[-1][0] == spk:
+                        merged_runs[-1][1].extend(w_)
+                    else:
+                        merged_runs.append([spk, w_])
+                runs = merged_runs
 
-            if best_corr > energy * 0.3:  # Confidence threshold
-                pitches.append(sample_rate / best_lag)
+            if len(runs) == 1:
+                seg["speaker_id"] = runs[0][0]
+                out.append(seg)
+                continue
 
-        if not pitches:
-            return 200.0  # Default to ambiguous range
+            # Diarization boundaries land a word or two off; real turns
+            # change at a sentence end. Snap each cut to the nearest word
+            # ending in . ? ! within MIN_RUN_WORDS words, if there is one.
+            labels = [spk for spk, ws in runs for _ in ws]
+            flat = [w for _, ws in runs for w in ws]
+            cut, b = [], 0
+            for _, ws in runs[:-1]:
+                b += len(ws)
+                cands = [j for j in range(b - MIN_RUN_WORDS, b + MIN_RUN_WORDS + 1)
+                         if 0 < j < len(flat)
+                         and str(flat[j - 1]["word"]).strip()[-1:] in ".?!"]
+                j = min(cands, key=lambda j: abs(j - b)) if cands else b
+                cut.append(max(j, cut[-1]) if cut else j)  # keep cuts in order
+            bounds = [0] + cut + [len(flat)]
+            runs = []
+            for k in range(len(bounds) - 1):
+                ws = flat[bounds[k]:bounds[k + 1]]
+                if not ws:
+                    continue
+                piece_labels = labels[bounds[k]:bounds[k + 1]]
+                # Majority speaker of the snapped piece (first-seen wins ties).
+                spk = max(dict.fromkeys(piece_labels), key=piece_labels.count)
+                if runs and runs[-1][0] == spk:
+                    runs[-1][1].extend(ws)
+                else:
+                    runs.append([spk, ws])
+            if len(runs) == 1:
+                seg["speaker_id"] = runs[0][0]
+                out.append(seg)
+                continue
 
-        # Return median pitch
-        pitches.sort()
-        return pitches[len(pitches) // 2]
+            # Split at each speaker change; pieces stay contiguous (the cut
+            # sits midway between the two words) and cover the original span.
+            n_split += 1
+            for k, (spk, ws) in enumerate(runs):
+                piece = dict(seg)
+                piece["words"] = ws
+                piece["text"] = " ".join(str(w["word"]).strip() for w in ws)
+                piece["speaker_id"] = spk
+                start = (seg["start"] if k == 0 else
+                         (float(runs[k - 1][1][-1]["end"]) + float(ws[0]["start"])) / 2)
+                end = (seg["end"] if k == len(runs) - 1 else
+                       (float(ws[-1]["end"]) + float(runs[k + 1][1][0]["start"])) / 2)
+                # Word timings can drift outside the segment: clamp, monotonic.
+                lo = out[-1]["end"] if k > 0 else seg["start"]
+                piece["start"] = min(max(start, lo, seg["start"]), seg["end"])
+                piece["end"] = min(max(end, piece["start"]), seg["end"])
+                out.append(piece)
+        if n_split:
+            self._report("transcribe", 0.985,
+                         f"Split {n_split} segment(s) at a mid-sentence speaker change")
+        return out
 
-    def _assign_speaker_to_segments(self, segments: List[Dict], diarization_speakers: Dict[str, List[tuple]]):
-        """Assign speaker labels to transcription segments by max temporal overlap."""
+    def _build_speaker_summary(self, genders: Dict[str, str]) -> None:
+        """Fill self.speaker_summary (most-talkative first) for the job page."""
+        speech = getattr(self, "_speaker_speech_sec", None) or {}
+        self.speaker_summary = [
+            {"speaker": spk, "gender": genders.get(spk, ""),
+             "voice": (self._voice_map or {}).get(spk, self.cfg.tts_voice),
+             "seconds": round(float(speech.get(spk, 0.0)), 1)}
+            for spk in sorted(genders, key=lambda k: (-speech.get(k, 0.0), k))
+        ]
+
+    def _apply_speaker_gender_grammar(self, segments: List[Dict]) -> None:
+        """Female speakers' Hindi: masculine first-person agreement → feminine
+        (see feminize_first_person_hi). Runs after every translation pass;
+        a no-op unless multi-speaker found a female speaker."""
+        if self.cfg.target_language.split("-")[0] != "hi":
+            return
+        female = {s for s, g in (getattr(self, "_speaker_genders", None) or {}).items()
+                  if g == "female"}
+        if not female:
+            return
+        changed = 0
         for seg in segments:
-            seg_start = seg["start"]
-            seg_end = seg["end"]
-            best_speaker = None
-            best_overlap = 0.0
+            if seg.get("speaker_id") in female and seg.get("text_translated"):
+                new = feminize_first_person_hi(seg["text_translated"])
+                if new != seg["text_translated"]:
+                    seg["text_translated"] = new
+                    changed += 1
+        if changed:
+            self._report("translate", 0.97,
+                         f"Female-speaker grammar: {changed} line(s) set to feminine first person")
 
-            for speaker, time_ranges in diarization_speakers.items():
-                overlap = 0.0
-                for t_start, t_end in time_ranges:
-                    ov_start = max(seg_start, t_start)
-                    ov_end = min(seg_end, t_end)
-                    if ov_end > ov_start:
-                        overlap += ov_end - ov_start
+    def _voice_for_segment(self, seg: Dict) -> str:
+        """The Edge voice for a segment: its speaker's mapped voice when a
+        voice map exists, otherwise the configured voice. Every synthesis and
+        retry path must use this so a speaker never changes voice."""
+        if self._voice_map and seg.get("speaker_id") in self._voice_map:
+            return self._voice_map[seg["speaker_id"]]
+        return self.cfg.tts_voice
 
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = speaker
+    def _sarvam_speaker_for_voice(self, edge_voice: str) -> str:
+        """Register-matched Sarvam bulbul:v3 fallback speaker for an Edge voice.
+        Only speakers whose register Sarvam documents are used
+        (shubh = male, ishita = female)."""
+        female = set(VOICE_POOL.get(self.cfg.target_language, {}).get("female", [])) | {
+            DEFAULT_VOICES.get(self.cfg.target_language, "")}
+        return "ishita" if edge_voice in female else "shubh"
 
-            seg["speaker_id"] = best_speaker or "SPEAKER_00"
+    def _sarvam_speaker_for_seg(self, seg: Dict) -> str:
+        """Sarvam speaker for a segment, matching its speaker's voice gender."""
+        return self._sarvam_speaker_for_voice(self._voice_for_segment(seg))
 
     def _assign_voices_to_speakers(self, speaker_genders: Dict[str, str]) -> Dict[str, str]:
-        """Map each speaker to a distinct Edge-TTS voice from VOICE_POOL."""
+        """Map each speaker to a distinct voice from VOICE_POOL. Speakers are
+        taken in order of how much they talk, so the main speaker of each
+        gender gets that gender's primary voice (the job's selected voice
+        when it is in the pool)."""
         lang = self.cfg.target_language
         pool = VOICE_POOL.get(lang, {})
         female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
         male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
+        for voices in (female_voices, male_voices):
+            if self.cfg.tts_voice in voices:
+                voices.remove(self.cfg.tts_voice)
+                voices.insert(0, self.cfg.tts_voice)
 
+        speech = getattr(self, "_speaker_speech_sec", None) or {}
         voice_map = {}
         female_idx = 0
         male_idx = 0
 
-        for speaker, gender in sorted(speaker_genders.items()):
-            if gender == "male":
+        for speaker in sorted(speaker_genders, key=lambda s: (-speech.get(s, 0.0), s)):
+            if speaker_genders[speaker] == "male":
                 voice_map[speaker] = male_voices[male_idx % len(male_voices)]
                 male_idx += 1
             else:
@@ -1849,74 +2489,10 @@ class Pipeline:
             self._report("transcribe", 1.0,
                          f"[cached] Loaded {len(text_segments)} transcribed segments")
         else:
-            sub_segments = None
-
-            # ── YT Auto-Translate fast-fast path: skip Whisper AND translation ──
-            # If user enabled use_yt_translate, fetch YouTube's pre-translated
-            # subs in the target language directly. Whisper never runs.
-            if self.cfg.use_yt_translate and re.match(r"^https?://", self.cfg.source):
-                self._report("transcribe", 0.0,
-                             "YT Auto-Translate ON — fetching YouTube's pre-translated subs (skipping Whisper)...")
-                yt_translated_subs = self._fetch_youtube_translated_subs(self.cfg.source)
-                if yt_translated_subs:
-                    # These segments already have text_translated populated.
-                    # Mark them so the fast path also skips translation.
-                    for seg in yt_translated_subs:
-                        seg.setdefault("_qc_issues", [])
-                        seg.setdefault("_protected_terms", [])
-                        seg.setdefault("emotion", "neutral")
-                        seg.setdefault("text_en_clean", seg.get("text", ""))
-                        # Ensure 'text' field is also set so downstream filters work
-                        if not seg.get("text") and seg.get("text_translated"):
-                            seg["text"] = seg["text_translated"]
-                    self.segments = yt_translated_subs
-                    sub_segments = yt_translated_subs  # mark for fast path below
-                    self._yt_subs_fast_path = True
-                    self._yt_already_translated = True  # tells _run_from_step4 to skip translation
-                    self._report("transcribe", 1.0,
-                                 f"YT Auto-Translate: {len(yt_translated_subs)} pre-translated segments — skipping Whisper AND translation")
-                else:
-                    self._report("transcribe", 0.05,
-                                 "No YT translated subs found -- falling back to Whisper + our translator")
-                # Mark that we already attempted, so step 4 doesn't retry
-                self._yt_translate_attempted = True
-
-            # ── CASCADE FALLBACK: English subs ──
-            # If Hindi auto-translate failed (or wasn't attempted), try English
-            # subs. This fires when EITHER:
-            #   - prefer_youtube_subs=True (user explicitly chose English subs)
-            #   - use_yt_translate=True but Hindi download failed (automatic
-            #     fallback — the UI makes these toggles mutually exclusive,
-            #     but the backend cascade should still fall through)
-            # This way the user only needs to turn ON "YT Auto-Translate"
-            # and the cascade handles Hindi -> English -> Whisper automatically.
-            _try_english_subs = (
-                self.cfg.prefer_youtube_subs
-                or (self.cfg.use_yt_translate and not sub_segments)
-            )
-            if not sub_segments and _try_english_subs:
-                self._report("transcribe", 0.0,
-                             "Checking for YouTube English subtitles (cascade fallback)...")
-                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-
-            if sub_segments:
-                self.segments = sub_segments
-                # Set fields for downstream compatibility + skip flag
-                for seg in sub_segments:
-                    seg.setdefault("_qc_issues", [])
-                    seg.setdefault("_protected_terms", [])
-                    seg.setdefault("emotion", "neutral")
-                    seg.setdefault("text_en_clean", seg.get("text", ""))
-                self._yt_subs_fast_path = True  # Skip ALL English processing
-                self._report("transcribe", 1.0,
-                             f"YouTube subs: {len(sub_segments)} segments — skipping English processing")
-            else:
-                if self.cfg.prefer_youtube_subs:
-                    self._report("transcribe", 0.05, "No subtitles found, using Whisper...")
-                self._report("transcribe", 0.1, "Loading ASR model...")
-                whisper_audio = self._whisper_audio or audio_raw
-                self.segments = self._transcribe(whisper_audio)
-                self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
+            self._report("transcribe", 0.1, "Loading ASR model...")
+            whisper_audio = self._whisper_audio or audio_raw
+            self.segments = self._transcribe(whisper_audio)
+            self._report("transcribe", 1.0, f"Transcribed {len(self.segments)} segments")
 
             text_segments = [s for s in self.segments if s.get("text", "").strip()]
             if not text_segments:
@@ -1928,113 +2504,6 @@ class Pipeline:
         text_segments = [s for s in self.segments if s.get("text", "").strip()]
         if not text_segments:
             raise RuntimeError("No speech detected in the video")
-
-        # ── YouTube subs fast path: skip ALL English processing to Step 4 ──
-        if getattr(self, '_yt_subs_fast_path', False):
-            self._ref_english_subs = None
-            self._voice_map = None
-            self._keyterms = {}
-
-            # ── CRITICAL: merge YouTube SRT fragments into complete sentences ──
-            # YouTube's raw SRT has ~192 tiny 2-4 second chunks split mid-sentence
-            # (e.g., "also a white tiger, but he came out as a"). Without merging,
-            # these fragments go directly to TTS and produce choppy audio.
-            # _merge_broken_sentences is the same step that runs on Whisper output
-            # in the main flow — we just need to also run it here.
-            pre_merge = len(text_segments)
-            yt_sentences = self._merge_broken_sentences(text_segments)
-            if len(yt_sentences) < pre_merge:
-                self._report("transcribe", 0.80,
-                             f"Merged YouTube SRT fragments: {pre_merge} -> {len(yt_sentences)} sentences")
-
-            # ── YouTube Transcript Mode: structure into Whisper-style segments ──
-            _yt_mode = getattr(self.cfg, 'yt_transcript_mode', 'yt_timeline')
-
-            if _yt_mode == "whisper_timeline":
-                # ═══ OPTION 2: YouTube text + Whisper timeline ═══
-                # Run Whisper for precise speech timestamps, then replace its
-                # text with YouTube's (better quality). Slower but exact timelines.
-                self._report("transcribe", 0.82,
-                             "Option 2: Running Whisper for precise timestamps...")
-                whisper_audio = self._whisper_audio or audio_raw
-                whisper_raw = self._transcribe(whisper_audio)
-                whisper_merged = self._merge_broken_sentences(whisper_raw)
-                self._report("transcribe", 0.90,
-                             f"Whisper: {len(whisper_raw)} raw -> {len(whisper_merged)} "
-                             f"merged. Aligning YouTube text ({len(yt_sentences)} sentences)...")
-
-                # Align: YouTube text + Whisper timestamps
-                text_segments = self._align_yt_text_to_whisper_timeline(
-                    yt_sentences, whisper_merged)
-
-                # Merge again (alignment may have created fragments)
-                text_segments = self._merge_broken_sentences(text_segments)
-                self._report("transcribe", 0.92,
-                             f"Aligned: {len(text_segments)} segments (Whisper timeline + YT text)")
-            else:
-                # ═══ OPTION 1: YouTube text + YouTube timeline (default) ═══
-                # Fast path: no Whisper needed. YouTube's own timelines are used.
-                text_segments = yt_sentences
-
-            # ── Segment split mode: user choice ──
-            _seg_mode = getattr(self.cfg, 'yt_segment_mode', 'sentence')
-
-            # Safety: if user chose "sentence" but captions have no punctuation
-            # (avg segment > 8s after merge), auto-fallback to wordcount.
-            if _seg_mode == "sentence" and text_segments:
-                avg_dur = sum(
-                    s.get("end", 0) - s.get("start", 0) for s in text_segments
-                ) / len(text_segments)
-                if avg_dur > 8.0:
-                    _seg_mode = "wordcount"
-                    self._report("transcribe", 0.91,
-                                 f"No punctuation detected (avg seg {avg_dur:.1f}s) "
-                                 f"-> auto-switching to word-count split")
-
-            # ── Total word count (across all sentences/segments) ──
-            total_words = sum(len(s.get("text", "").split()) for s in text_segments)
-            total_sents = len(text_segments)
-            _unit = "sentences" if _seg_mode == "sentence" else "chunks"
-            self._report("transcribe", 0.93,
-                         f"Inventory: {total_sents} {_unit}, "
-                         f"{total_words} total words, "
-                         f"avg {total_words / max(total_sents, 1):.1f} words/{_unit[:-1]}")
-
-            if _seg_mode == "sentence":
-                # ── SENTENCE SPLIT: group 2 sentences per segment ──
-                # Sentences are atomic — never split. Orphan merges into previous.
-                max_per_cue = getattr(self.cfg, 'max_sentences_per_cue', 2)
-                text_segments = self._group_sentences_by_count(
-                    text_segments, target_per_group=max_per_cue)
-            else:
-                # ── WORD COUNT SPLIT: ~20 words per segment (uniform) ──
-                # Join all text, split into even segments by word count.
-                # Gaps removed anyway -> uniform word density = uniform speed.
-                target_words_per_seg = 20  # ~2 sentences worth
-                text_segments = self._split_by_even_wordcount(
-                    text_segments, target_words_per_seg)
-
-            # ── Redistribute slot timelines by word count ──
-            # Each segment gets time proportional to its word count. Segments
-            # with more words get more time -> matches what TTS will produce.
-            text_segments = self._redistribute_slots_by_wordcount(text_segments)
-
-            self.segments = text_segments
-
-            from srt_utils import write_srt as _fast_ws
-            src_srt = self.cfg.work_dir / "transcript_source.srt"
-            if not src_srt.exists():
-                _fast_ws(text_segments, src_srt, text_key="text")
-
-            _mode_label = "YT text + Whisper timeline" if _yt_mode == "whisper_timeline" \
-                          else "YT text + YT timeline"
-            _split_label = "sentence-split" if _seg_mode == "sentence" else "word-split"
-            self._report("transcribe", 1.0,
-                         f"[{_mode_label}, {_split_label}] {len(text_segments)} segments, "
-                         f"{total_words} words -> translation")
-            # SKIP to Step 4 — run _run_from_step4 which contains translate -> TTS -> assemble
-            self._run_from_step4(text_segments, video_path, audio_raw)
-            return
 
         # Fetch English reference subs for QA (save for post-translation comparison)
         self._ref_english_subs = None
@@ -2050,14 +2519,22 @@ class Pipeline:
         # Multi-speaker diarization (runs within "transcribe" step progress 82-98%)
         self._voice_map = None
         if self.cfg.multi_speaker:
-            speaker_genders, speaker_ranges = self._diarize(audio_raw)
+            # 16 kHz mono (what pyannote/wav2vec2 use) — 6x less RAM than the
+            # 48 kHz stereo audio_raw on long videos.
+            speaker_genders, speaker_ranges = self._diarize(self._whisper_audio or audio_raw)
             if speaker_genders and speaker_ranges:
-                self._assign_speaker_to_segments(text_segments, speaker_ranges)
+                text_segments = self._assign_speaker_to_segments(text_segments, speaker_ranges)
+                self._speaker_ranges = speaker_ranges
+                self._speaker_genders = speaker_genders
                 self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                self._build_speaker_summary(speaker_genders)
                 if self.cfg.use_coqui_xtts:
                     self._save_speaker_refs(audio_raw, text_segments)
                 self._report("transcribe", 0.99,
-                             f"Assigned {len(self._voice_map)} distinct voices")
+                             f"{len(self._voice_map)} speakers → {len(set(self._voice_map.values()))} "
+                             f"distinct voices: " + ", ".join(
+                                 f"{d['speaker']}={d['gender']}/{d['voice'].split('-')[-1].replace('Neural', '')}"
+                                 for d in self.speaker_summary))
 
         # Transcribe-only mode: save source SRT, extract per-speaker refs, and stop
         if self.cfg.transcribe_only:
@@ -2083,46 +2560,6 @@ class Pipeline:
             _write_srt_src(text_segments, source_srt, text_key="text",
                            include_speaker=has_speakers)
 
-        # ── YouTube text correction: fix Whisper text using YouTube subs ──
-        # Whisper keeps its precise timestamps (proven to produce 5:34 output).
-        # Only the TEXT is replaced with YouTube's (fewer hallucinations, better
-        # punctuation, correct proper nouns). If YouTube subs aren't available,
-        # Whisper's own text is used unchanged.
-        if getattr(self.cfg, 'yt_text_correction', False) and re.match(r"^https?://", self.cfg.source):
-            try:
-                self._report("transcribe", 0.85,
-                             "Fetching YouTube subs for text correction...")
-                yt_subs = self._fetch_youtube_subtitles(self.cfg.source)
-                if yt_subs:
-                    # Merge YouTube fragments into complete sentences
-                    yt_merged = self._merge_broken_sentences(yt_subs)
-                    self._report("transcribe", 0.88,
-                                 f"YouTube subs: {len(yt_subs)} fragments -> {len(yt_merged)} sentences. "
-                                 f"Correcting Whisper text...")
-                    # Replace Whisper text with YouTube text, keep Whisper timestamps
-                    corrected = self._correct_whisper_with_yt(text_segments, yt_merged)
-                    if corrected:
-                        corrected_count = sum(
-                            1 for i, s in enumerate(text_segments)
-                            if i < len(corrected) and s.get("text") != corrected[i].get("text")
-                        )
-                        text_segments = corrected
-                        self.segments = text_segments
-                        self._report("transcribe", 0.90,
-                                     f"Corrected {corrected_count}/{len(text_segments)} segments "
-                                     f"using YouTube subs")
-                    else:
-                        self._report("transcribe", 0.90,
-                                     "YT text correction returned empty -> using Whisper text as-is")
-                else:
-                    self._report("transcribe", 0.90,
-                                 "No YouTube subs found -> using Whisper text as-is")
-            except Exception as _ytc_err:
-                print(f"[YT-text-correct] Failed: {_ytc_err} -> continuing with Whisper text",
-                      flush=True)
-                self._report("transcribe", 0.90,
-                             f"YT text correction failed ({str(_ytc_err)[:60]}) -> using Whisper text")
-
         # ── Merge broken sentences: fix Whisper mid-sentence splits ──────
         text_segments = self._merge_broken_sentences(text_segments)
 
@@ -2147,142 +2584,39 @@ class Pipeline:
         self._check_cancelled()
 
         # Step 4: Translate — cache: _cache_translate.json exists
-        yt_translated = None
-        # Only try YouTube translated subs if we haven't already attempted
-        # them in the transcription step (line 1817). If the first attempt
-        # failed (429/unavailable), retrying here wastes 10-30 seconds on
-        # yt-dlp for the same result.
-        _yt_already_attempted = getattr(self, '_yt_translate_attempted', False)
-        if self.cfg.use_yt_translate and re.match(r"^https?://", self.cfg.source) and not _yt_already_attempted:
-            self._report("translate", 0.0, "Fetching YouTube auto-translated subtitles...")
-            yt_translated = self._fetch_youtube_translated_subs(self.cfg.source)
-            if yt_translated:
-                self.segments = yt_translated
-                text_segments = [s for s in self.segments if s.get("text_translated", "").strip()]
+        cached_translated = self._load_segments_cache("translate")
+        if cached_translated:
+            # Verify the cached translation matches current target language
+            has_translation = any(s.get("text_translated") for s in cached_translated)
+            if has_translation:
+                self.segments = cached_translated
+                text_segments = [s for s in self.segments if s.get("text", "").strip()]
                 self._report("translate", 1.0,
-                             f"Using YouTube translated subs — {len(text_segments)} segments (skipped Whisper translation)")
-                self._save_segments_cache(text_segments, "translate")
+                             f"[cached] Loaded {len(text_segments)} translated segments")
             else:
-                self._report("translate", 0.1, "No YouTube translated subs found, using normal translation...")
+                cached_translated = None
 
-        if not yt_translated:
-            cached_translated = self._load_segments_cache("translate")
-            if cached_translated:
-                # Verify the cached translation matches current target language
-                has_translation = any(s.get("text_translated") for s in cached_translated)
-                if has_translation:
-                    self.segments = cached_translated
-                    text_segments = [s for s in self.segments if s.get("text", "").strip()]
-                    self._report("translate", 1.0,
-                                 f"[cached] Loaded {len(text_segments)} translated segments")
-                else:
-                    cached_translated = None
+        if not cached_translated:
+            target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
 
-            if not cached_translated:
-                target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
+            # Mask glossary words before Google Translate
+            self._glossary_mask(text_segments)
+            self._report("translate", 0.0,
+                         f"[Google Translate] Translating {len(text_segments)} segments to {target_name}...")
+            self._translate_segments(text_segments)
+            # Unmask glossary placeholders in translated text
+            self._glossary_unmask(text_segments)
 
-                # ── Try YouTube Hindi translation first (better than Google) ──
-                _yt_hindi_used = False
-                if (getattr(self.cfg, 'yt_text_correction', False)
-                    and re.match(r"^https?://", self.cfg.source)):
-                    try:
-                        import time as _yth_time
-                        yt_hindi = None
-                        for _yth_attempt in range(3):
-                            self._report("translate", 0.0,
-                                         f"[YT Hindi] Downloading YouTube Hindi auto-translate "
-                                         f"(attempt {_yth_attempt + 1}/3)...")
-                            print(f"[YT-Hindi] Attempt {_yth_attempt + 1}/3...", flush=True)
-                            yt_hindi = self._fetch_youtube_translated_subs(self.cfg.source)
-                            if yt_hindi:
-                                break
-                            if _yth_attempt < 2:
-                                _delay = 3 * (_yth_attempt + 1)
-                                print(f"[YT-Hindi] Attempt {_yth_attempt + 1} returned None, "
-                                      f"retrying in {_delay}s...", flush=True)
-                                _yth_time.sleep(_delay)
-                        if yt_hindi:
-                            print(f"[YT-Hindi] SUCCESS: Got {len(yt_hindi)} Hindi segments from YouTube",
-                                  flush=True)
-                            # Show first segment as preview
-                            _preview = ""
-                            for _ys in yt_hindi[:1]:
-                                _preview = _ys.get("text_translated", _ys.get("text", ""))[:80]
-                            self._report("translate", 0.1,
-                                         f"[YT Hindi] Downloaded {len(yt_hindi)} segments. "
-                                         f"Preview: {_preview}...")
-
-                            # Map YouTube Hindi text onto our Whisper-timed segments
-                            yt_hindi_words: List[str] = []
-                            for ys in yt_hindi:
-                                tr = ys.get("text_translated", ys.get("text", ""))
-                                yt_hindi_words.extend(tr.split())
-
-                            if yt_hindi_words:
-                                w_total = sum(
-                                    max(len(s.get("text", "").split()), 1)
-                                    for s in text_segments
-                                )
-                                yt_h_total = len(yt_hindi_words)
-                                cursor = 0
-
-                                for si, seg in enumerate(text_segments):
-                                    seg_wc = max(len(seg.get("text", "").split()), 1)
-                                    n = round((seg_wc / w_total) * yt_h_total)
-                                    n = max(1, min(n, yt_h_total - cursor))
-                                    if si == len(text_segments) - 1:
-                                        n = max(0, yt_h_total - cursor)
-                                    if n > 0 and cursor < yt_h_total:
-                                        seg["text_translated"] = " ".join(
-                                            yt_hindi_words[cursor:cursor + n])
-                                        cursor += n
-                                    elif not seg.get("text_translated"):
-                                        # Safety: if cursor exhausted, use English as fallback
-                                        seg["text_translated"] = seg.get("text", "")
-
-                                _yt_hindi_used = True
-                                self._report("translate", 0.9,
-                                             f"[YT Hindi] USED — {yt_h_total} Hindi words -> "
-                                             f"{len(text_segments)} segments (Google Translate SKIPPED)")
-                                print(f"[YT-Hindi] Mapped {yt_h_total} Hindi words to "
-                                      f"{len(text_segments)} segments. Google Translate skipped.",
-                                      flush=True)
-                                # Post-replace glossary words in YouTube Hindi
-                                self._glossary_post_replace(text_segments)
-                            else:
-                                self._report("translate", 0.05,
-                                             "[YT Hindi] Downloaded but empty text -> using Google Translate")
-                                print("[YT-Hindi] Downloaded but segments had no text", flush=True)
-                        else:
-                            self._report("translate", 0.05,
-                                         "[YT Hindi] NOT AVAILABLE -> using Google Translate instead")
-                            print("[YT-Hindi] Not available for this video. "
-                                  "Falling back to Google Translate.", flush=True)
-                    except Exception as _yth_err:
-                        self._report("translate", 0.05,
-                                     f"[YT Hindi] FAILED ({str(_yth_err)[:40]}) -> using Google Translate")
-                        print(f"[YT-Hindi] Failed: {_yth_err} -> falling back to Google Translate",
-                              flush=True)
-
-                if not _yt_hindi_used:
-                    # Mask glossary words before Google Translate
-                    self._glossary_mask(text_segments)
-                    self._report("translate", 0.0,
-                                 f"[Google Translate] Translating {len(text_segments)} segments to {target_name}...")
-                    self._translate_segments(text_segments)
-                    # Unmask glossary placeholders in translated text
-                    self._glossary_unmask(text_segments)
-
-                # Recalculate timeline for target language word count
-                self._recalculate_timeline(text_segments)
-                self._close_segment_gaps(text_segments)
-                self.segments = text_segments
-                # Tag emotion on each segment after translation
-                for _seg in text_segments:
-                    _seg["emotion"] = self._detect_segment_emotion(_seg)
-                self._report("translate", 1.0, "Translation complete")
-                # Cache translation for crash recovery
-                self._save_segments_cache(text_segments, "translate")
+            # Recalculate timeline for target language word count
+            self._recalculate_timeline(text_segments)
+            self._close_segment_gaps(text_segments)
+            self.segments = text_segments
+            # Tag emotion on each segment after translation
+            for _seg in text_segments:
+                _seg["emotion"] = self._detect_segment_emotion(_seg)
+            self._report("translate", 1.0, "Translation complete")
+            # Cache translation for crash recovery
+            self._save_segments_cache(text_segments, "translate")
 
         # ── QA Check: Compare our translation against reference English subs ──
         if getattr(self, '_ref_english_subs', None):
@@ -2302,6 +2636,11 @@ class Pipeline:
                 for ref_seg in self._ref_english_subs:
                     ref_seg["text"] = ref_seg.get("text", "")
                 ref_copy = [dict(s) for s in self._ref_english_subs]
+                if self._voice_map and getattr(self, "_speaker_ranges", None):
+                    # Reference subs carry no speaker_id — stamp them BEFORE
+                    # translating, so the dub keeps each speaker's voice and
+                    # the female-grammar pass in _translate_segments applies.
+                    ref_copy = self._assign_speaker_to_segments(ref_copy, self._speaker_ranges)
                 self._glossary_mask(ref_copy)
                 self._translate_segments(ref_copy)
                 self._glossary_unmask(ref_copy)
@@ -2387,7 +2726,11 @@ class Pipeline:
 
         # Audio-priority: video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.05, "Building per-segment video (NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -2426,15 +2769,8 @@ class Pipeline:
 
         self.segments = text_segments
 
-        # ── If YT Auto-Translate already provided text_translated, skip ALL translation ──
-        already_translated = getattr(self, '_yt_already_translated', False) and all(
-            s.get("text_translated", "").strip() for s in text_segments
-        )
-
-        if already_translated:
-            self._report("translate", 1.0,
-                         f"YT Auto-Translate provided {len(text_segments)} pre-translated segments — skipping translation step")
-        else:
+        # Translate Whisper/SRT output into the target language
+        if True:
             # Simplify English before translation (if enabled)
             if self.cfg.simplify_english:
                 self._report("translate", 0.0, "Simplifying English for better translation...")
@@ -2509,6 +2845,10 @@ class Pipeline:
 
         total_tts = sum(t.get("duration", 0) for t in tts_data)
         total_slots = sum(max(0, t.get("end", 0) - t.get("start", 0)) for t in tts_data)
+        # Tempo Match: the per-segment fit ladder supersedes this global
+        # stretch (which uses rubberband and computed — not measured — durations).
+        if getattr(self.cfg, "tempo_match", False):
+            total_slots = 0
         if total_slots > 0 and total_tts > 0:
             ratio = total_tts / total_slots
             speed = min(max(ratio, 1.0), 1.25) if ratio > 0.95 else 1.0
@@ -2539,7 +2879,11 @@ class Pipeline:
 
         # Step 6: Assembly — audio-priority, video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.1, "Assembling (per-segment NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -2616,14 +2960,8 @@ class Pipeline:
             self.segments = cached_segs
             self._report("transcribe", 1.0, f"[cached] {len(cached_segs)} segments")
         else:
-            sub_segments = None
-            if self.cfg.prefer_youtube_subs and re.match(r"^https?://", self.cfg.source):
-                sub_segments = self._fetch_youtube_subtitles(self.cfg.source)
-            if self.cfg.prefer_youtube_subs and sub_segments:
-                self.segments = sub_segments
-            else:
-                whisper_audio = self._whisper_audio or audio_raw
-                self.segments = self._transcribe(whisper_audio)
+            whisper_audio = self._whisper_audio or audio_raw
+            self.segments = self._transcribe(whisper_audio)
             text_segments = [s for s in self.segments if s.get("text", "").strip()]
             if text_segments:
                 self._save_segments_cache(text_segments, "transcribe")
@@ -2652,6 +2990,12 @@ class Pipeline:
 
         srt_path = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
         write_srt(text_segments, srt_path, text_key="text_translated")
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: snapshot _orig_gap + clamp cue overlaps so the fit
+            # ladder can borrow trailing silence (matches the other run modes;
+            # SRT above was already written on the raw cue times).
+            text_segments = self._close_segment_gaps(text_segments)
+            self.segments = text_segments
         self._report("synthesize", 0.0, f"Generating speech ({self.cfg.tts_voice})...")
         tts_data = self._generate_tts_natural(text_segments)
         # Sync text_segments with the split segments from _generate_tts_natural
@@ -2687,7 +3031,11 @@ class Pipeline:
         self.cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
         video_duration = self._get_duration(video_path)
         self._report("assemble", 0.1, "Assembling (per-segment NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
         if srt_path.exists():
             shutil.copy2(srt_path, out_srt)
@@ -2736,40 +3084,6 @@ class Pipeline:
 
         self.segments = translated
 
-        # Check for speaker labels from SRT and rebuild voice map
-        speakers_found = set(s.get("speaker_id") for s in translated if s.get("speaker_id"))
-        if speakers_found and self.cfg.multi_speaker:
-            self._report("translate", 0.5,
-                         f"Found {len(speakers_found)} speakers in SRT, assigning voices...")
-            # Re-run gender detection from original audio if available
-            audio_raw = self.cfg.work_dir / "audio_raw.wav"
-            if audio_raw.exists():
-                speaker_ranges = {}
-                for seg in translated:
-                    spk = seg.get("speaker_id")
-                    if spk:
-                        if spk not in speaker_ranges:
-                            speaker_ranges[spk] = []
-                        speaker_ranges[spk].append((seg["start"], seg["end"]))
-                speaker_genders = self._detect_speaker_genders(audio_raw, speaker_ranges)
-                self._voice_map = self._assign_voices_to_speakers(speaker_genders)
-                self._report("translate", 0.8,
-                             f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
-            else:
-                # No audio for gender detection — alternate male/female
-                self._voice_map = {}
-                lang = self.cfg.target_language
-                pool = VOICE_POOL.get(lang, {})
-                female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
-                male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
-                for i, spk in enumerate(sorted(speakers_found)):
-                    if i % 2 == 0:
-                        self._voice_map[spk] = female_voices[i // 2 % len(female_voices)]
-                    else:
-                        self._voice_map[spk] = male_voices[i // 2 % len(male_voices)]
-        else:
-            self._voice_map = None
-
         self._report("translate", 1.0, f"Loaded {len(translated)} translated segments")
 
         # Find existing video and audio from first run
@@ -2789,6 +3103,30 @@ class Pipeline:
         if not audio_raw.exists():
             self._report("extract", 0.0, "Re-extracting audio...")
             audio_raw = self._extract_audio(video_path)
+
+        # [SPEAKER_xx] labels in the SRT → one voice per speaker, whatever the
+        # Multi-Speaker toggle says (it's hidden in SRT mode, and labels are an
+        # explicit request). Gender comes from each speaker's lines in the
+        # original audio — which is why this runs after the audio exists.
+        speakers_found = set(s.get("speaker_id") for s in translated if s.get("speaker_id"))
+        self._voice_map = None
+        if speakers_found:
+            self._report("translate", 0.5,
+                         f"Found {len(speakers_found)} speakers in SRT, detecting genders...")
+            speaker_ranges: Dict[str, List[tuple]] = {}
+            for seg in translated:
+                if seg.get("speaker_id"):
+                    speaker_ranges.setdefault(seg["speaker_id"], []).append((seg["start"], seg["end"]))
+            _wav16 = self.cfg.work_dir / "audio_16k.wav"
+            speaker_genders = self._detect_speaker_genders(
+                _wav16 if _wav16.exists() else audio_raw, speaker_ranges)
+            if speaker_genders:
+                self._voice_map = self._assign_voices_to_speakers(speaker_genders)
+                self._speaker_genders = speaker_genders
+                self._build_speaker_summary(speaker_genders)
+                self._report("translate", 0.8,
+                             f"Assigned voices: {', '.join(f'{k}={v}' for k, v in self._voice_map.items())}")
+            # else: gender detection failed → one voice; speaker_warning says so
 
         # Write the translated SRT to standard location
         srt_translated = self.cfg.work_dir / f"transcript_{self.cfg.target_language}.srt"
@@ -2855,7 +3193,11 @@ class Pipeline:
 
         # Audio-priority: video adapts per-segment (NVENC + parallel)
         self._report("assemble", 0.05, "Building per-segment video (NVENC parallel)...")
-        self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: audio fits the slots, video is never re-timed.
+            self._assemble_anchored(video_path, audio_raw, tts_data, video_duration)
+        else:
+            self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
@@ -2886,21 +3228,120 @@ class Pipeline:
                 "FFmpeg not found! Install: winget install Gyan.FFmpeg"
             )
         self._ffmpeg = resolved
+        # Keep the ORIGINAL system ffmpeg (standard name + ffprobe sibling) for
+        # yt-dlp's remux/merge. self._ffmpeg may be swapped to imageio below
+        # purely for NVENC encoding, and yt-dlp can't use that (odd binary name,
+        # no ffprobe alongside it).
+        self._ffmpeg_system = resolved
+
+        # ── GPU-encode rescue ────────────────────────────────────────────────
+        # If the resolved ffmpeg can't actually run NVENC (common when a rolling
+        # ffmpeg build outpaces the installed GPU driver), switch to the bundled
+        # imageio-ffmpeg in the venv, whose older NVENC matches the driver. Only
+        # switch if it TRULY encodes a frame; otherwise stay on libx264 (CPU).
+        if self._nvenc_usable(resolved):
+            self._has_nvenc = True
+        else:
+            self._has_nvenc = False
+            try:
+                import imageio_ffmpeg
+                bundled = imageio_ffmpeg.get_ffmpeg_exe()
+                if (bundled and os.path.exists(bundled) and bundled != resolved
+                        and self._nvenc_usable(bundled)):
+                    print(f"[FFmpeg] '{Path(resolved).name}' NVENC unusable on this "
+                          f"driver — switching to bundled imageio ffmpeg for GPU "
+                          f"encoding.", flush=True)
+                    self._ffmpeg = bundled
+                    self._has_nvenc = True
+            except Exception as e:
+                print(f"[FFmpeg] imageio-ffmpeg NVENC fallback unavailable ({e}).",
+                      flush=True)
+        print(f"[FFmpeg] Using {self._ffmpeg} | GPU encode (NVENC): "
+              f"{'yes' if self._has_nvenc else 'no — libx264 CPU'}", flush=True)
+
+        # Resolve ffprobe INDEPENDENTLY of self._ffmpeg. self._ffmpeg may be the
+        # imageio binary (no ffprobe sibling, non-standard name), so deriving
+        # ffprobe from its path returns a non-existent file — every duration
+        # probes as 0 and assembly aborts. Prefer PATH ffprobe, then the system
+        # ffmpeg's sibling.
+        self._ffprobe = self._resolve_ffprobe()
+        print(f"[FFmpeg] ffprobe: {self._ffprobe}", flush=True)
+
+    def _resolve_ffprobe(self) -> str:
+        """Locate a working ffprobe, independent of self._ffmpeg."""
+        p = shutil.which("ffprobe")
+        if p:
+            return p
+        sysff = getattr(self, "_ffmpeg_system", None)
+        if sysff:
+            sp = Path(sysff)
+            if sp.is_absolute() and sp.stem.lower() == "ffmpeg":
+                cand = sp.parent / ("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+                if cand.exists():
+                    return str(cand)
+        return "ffprobe"
+
+    def _nvenc_usable(self, ffmpeg_path: str) -> bool:
+        """Run a throwaway 1-frame NVENC encode with a SPECIFIC ffmpeg binary.
+        Returns True only when it exits 0 — i.e. the encoder is compiled in AND
+        the installed GPU driver actually supports it."""
+        try:
+            r = self._run_proc(
+                [ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5",
+                 "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _check_nvenc(self) -> bool:
-        """Check if NVIDIA NVENC hardware encoder is available."""
+        """Check if the NVIDIA NVENC hardware encoder is actually USABLE.
+
+        Seeing ``h264_nvenc`` in ``-encoders`` is NOT enough: the encoder can be
+        compiled into ffmpeg yet fail at runtime when the ffmpeg build requires a
+        newer GPU driver than is installed (e.g. a scoop/gyan ffmpeg 8.x needing
+        NVENC API 13.1 on a driver that only provides 13.0 → "Driver does not
+        support the required nvenc API version"). That mismatch would otherwise
+        crash EVERY section encode. So we run a throwaway 1-frame encode and fall
+        back to libx264 (CPU) on any failure.
+        """
         if self._has_nvenc is not None:
             return self._has_nvenc
+        # 1. Must at least be compiled in.
+        listed = False
         try:
             r = self._run_proc(
                 [self._ffmpeg, "-hide_banner", "-encoders"],
                 capture_output=True, text=True, timeout=10,
             )
-            self._has_nvenc = "h264_nvenc" in (r.stdout or "")
+            listed = "h264_nvenc" in (r.stdout or "")
         except Exception:
+            listed = False
+        if not listed:
             self._has_nvenc = False
+            return False
+        # 2. Must actually encode a frame with THIS ffmpeg + THIS driver.
+        try:
+            t = self._run_proc(
+                [self._ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5",
+                 "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self._has_nvenc = (t.returncode == 0)
+            if not self._has_nvenc:
+                first = next((ln for ln in (t.stderr or "").splitlines() if ln.strip()),
+                             "unknown error")
+                print(f"[NVENC] Encoder listed but NOT usable — falling back to "
+                      f"libx264 (CPU). Reason: {first}", flush=True)
+        except Exception as e:
+            self._has_nvenc = False
+            print(f"[NVENC] Test-encode errored ({e}) — falling back to libx264 (CPU).",
+                  flush=True)
         if self._has_nvenc:
-            print("[NVENC] GPU encoding available — using h264_nvenc", flush=True)
+            print("[NVENC] GPU encoding verified — using h264_nvenc", flush=True)
         return self._has_nvenc
 
     def _video_encode_args(self, crf: str = "18", force_cpu: bool = False) -> list:
@@ -3098,10 +3539,14 @@ class Pipeline:
 
                 self._report("download", 0.05, f"Downloading [{mode_label}]...")
 
-                # Only add --ffmpeg-location if we have a real path (not bare "ffmpeg")
-                ffmpeg_path = Path(self._ffmpeg)
-                if ffmpeg_path.is_absolute():
-                    dl_cmd += ["--ffmpeg-location", str(ffmpeg_path.parent)]
+                # yt-dlp needs a real ffmpeg+ffprobe for remux/merge. Use the
+                # SYSTEM ffmpeg (has an ffprobe sibling), NOT self._ffmpeg, which
+                # may be the imageio binary we switched to for NVENC (odd name,
+                # no ffprobe). If it isn't a standard ffmpeg, omit the flag and
+                # let yt-dlp find ffmpeg/ffprobe on PATH.
+                dl_ffmpeg = Path(getattr(self, "_ffmpeg_system", self._ffmpeg))
+                if dl_ffmpeg.is_absolute() and dl_ffmpeg.stem.lower() == "ffmpeg":
+                    dl_cmd += ["--ffmpeg-location", str(dl_ffmpeg.parent)]
                 dl_cmd += cookies_args + js_args + [src]
                 print(f"[YTDLP] cmd: {dl_cmd}", flush=True)
                 # ── Live progress: watchdog polls work_dir file growth every 1s ──
@@ -3431,220 +3876,6 @@ class Pipeline:
 
         return merged
 
-    def _fetch_youtube_subtitles(self, url: str) -> Optional[List[Dict]]:
-        """Download and parse YouTube subtitles via yt-dlp. Returns segments or None.
-
-        Single yt-dlp call with all common languages + auto-generated subs.
-        ~5-10s per video. Battle-tested, updated daily, rarely breaks.
-
-        Languages are tried in PRIORITY ORDER (not filesystem order) so we
-        always prefer the source language → English → other common ones.
-        """
-        if not re.match(r"^https?://", url):
-            return None
-
-        # GUARD: NO cookies for subtitle downloads. Premium cookies trigger
-        # YouTube's JS signature challenge which kills the entire yt-dlp process.
-        # Subtitles are public — no authentication needed. See 2026-04-13 fix.
-        # cookies_args = self._get_cookies_args()  # DO NOT USE for subs
-        sub_dir = self.cfg.work_dir / "subs"
-        sub_dir.mkdir(exist_ok=True)
-        out_tpl = str(sub_dir / "sub.%(ext)s")
-
-        # Build PRIORITY-ORDERED language list — explicit source first, English next,
-        # then common fallbacks. Order matters: we pick the FIRST one that has subs.
-        if self.cfg.source_language and self.cfg.source_language != "auto":
-            priority_langs = [
-                self.cfg.source_language,          # user-specified source
-                f"{self.cfg.source_language}-US",  # variant
-                f"{self.cfg.source_language}-GB",  # variant
-                "en", "en-US", "en-GB",            # English fallback
-            ]
-        else:
-            # auto-detect: English first (most YouTube content), then common ones
-            priority_langs = [
-                "en", "en-US", "en-GB",
-                "hi", "hi-IN",
-                "zh", "zh-Hans", "zh-Hant",
-                "ja", "ko", "es", "ru", "fr", "de", "pt",
-            ]
-        # de-dup while preserving order
-        seen = set()
-        priority_langs = [l for l in priority_langs if not (l in seen or seen.add(l))]
-        langs_csv = ",".join(priority_langs)
-
-        # Single call: try BOTH manual and auto-generated subs in one shot.
-        # Retry up to 3 times on failure (429 rate limits are common even with
-        # Premium cookies — a 2-3 second delay usually resolves them).
-        # Timeout scaled for long videos: 30s base + 1s per 10 minutes of source.
-        source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
-        sub_timeout = max(30, int(30 + source_dur / 600))
-        cmd = [
-            self._ytdlp,
-            "--write-sub",          # manual subs (rare, but BEST quality)
-            "--write-auto-sub",     # auto-generated (common)
-            "--sub-lang", langs_csv,
-            "--sub-format", "vtt/srt/best",
-            "--skip-download",
-            "--no-warnings",
-            "-o", out_tpl,
-            url,
-        ]
-        # NOTE: cookies intentionally omitted for subtitle-only downloads.
-        # Premium cookies trigger YouTube's JS signature challenge which
-        # aborts the process. Subtitles are public — no auth needed.
-
-        import time as _sub_time
-        for _attempt in range(3):
-            try:
-                self._run_proc(cmd, capture_output=True, text=True,
-                               timeout=sub_timeout)
-                break  # success
-            except Exception as _sub_err:
-                if _attempt < 2:
-                    delay = 5 * (_attempt + 1)  # 5s, 10s (429 rate limits)
-                    print(f"[YT Subs] Attempt {_attempt + 1}/3 failed: {_sub_err} "
-                          f"— retrying in {delay}s", flush=True)
-                    _sub_time.sleep(delay)
-                else:
-                    print(f"[YT Subs] All 3 attempts failed: {_sub_err}", flush=True)
-                    return None
-
-        # Walk languages in PRIORITY ORDER, not filesystem order.
-        # For each language, prefer manual track (sub.en.vtt) over auto-caption.
-        # yt-dlp file naming: sub.<lang>.<ext> for manual, sub.<lang>.<ext> for auto too,
-        # so we just check each candidate language by name.
-        for lang in priority_langs:
-            # Manual + auto-cap end up with the same filename pattern in this output template,
-            # so a single match per language is enough. Try .vtt first, then .srt.
-            for ext in ("vtt", "srt"):
-                candidate = sub_dir / f"sub.{lang}.{ext}"
-                if not candidate.exists():
-                    continue
-                if ext == "vtt":
-                    segments = self._parse_vtt(candidate)
-                else:
-                    segments = self._parse_srt_file(candidate)
-                if segments:
-                    print(f"[YT Subs] Picked {candidate.name} "
-                          f"({len(segments)} segments, lang={lang})", flush=True)
-                    return segments
-
-        # Last-resort fallback: take ANY remaining file (rare — yt-dlp downloaded
-        # something but in an unexpected language code).
-        for vtt_file in sorted(sub_dir.glob("*.vtt")):
-            segments = self._parse_vtt(vtt_file)
-            if segments:
-                print(f"[YT Subs] Fallback to {vtt_file.name} "
-                      f"({len(segments)} segments) — language not in priority list", flush=True)
-                return segments
-        for srt_file in sorted(sub_dir.glob("*.srt")):
-            segments = self._parse_srt_file(srt_file)
-            if segments:
-                print(f"[YT Subs] Fallback to {srt_file.name} "
-                      f"({len(segments)} segments) — language not in priority list", flush=True)
-                return segments
-
-        return None
-
-    def _fetch_youtube_translated_subs(self, url: str) -> Optional[List[Dict]]:
-        """Download YouTube's auto-translated subtitles in the target language.
-
-        YouTube can translate auto-captions to any language on-the-fly.
-        yt-dlp format: --sub-lang {target}-{source} for translated subs.
-        This skips both Whisper AND our translation step.
-        """
-        if not re.match(r"^https?://", url):
-            return None
-
-        # GUARD: NO cookies for subtitle downloads. Premium cookies trigger
-        # YouTube's JS signature challenge which kills the entire yt-dlp process.
-        # Subtitles are public — no authentication needed. See 2026-04-13 fix.
-        # cookies_args = self._get_cookies_args()  # DO NOT USE for subs
-        sub_dir = self.cfg.work_dir / "yt_translated"
-        sub_dir.mkdir(exist_ok=True)
-
-        target = self.cfg.target_language        # "hi"
-        source = self.cfg.source_language or "en"
-        if source == "auto":
-            source = "en"
-
-        # ONE attempt only: hi-en (Hindi auto-translated from English).
-        # Pipeline is locked to English→Hindi so we never need to guess.
-        sub_lang = f"{target}-{source}" if target != source else target
-
-        # Clean previous attempts
-        for f in sub_dir.glob("*"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
-
-        # Retry up to 3 times — YouTube's auto-translate endpoint is rate-limited
-        # and returns 429 even with Premium cookies. A 3-second delay between
-        # attempts usually resolves it. Timeout scaled for long videos.
-        source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
-        sub_timeout = max(30, int(30 + source_dur / 600))
-        # NOTE: DO NOT pass cookies for subtitle-only downloads.
-        # Premium cookies trigger YouTube's JS signature challenge which
-        # causes a "Requested format is not available" error that aborts
-        # the entire process — even though subtitles don't need auth.
-        # Subtitles are public and download fine without cookies.
-        cmd = [
-            self._ytdlp,
-            "--write-auto-sub",
-            "--sub-lang", sub_lang,
-            "--sub-format", "vtt/srt/best",
-            "--skip-download",
-            "--no-warnings",
-            "-o", str(sub_dir / "ytsub.%(ext)s"),
-            url,
-        ]
-
-        import time as _sub_time
-        for _attempt in range(3):
-            try:
-                self._run_proc(cmd, capture_output=True, text=True,
-                               timeout=sub_timeout,
-                               encoding="utf-8", errors="replace")
-                break  # success
-            except Exception as e:
-                if _attempt < 2:
-                    delay = 5 * (_attempt + 1)  # 5s, 10s (429 rate limits)
-                    print(f"[YT Translated] Attempt {_attempt + 1}/3 failed: {e} "
-                          f"— retrying in {delay}s", flush=True)
-                    _sub_time.sleep(delay)
-                    # Clean partial files before retry
-                    for f in sub_dir.glob("*"):
-                        try: f.unlink()
-                        except OSError: pass
-                else:
-                    print(f"[YT Translated] All 3 attempts failed: {e}", flush=True)
-                    return None
-
-        # Find the result (single language, single file)
-        for vtt_file in sub_dir.glob("*.vtt"):
-            segments = self._parse_vtt(vtt_file)
-            if segments:
-                self._report("translate", 0.5,
-                             f"Got YouTube auto-translated {target} subs from {source} "
-                             f"({len(segments)} segments)")
-                for seg in segments:
-                    seg["text_translated"] = seg.get("text", "")
-                return segments
-        for srt_file in sub_dir.glob("*.srt"):
-            segments = self._parse_srt_file(srt_file)
-            if segments:
-                self._report("translate", 0.5,
-                             f"Got YouTube auto-translated {target} subs from {source} "
-                             f"({len(segments)} segments)")
-                for seg in segments:
-                    seg["text_translated"] = seg.get("text", "")
-                return segments
-
-        print(f"[YT Translated] No {sub_lang} subs available for this video", flush=True)
-        return None
-
     def _fetch_reference_subs(self, url: str) -> Optional[List[Dict]]:
         """Fetch English reference subs: try YouTube subs first, then OCR burned-in subs."""
         # 1. Try YouTube subtitle download
@@ -3905,7 +4136,7 @@ class Pipeline:
                     if not segments:
                         raise RuntimeError("Groq Whisper returned 0 segments")
                     if self.cfg.use_whisperx and segments:
-                        segments = self._whisperx_align(wav_path, segments)
+                        segments = self._refine_word_timing(wav_path, segments)
                     segments = self._dedup_segments(segments)
                     _cache.put_asr(wav_path, model, lang, segments)
                     return segments
@@ -3919,7 +4150,7 @@ class Pipeline:
 
         # Optional: refine word-level timestamps with WhisperX forced alignment
         if self.cfg.use_whisperx and segments:
-            segments = self._whisperx_align(wav_path, segments)
+            segments = self._refine_word_timing(wav_path, segments)
 
         segments = self._dedup_segments(segments)
         _cache.put_asr(wav_path, model, lang, segments)
@@ -4096,6 +4327,11 @@ class Pipeline:
                     i += 1
                     continue
 
+                # Never merge across a known speaker change: the merged
+                # segment would be voiced entirely by the first speaker.
+                if self._different_speakers(current, next_seg):
+                    break
+
                 # Check gap between segments
                 gap = next_seg.get("start", 0) - current.get("end", 0)
                 if gap > MAX_GAP:
@@ -4114,7 +4350,10 @@ class Pipeline:
                     cur_tr = current.get("text_translated", "").strip()
                     nxt_tr = next_seg.get("text_translated", "").strip()
                     current["text_translated"] = (cur_tr + " " + nxt_tr).strip()
-                # Preserve speaker from first segment
+                # Same (or unknown) speaker on both sides. Adopt the first known
+                # label so a later, different speaker is still recognised.
+                if not current.get("speaker_id") and next_seg.get("speaker_id"):
+                    current["speaker_id"] = next_seg["speaker_id"]
                 text = current["text"].strip()
                 i += 1
 
@@ -4127,8 +4366,20 @@ class Pipeline:
 
         return merged
 
+    @staticmethod
+    def _different_speakers(a: Dict, b: Dict) -> bool:
+        """True only when BOTH segments carry a speaker label and they differ."""
+        sa, sb = a.get("speaker_id"), b.get("speaker_id")
+        return bool(sa) and bool(sb) and sa != sb
+
     def _combine_sentence_group(self, group: List[Dict]) -> Dict:
-        """Combine a list of sentences into a single segment dict."""
+        """Combine a list of sentences into a single segment dict.
+
+        Callers must pass single-speaker groups (see _group_sentences_by_count).
+        """
+        speakers = {g.get("speaker_id") for g in group if g.get("speaker_id")}
+        if len(speakers) > 1:
+            raise ValueError(f"refusing to combine sentences of different speakers: {sorted(speakers)}")
         combined_text = " ".join(
             s.get("text", "").strip() for s in group if s.get("text", "").strip()
         )
@@ -4148,66 +4399,6 @@ class Pipeline:
             if key not in ("start", "end", "text", "text_translated"):
                 combined.setdefault(key, group[0][key])
         return combined
-
-    def _group_sentences_by_count(self, sentences: List[Dict],
-                                  target_per_group: int = 2,
-                                  word_tolerance: float = 0.15) -> List[Dict]:
-        """Group sentences into segments of exactly N sentences each.
-
-        Sentences are the ATOMIC UNIT — never split. Grouping is purely
-        by sentence count. Word count is NOT used for grouping decisions;
-        it is only used LATER in _redistribute_slots_by_wordcount to
-        assign fair timeline slots to each segment.
-
-        Rules:
-          - Each segment gets exactly target_per_group sentences
-          - Last segment gets the remainder (1 to target_per_group)
-          - If last segment is a single orphan sentence, merge it into
-            the previous segment (so last segment gets target+1 instead)
-          - Every sentence ends up in exactly one segment — none lost
-
-        Example (target=2, 7 sentences):
-          [S1, S2, S3, S4, S5, S6, S7]
-          -> [Seg1(S1+S2), Seg2(S3+S4), Seg3(S5+S6+S7)]
-             (S7 merged into Seg3 instead of orphan Seg4)
-        """
-        if not sentences:
-            return []
-        if len(sentences) <= target_per_group:
-            return [self._combine_sentence_group(sentences)]
-
-        # ── Simple fixed-count grouping ──
-        raw_groups: List[List[Dict]] = []
-        for i in range(0, len(sentences), target_per_group):
-            raw_groups.append(sentences[i:i + target_per_group])
-
-        # ── Merge orphan: if last group is a single sentence, fold into previous ──
-        if len(raw_groups) >= 2 and len(raw_groups[-1]) == 1:
-            raw_groups[-2].extend(raw_groups[-1])
-            raw_groups.pop()
-
-        # ── Combine into segment dicts ──
-        grouped = [self._combine_sentence_group(g) for g in raw_groups]
-
-        # ── Logging ──
-        total_words = sum(len(g.get("text", "").split()) for g in grouped)
-        seg_wcs = [len(g.get("text", "").split()) for g in grouped]
-        seg_counts = [len(g) for g in raw_groups]
-        min_wc, max_wc = min(seg_wcs), max(seg_wcs)
-        avg_wc = total_words / len(grouped) if grouped else 0
-        print(f"[Sentence-group] {len(sentences)} sentences -> {len(grouped)} segments "
-              f"| {target_per_group} sent/seg (sentence-first, never split) "
-              f"| words: total={total_words}, avg={avg_wc:.1f}, "
-              f"min={min_wc}, max={max_wc} "
-              f"| group sizes: {seg_counts}", flush=True)
-
-        # Verify: every sentence accounted for
-        total_in_groups = sum(seg_counts)
-        if total_in_groups != len(sentences):
-            print(f"[Sentence-group] WARNING: {total_in_groups} sentences in groups "
-                  f"vs {len(sentences)} input — mismatch!", flush=True)
-
-        return grouped
 
     def _glossary_mask(self, segments: List[Dict]) -> int:
         """Mask glossary words BEFORE translation with placeholders.
@@ -4319,86 +4510,6 @@ class Pipeline:
             print(f"[Glossary] Restored {restored} words after translation", flush=True)
         return restored
 
-    def _glossary_post_replace(self, segments: List[Dict]) -> int:
-        """Post-translation glossary for YouTube Hindi path.
-
-        YouTube Hindi auto-translate doesn't see our placeholders. Instead,
-        we translate each glossary English word to Hindi (via Google Translate)
-        to discover what YouTube likely used, then find-and-replace in the
-        translated text with the glossary's desired output.
-
-        The Hindi lookups are cached on self._glossary_hindi so they're only
-        computed once per pipeline run.
-        """
-        if not self._glossary:
-            return 0
-
-        # Build Hindi lookup cache if not already done
-        if not hasattr(self, '_glossary_hindi') or not self._glossary_hindi:
-            self._glossary_hindi: Dict[str, List[str]] = {}
-            # Hardcoded common translations (fast, no API call)
-            _KNOWN = {
-                "noble": ["कुलीन", "महान", "उत्कृष्ट", "शाही", "नेक"],
-                "king": ["राजा", "किंग"],
-                "queen": ["रानी", "क्वीन"],
-                "princess": ["राजकुमारी", "प्रिंसेस"],
-                "prince": ["राजकुमार", "युवराज", "प्रिंस"],
-                "general": ["सेनापति", "जनरल"],
-                "consort": ["पत्नी", "राजमहिषी", "संगिनी"],
-                "immortal": ["अमर", "देवता", "अमरत्व"],
-                "demon": ["राक्षस", "दानव", "असुर", "डीमन"],
-                "dragon": ["ड्रैगन", "अजगर", "नाग"],
-                "spirit": ["आत्मा", "भूत", "प्राण", "स्पिरिट"],
-                "clan": ["कुल", "वंश", "कबीला", "क्लैन"],
-                "contract": ["अनुबंध", "करार", "संविदा", "कॉन्ट्रैक्ट"],
-                "cultivation": ["साधना", "तपस्या", "खेती"],
-                "realm": ["लोक", "क्षेत्र", "राज्य", "दुनिया"],
-                "warrior": ["योद्धा", "वारियर", "सैनिक"],
-                "phoenix": ["फीनिक्स", "अग्निपक्षी"],
-                "emperor": ["सम्राट", "एम्परर", "बादशाह"],
-                "heavenly": ["स्वर्गीय", "दिव्य"],
-                "divine": ["दिव्य", "देवी", "ईश्वरीय"],
-                "beast": ["जानवर", "पशु", "बीस्ट"],
-                "sparrow": ["गौरैया", "चिड़िया", "स्पैरो"],
-                "fox": ["लोमड़ी", "फॉक्स"],
-                "palace": ["महल", "राजमहल", "पैलेस"],
-                "throne": ["सिंहासन", "गद्दी", "थ्रोन"],
-            }
-            for eng in self._glossary:
-                forms = _KNOWN.get(eng.lower(), [])
-                # Also try quick Google Translate for unknown words
-                if not forms:
-                    try:
-                        tmp_segs = [{"text": eng}]
-                        self._translate_segments(tmp_segs)
-                        hindi_tr = tmp_segs[0].get("text_translated", "").strip()
-                        if hindi_tr and hindi_tr != eng:
-                            forms = [hindi_tr]
-                            print(f"[Glossary] Looked up '{eng}' -> '{hindi_tr}' via Google", flush=True)
-                    except Exception:
-                        pass
-                self._glossary_hindi[eng] = forms
-
-        replaced = 0
-        for seg in segments:
-            translated = seg.get("text_translated", "")
-            if not translated:
-                continue
-            changed = False
-            for eng, target in self._glossary.items():
-                hindi_forms = self._glossary_hindi.get(eng, [])
-                for hindi_word in hindi_forms:
-                    if hindi_word in translated:
-                        translated = translated.replace(hindi_word, target)
-                        changed = True
-                        replaced += 1
-            if changed:
-                seg["text_translated"] = translated
-
-        if replaced:
-            print(f"[Glossary] Post-replaced {replaced} Hindi words with glossary entries", flush=True)
-        return replaced
-
     def _chunk_segments_for_tts(self, segments: List[Dict],
                                 chunk_words: int) -> List[Dict]:
         """Re-split segments into N-word chunks for TTS.
@@ -4418,7 +4529,7 @@ class Pipeline:
 
         result: List[Dict] = []
 
-        for seg in segments:
+        for pi, seg in enumerate(segments):
             hindi = seg.get("text_translated", "").split()
             english = seg.get("text", "").split()
             seg_start = seg.get("start", 0)
@@ -4462,6 +4573,18 @@ class Pipeline:
                     if key not in ("start", "end", "text", "text_translated"):
                         chunk_seg.setdefault(key, seg[key])
 
+                # Tempo Match: chunk start/end are SYNTHETIC (proportional).
+                # Stamp the REAL parent anchors so the fit ladder groups all
+                # chunks back to the original Whisper slot. The "c{pi}" string
+                # key cannot collide with the integer keys stamped later by
+                # _split_segments_at_sentences (different list, different ids).
+                chunk_seg["_parent_idx"] = f"c{pi}"
+                chunk_seg["_parent_start"] = seg_start
+                chunk_seg["_parent_end"] = seg_end
+                # The parent's trailing silence follows only the LAST chunk.
+                if ci + chunk_words < hindi_total:
+                    chunk_seg["_orig_gap"] = 0.0
+
                 result.append(chunk_seg)
                 cursor_time += chunk_dur
 
@@ -4493,6 +4616,11 @@ class Pipeline:
         total_overlap = 0.0
         for i in range(len(segments) - 1):
             gap = segments[i + 1].get("start", 0) - segments[i].get("end", 0)
+            # Tempo Match: remember the REAL trailing silence before it is
+            # folded into the slot — the fit ladder borrows from this snapshot
+            # (only the first gap-close call sees the true gap).
+            if "_orig_gap" not in segments[i]:
+                segments[i]["_orig_gap"] = max(0.0, gap)
             if gap > 0.01:
                 # Gap: extend current segment's end to meet next start
                 total_gap += gap
@@ -4513,405 +4641,47 @@ class Pipeline:
 
         return segments
 
-    def _redistribute_slots_by_wordcount(self, segments: List[Dict]) -> List[Dict]:
-        """Redistribute segment timelines proportionally by word count.
-
-        Keeps the total time span (first start -> last end) identical, but
-        gives each segment a slot proportional to its word count. Segments
-        with more words get more time -- matching TTS output duration behavior.
-
-        Before: [Seg1(0-12s, 20 words), Seg2(12-22s, 5 words)]
-                 Seg1 has 12s for 20w, Seg2 has 10s for 5w (unbalanced)
-        After:  [Seg1(0-17.6s, 20 words), Seg2(17.6-22s, 5 words)]
-                 Both get 0.88s per word (balanced)
-        """
-        if not segments or len(segments) < 2:
-            return segments
-
-        total_start = segments[0]["start"]
-        total_end = segments[-1]["end"]
-        total_duration = total_end - total_start
-
-        if total_duration <= 0:
-            return segments
-
-        # Count words per segment (min 1 to avoid zero-division)
-        word_counts = []
-        for seg in segments:
-            wc = len(seg.get("text", "").split())
-            word_counts.append(max(wc, 1))
-
-        total_words = sum(word_counts)
-
-        # Redistribute: each segment gets time proportional to its word count
-        cursor = total_start
-        for i, seg in enumerate(segments):
-            slot = (word_counts[i] / total_words) * total_duration
-            seg["start"] = round(cursor, 3)
-            seg["end"] = round(cursor + slot, 3)
-            cursor += slot
-
-        # Snap last segment's end to exact total_end (avoid float drift)
-        segments[-1]["end"] = total_end
-
-        avg_per_word = total_duration / total_words if total_words else 0
-        print(f"[Slot-redistribute] {len(segments)} segments, {total_words} words, "
-              f"{total_duration:.1f}s total, {avg_per_word:.3f}s/word avg", flush=True)
-
-        return segments
-
-    def _split_by_even_wordcount(self, segments: List[Dict],
-                                 target_words: int = 20) -> List[Dict]:
-        """Split segments into even-word-count chunks (no punctuation fallback).
-
-        When YouTube captions have no punctuation, sentence boundaries are
-        unreliable. Instead, join ALL text into one stream and split into
-        segments of ~target_words each. Gaps are removed in assembly anyway,
-        so uniform word density = uniform playback speed.
-
-        Timeline: each output segment gets a proportional slice of the
-        total time span based on its word count (same as redistribute).
-
-        No word is lost — every word from input ends up in exactly one output.
-        """
-        if not segments:
-            return []
-
-        # Collect all words + total time span
-        all_words: List[str] = []
-        for seg in segments:
-            words = seg.get("text", "").split()
-            all_words.extend(words)
-
-        if not all_words:
-            return segments
-
-        total_start = segments[0].get("start", 0)
-        total_end = segments[-1].get("end", 0)
-        total_duration = max(total_end - total_start, 0.1)
-        total_word_count = len(all_words)
-
-        # Also collect translated words if present
-        all_translated: List[str] = []
-        has_translated = any(s.get("text_translated") for s in segments)
-        if has_translated:
-            for seg in segments:
-                tr_words = seg.get("text_translated", "").split()
-                all_translated.extend(tr_words)
-
-        # Split into chunks of ~target_words
-        result: List[Dict] = []
-        cursor = total_start
-        i = 0
-        while i < total_word_count:
-            chunk_end = min(i + target_words, total_word_count)
-            chunk_words = all_words[i:chunk_end]
-            chunk_text = " ".join(chunk_words)
-
-            # Proportional time slot
-            slot = (len(chunk_words) / total_word_count) * total_duration
-            seg_dict = {
-                "start": round(cursor, 3),
-                "end": round(cursor + slot, 3),
-                "text": chunk_text,
-            }
-
-            # Proportional translated text if present
-            if has_translated and all_translated:
-                tr_ratio = len(all_translated) / max(total_word_count, 1)
-                tr_start = int(i * tr_ratio)
-                tr_end = int(chunk_end * tr_ratio)
-                seg_dict["text_translated"] = " ".join(
-                    all_translated[tr_start:tr_end])
-
-            result.append(seg_dict)
-            cursor += slot
-            i = chunk_end
-
-        # Snap last segment end
-        if result:
-            result[-1]["end"] = total_end
-
-        print(f"[Word-split] {total_word_count} words -> {len(result)} segments "
-              f"(~{target_words} words/seg, no punctuation path)", flush=True)
-
-        return result
-
-    def _align_yt_text_to_whisper_timeline(self, yt_sentences: List[Dict],
-                                           whisper_segments: List[Dict]) -> List[Dict]:
-        """Align YouTube text onto Whisper's precise timeline.
-
-        YouTube gives better TEXT (human-curated captions vs Whisper guesses).
-        Whisper gives better TIMESTAMPS (actual audio analysis vs display timing).
-
-        Strategy: walk both lists in parallel (both are chronological). For each
-        Whisper segment, find the YouTube sentence whose time overlaps most and
-        take the YouTube text. If no good overlap, keep Whisper's own text.
-
-        Returns segments with Whisper start/end but YouTube text.
-        """
-        if not yt_sentences or not whisper_segments:
-            return whisper_segments or yt_sentences or []
-
-        # Build a simple overlap matcher: for each Whisper segment, find the
-        # best-matching YouTube sentence by time overlap
-        result: List[Dict] = []
-        yt_used = set()  # track which YT sentences we've consumed
-
-        for wseg in whisper_segments:
-            w_start = wseg.get("start", 0)
-            w_end = wseg.get("end", 0)
-            w_mid = (w_start + w_end) / 2
-
-            best_idx = -1
-            best_overlap = 0.0
-
-            for j, yseg in enumerate(yt_sentences):
-                if j in yt_used:
-                    continue
-                y_start = yseg.get("start", 0)
-                y_end = yseg.get("end", 0)
-
-                # Overlap = intersection of [w_start,w_end] and [y_start,y_end]
-                overlap_start = max(w_start, y_start)
-                overlap_end = min(w_end, y_end)
-                overlap = max(0, overlap_end - overlap_start)
-
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_idx = j
-
-            # Take YouTube text if we found a decent overlap (>20% of Whisper seg)
-            w_dur = max(w_end - w_start, 0.1)
-            if best_idx >= 0 and best_overlap > w_dur * 0.2:
-                yt_used.add(best_idx)
-                aligned = dict(wseg)  # keep Whisper timeline
-                aligned["text"] = yt_sentences[best_idx].get("text", wseg.get("text", ""))
-                result.append(aligned)
-            else:
-                # No good YouTube match -- keep Whisper's own text
-                result.append(dict(wseg))
-
-        # Skip unused YouTube sentences — appending them with their imprecise
-        # YT timelines would create overlapping segments that break assembly.
-        # The matched segments already carry YouTube's text quality where overlap
-        # was found; unmatched ones are likely intros/outros or timing mismatches.
-        unmatched = len(yt_sentences) - len(yt_used)
-
-        matched = len(yt_used)
-        total_yt = len(yt_sentences)
-        print(f"[YT-Whisper-align] Matched {matched}/{total_yt} YouTube sentences "
-              f"to {len(whisper_segments)} Whisper segments"
-              f"{f' (skipped {unmatched} unmatched YT sentences)' if unmatched else ''}",
-              flush=True)
-
-        return result
-
-    def _correct_whisper_with_yt(self, whisper_segments: List[Dict],
-                                 yt_sentences: List[Dict]) -> List[Dict]:
-        """Replace or correct Whisper text using YouTube subs.
-
-        Both are English transcriptions of the same audio in the same order.
-        Whisper has precise timestamps but garbled text (name variations,
-        spelling). YouTube has clean text but imprecise display timelines.
-
-        Two modes (controlled by cfg.yt_replace_mode):
-
-        "full"  — Total replacement. Flatten both into word streams,
-                  align by time, replace Whisper text entirely with YouTube.
-                  Whisper timestamps kept. Best when YouTube text is much
-                  cleaner overall.
-
-        "diff"  — Word-level diff. Align both word streams using
-                  SequenceMatcher, only swap words that DIFFER. Keeps
-                  Whisper's punctuation and structure intact, fixes only
-                  the misheard parts (names, nouns, spelling). Best when
-                  Whisper's structure is good but specific words are wrong.
-        """
-        if not whisper_segments or not yt_sentences:
-            return whisper_segments
-
-        mode = getattr(self.cfg, 'yt_replace_mode', 'diff')
-
-        # ── Flatten both into word streams ──
-        # Whisper: word list per segment (we need to reconstruct back)
-        w_seg_words: List[List[str]] = []
-        for seg in whisper_segments:
-            w_seg_words.append(seg.get("text", "").split())
-        w_flat = []
-        for words in w_seg_words:
-            w_flat.extend(words)
-
-        # YouTube: single word stream (order matches audio)
-        yt_flat: List[str] = []
-        for yt_seg in yt_sentences:
-            yt_flat.extend(yt_seg.get("text", "").split())
-
-        if not yt_flat or not w_flat:
-            return whisper_segments
-
-        w_total = len(w_flat)
-        yt_total = len(yt_flat)
-
-        if mode == "full":
-            # ═══ FULL REPLACE: swap all Whisper words with YouTube words ═══
-            # Proportional distribution: each Whisper segment gets its share
-            # of YouTube words based on its word count relative to total.
-            result = []
-            yt_cursor = 0
-
-            for i, wseg in enumerate(whisper_segments):
-                seg = dict(wseg)
-                seg_wc = len(w_seg_words[i])
-
-                # Proportional share of YouTube words
-                proportion = seg_wc / max(w_total, 1)
-                n_words = round(proportion * yt_total)
-                n_words = max(1, min(n_words, yt_total - yt_cursor))
-
-                # Last segment gets everything remaining
-                if i == len(whisper_segments) - 1:
-                    n_words = max(0, yt_total - yt_cursor)
-
-                if n_words > 0 and yt_cursor < yt_total:
-                    yt_slice = yt_flat[yt_cursor:yt_cursor + n_words]
-                    seg["_whisper_original"] = seg.get("text", "")
-                    seg["text"] = " ".join(yt_slice)
-                    yt_cursor += n_words
-
-                result.append(seg)
-
-            print(f"[YT-replace-full] All {len(result)} segments replaced | "
-                  f"Whisper {w_total} words -> YouTube {yt_total} words | "
-                  f"consumed {yt_cursor}/{yt_total}", flush=True)
-            return result
-
-        else:
-            # ═══ DIFF REPLACE: only swap words that differ ═══
-            # Use SequenceMatcher to align the two word streams. Where they
-            # match, keep Whisper's word (with its punctuation). Where they
-            # differ, use YouTube's word (correct spelling/names).
-            from difflib import SequenceMatcher
-
-            # Normalize for comparison (lowercase, strip punctuation)
-            import string
-            _punct = set(string.punctuation)
-
-            def _normalize(word: str) -> str:
-                return word.lower().strip("".join(_punct))
-
-            w_norm = [_normalize(w) for w in w_flat]
-            yt_norm = [_normalize(w) for w in yt_flat]
-
-            # Align the two sequences
-            sm = SequenceMatcher(None, w_norm, yt_norm, autojunk=False)
-            opcodes = sm.get_opcodes()
-
-            # Build the corrected flat word list
-            corrected_flat: List[str] = []
-            diff_count = 0
-
-            for tag, i1, i2, j1, j2 in opcodes:
-                if tag == "equal":
-                    # Words match — keep Whisper's version (preserves punctuation)
-                    corrected_flat.extend(w_flat[i1:i2])
-                elif tag == "replace":
-                    # Words differ — use YouTube's version (correct names/spelling)
-                    corrected_flat.extend(yt_flat[j1:j2])
-                    diff_count += (j2 - j1)
-                elif tag == "insert":
-                    # YouTube has extra words — insert them (Whisper dropped words)
-                    corrected_flat.extend(yt_flat[j1:j2])
-                    diff_count += (j2 - j1)
-                elif tag == "delete":
-                    # Whisper has extra words — skip them (hallucinations)
-                    diff_count += (i2 - i1)
-
-            # ── Reconstruct back into Whisper's segment structure ──
-            # Each segment gets the same NUMBER of words it originally had
-            # (from the corrected stream), preserving segment boundaries.
-            result = []
-            cursor = 0
-            corrected_total = len(corrected_flat)
-
-            for i, wseg in enumerate(whisper_segments):
-                seg = dict(wseg)
-                orig_wc = len(w_seg_words[i])
-
-                # Proportional share from corrected stream
-                if w_total > 0:
-                    proportion = orig_wc / w_total
-                    n_words = round(proportion * corrected_total)
-                else:
-                    n_words = orig_wc
-
-                n_words = max(1, min(n_words, corrected_total - cursor))
-                if i == len(whisper_segments) - 1:
-                    n_words = max(0, corrected_total - cursor)
-
-                if n_words > 0 and cursor < corrected_total:
-                    new_text = " ".join(corrected_flat[cursor:cursor + n_words])
-                    if new_text != seg.get("text", ""):
-                        seg["_whisper_original"] = seg.get("text", "")
-                    seg["text"] = new_text
-                    cursor += n_words
-
-                result.append(seg)
-
-            match_pct = ((w_total - diff_count) / max(w_total, 1)) * 100
-            print(f"[YT-replace-diff] {diff_count} words changed out of {w_total} "
-                  f"({match_pct:.0f}% match) | "
-                  f"Whisper {w_total} words, YouTube {yt_total} words, "
-                  f"corrected {corrected_total} words", flush=True)
-            return result
-
-    def _whisperx_align(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
-        """Refine word-level timestamps using WhisperX forced alignment.
-        Falls back to original segments if whisperx is not installed."""
+    def _refine_word_timing(self, wav_path: Path, segments: List[Dict]) -> List[Dict]:
+        """Refine to word-level timestamps via the tiered strategy in
+        dubbing/word_timing.py:
+
+            WhisperX forced alignment  →  local faster-whisper on GPU (when
+            WhisperX 'is not proper')  →  original segment-level timing.
+
+        The heavy local re-transcription is injected as a closure so the module
+        stays free of the multiprocessing worker; it is bound to
+        cfg.whisper_fallback_model (default large-v3)."""
         try:
-            import whisperx
-            import torch
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            lang = self.cfg.source_language
-            if not lang or lang == "auto":
-                lang = "en"
-
-            self._report("transcribe", 0.97, "Running WhisperX forced alignment...")
-            align_model, metadata = whisperx.load_align_model(
-                language_code=lang, device=device
-            )
-            result = whisperx.align(
-                segments, align_model, metadata, str(wav_path), device,
-                return_char_alignments=False,
-            )
-            refined = result.get("segments", segments)
-            # Normalise to our segment dict format (ensure start/end/text present)
-            # Preserve all original fields (e.g. speaker_id for multi-speaker mode)
-            out = []
-            for seg in refined:
-                entry = {**seg,  # Preserve original fields first
-                    "start": float(seg.get("start", 0)),
-                    "end":   float(seg.get("end", 0)),
-                    "text":  seg.get("text", "").strip(),
-                }
-                words = seg.get("words")
-                if words:
-                    entry["words"] = [
-                        {"word": w.get("word", "").strip(),
-                         "start": float(w.get("start", entry["start"])),
-                         "end":   float(w.get("end", entry["end"]))}
-                        for w in words
-                    ]
-                out.append(entry)
-            self._report("transcribe", 0.99, f"WhisperX alignment complete ({len(out)} segments)")
-            return out
-        except ImportError:
-            print("[Pipeline] whisperx not installed — skipping forced alignment", flush=True)
-            return segments
+            from dubbing import word_timing
         except Exception as e:
-            print(f"[Pipeline] WhisperX alignment failed ({e}) — using original timestamps", flush=True)
+            print(f"[Pipeline] word_timing module unavailable ({e}) — keeping timestamps",
+                  flush=True)
             return segments
+
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+        lang = self.cfg.source_language or "en"
+
+        def _local_whisper():
+            # Native word_timestamps via faster-whisper, forced to the fallback model.
+            return self._transcribe_local(
+                wav_path,
+                model_override=getattr(self.cfg, "whisper_fallback_model", "large-v3"),
+            )
+
+        return word_timing.refine(
+            wav_path, segments,
+            language=lang,
+            device=device,
+            use_whisperx=bool(self.cfg.use_whisperx),
+            gpu_fallback=bool(getattr(self.cfg, "whisper_gpu_fallback", True)),
+            local_whisper=_local_whisper,
+            report=self._report,
+        )
 
     def _transcribe_groq(self, wav_path: Path, api_key: str) -> List[Dict]:
         """Transcribe using Groq Whisper API — ~25s per hour of audio.
@@ -5049,7 +4819,7 @@ class Pipeline:
 
         return segments
 
-    def _transcribe_local(self, wav_path: Path) -> List[Dict]:
+    def _transcribe_local(self, wav_path: Path, model_override: Optional[str] = None) -> List[Dict]:
         """Transcribe speech from audio using local faster-whisper (GPU/CPU).
 
         Runs Whisper in a **child process** so that C-level crashes
@@ -5062,33 +4832,43 @@ class Pipeline:
         import json as _json
         import tempfile as _tmpmod
 
-        local_model = self.cfg.asr_model
-        if local_model in ("groq-whisper", "groq", "parakeet"):
-            local_model = "medium"
+        requested = model_override or self.cfg.asr_model
+        if requested in ("groq-whisper", "groq", "parakeet"):
+            requested = "medium"
 
         source_lang = self.cfg.source_language if self.cfg.source_language != "auto" else None
 
-        def _run_in_child(device: str, compute: str) -> List[Dict]:
-            """Spawn a child process to run Whisper. Returns segments or raises."""
+        # Timeout scales with audio length. A crash returns instantly (nonzero
+        # exit), so this only bounds a genuine hang — capped at 15 min, down from
+        # 30, so nothing grinds for half an hour.
+        try:
+            _audio_dur = self._get_duration(wav_path) or 300.0
+        except Exception:
+            _audio_dur = 300.0
+        child_timeout = int(min(900, max(180, _audio_dur * 3)))
+
+        def _run_in_child(model: str, device: str, compute: str) -> List[Dict]:
+            """Spawn a child process to run a SPECIFIC Whisper model. Returns
+            segments or raises."""
             fd, result_path = _tmpmod.mkstemp(suffix=".json", prefix="whisper_result_")
             import os as _os
             _os.close(fd)
             try:
                 self._report("transcribe", 0.1,
-                             f"Loading Whisper ({local_model}) on {device.upper()} (isolated process)...")
+                             f"Loading Whisper ({model}) on {device.upper()} (isolated process)...")
                 p = mp.Process(
                     target=_whisper_child_worker,
-                    args=(str(wav_path), local_model, device, compute, source_lang, result_path),
+                    args=(str(wav_path), model, device, compute, source_lang, result_path),
                     daemon=True,
                 )
                 p.start()
-                p.join(timeout=1800)  # 30 min max
+                p.join(timeout=child_timeout)
                 if p.is_alive():
                     p.kill()
                     p.join(5)
-                    raise RuntimeError("Whisper transcription timed out (30 min limit)")
+                    raise RuntimeError(f"Whisper {model}/{device} timed out ({child_timeout}s)")
                 if p.exitcode != 0:
-                    err_msg = f"Whisper child process died with exit code {p.exitcode}"
+                    err_msg = f"Whisper {model}/{device} child died with exit code {p.exitcode}"
                     try:
                         with open(result_path, "r", encoding="utf-8") as f:
                             data = _json.load(f)
@@ -5110,28 +4890,48 @@ class Pipeline:
                 except Exception:
                     pass
 
-        # Auto-detect GPU
-        device, compute = "cpu", "int8"
+        # Auto-detect GPU.
+        gpu = False
         try:
             import torch as _torch_mod
-            if _torch_mod.cuda.is_available():
-                device, compute = "cuda", "float16"
+            gpu = bool(_torch_mod.cuda.is_available())
+            if gpu:
                 print(f"[Whisper] GPU detected: {_torch_mod.cuda.get_device_name(0)}", flush=True)
             else:
                 print("[Whisper] torch.cuda.is_available() = False -> using CPU", flush=True)
-        except ImportError:
-            print("[Whisper] torch not installed -> using CPU", flush=True)
         except Exception as _gpu_err:
             print(f"[Whisper] GPU detection failed: {_gpu_err} -> using CPU", flush=True)
 
-        try:
-            return _run_in_child(device, compute)
-        except RuntimeError as e:
-            if device == "cuda":
+        # Fallback LADDER. A heavy model (e.g. large-v3) can hard-crash the CUDA
+        # child on some driver/CTranslate2 combos (exit 0xC0000409), and running
+        # a heavy model on CPU is so slow it used to hit the 30-min timeout. So
+        # on failure we DOWNSHIFT the model (then the device) to something lighter
+        # that actually finishes, instead of re-running the same heavy model on
+        # CPU. For large-v3 quality without a local GPU, use the Groq ASR model.
+        attempts: List[tuple] = []
+        if gpu:
+            attempts.append((requested, "cuda", "float16"))
+            if requested not in ("medium", "small", "base", "tiny"):
+                attempts.append(("medium", "cuda", "float16"))
+            attempts.append(("small", "cuda", "float16"))   # tiny + very stable
+        cpu_model = requested if requested in ("small", "base", "tiny") else "small"
+        attempts.append((cpu_model, "cpu", "int8"))         # CPU last resort — light so it completes
+
+        last_err: Optional[Exception] = None
+        for _i, (_model, _dev, _comp) in enumerate(attempts):
+            try:
+                return _run_in_child(_model, _dev, _comp)
+            except RuntimeError as _e:
+                last_err = _e
+                _nxt = attempts[_i + 1] if _i + 1 < len(attempts) else None
                 self._report("transcribe", 0.15,
-                             f"GPU transcription failed ({str(e)[:80]}) — retrying on CPU...")
-                return _run_in_child("cpu", "int8")
-            raise
+                             f"Whisper {_model}/{_dev} failed ({str(_e)[:55]})"
+                             + (f" — trying {_nxt[0]}/{_nxt[1]}..." if _nxt else "."))
+                continue
+        raise RuntimeError(
+            f"Local Whisper failed on all fallbacks ({str(last_err)[:100]}). "
+            f"Switch the ASR model to 'Groq Whisper' (cloud) — it runs large-v3 "
+            f"fast with no local GPU.")
 
     # ── Step 4: Translate full narrative ─────────────────────────────────
     def _translate_full_narrative(self, text_segments: List[Dict], speech_duration: float = 0) -> tuple:
@@ -5173,7 +4973,7 @@ class Pipeline:
             self._report("translate", 0.25, "Using Gemini for translation...")
             translated_text = self._translate_with_gemini(full_text, gemini_key, speech_duration)
         elif engine == "groq" and groq_key:
-            self._report("translate", 0.25, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.25, "Using Groq (gpt-oss-120b) for translation...")
             translated_text = self._translate_with_groq(full_text, groq_key, speech_duration)
         elif engine == "ollama" and self._ollama_available():
             self._report("translate", 0.25, "Using Ollama (local LLM) for translation...")
@@ -5185,7 +4985,7 @@ class Pipeline:
         elif gemini_key:
             translated_text = self._translate_with_gemini(full_text, gemini_key, speech_duration)
         elif groq_key:
-            self._report("translate", 0.25, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.25, "Using Groq (gpt-oss-120b) for translation...")
             translated_text = self._translate_with_groq(full_text, groq_key, speech_duration)
         elif self._ollama_available():
             self._report("translate", 0.25, "Using Ollama (local LLM) for translation...")
@@ -5248,7 +5048,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-pro",
+                        model=GEMINI_LLM_MODEL,
                         contents=prompt,
                     )
                     translated_parts.append((response.text or "").strip())
@@ -5390,7 +5190,7 @@ class Pipeline:
 
 
     def _translate_with_groq(self, full_text: str, api_key: str, speech_duration: float = 0) -> str:
-        """Translate using Groq (Llama 3.3 70B) for natural, fluent output."""
+        """Translate using Groq (gpt-oss-120b) for natural, fluent output."""
         import requests as _requests
 
         target_name = LANGUAGE_NAMES.get(self.cfg.target_language, self.cfg.target_language)
@@ -5426,7 +5226,7 @@ class Pipeline:
                     resp = _requests.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}]},
+                        json={"model": GROQ_LLM_MODEL, "messages": [{"role": "user", "content": prompt}]},
                         timeout=60,
                     )
                     data = resp.json()
@@ -5868,6 +5668,15 @@ class Pipeline:
 
         Only extends — never shrinks (shorter translation keeps original timing).
         """
+        # Tempo Match: slots must stay the ORIGINAL Whisper timing (they are
+        # the original speaker's tempo container). The per-segment fit ladder
+        # handles long translations; extending slots here would shift capacity
+        # between neighbours and distort every fit ratio.
+        if getattr(self.cfg, "tempo_match", False):
+            print("[Timeline] tempo_match ON — keeping original Whisper slots "
+                  "(WPM extension skipped)", flush=True)
+            return
+
         # Ensure sorted by start time before clamping to next segment
         segments.sort(key=lambda s: s.get("start", 0))
 
@@ -6143,6 +5952,10 @@ class Pipeline:
             if prev_ends_with_terminal:
                 i += 1
                 continue
+            # Different speakers are never one sentence (multi-speaker).
+            if self._different_speakers(segments[i - 1], segments[i]):
+                i += 1
+                continue
 
             first_word = text.split()[0] if text else ""
             word_count = len(text.split())
@@ -6196,6 +6009,9 @@ class Pipeline:
                           f"may contain placeholder tokens like __KEEP_SUBJ_0__",
                           flush=True)
 
+        # Hindi verbs agree with the speaker's gender; MT defaults to masculine.
+        self._apply_speaker_gender_grammar(segments)
+
     def _dispatch_translation_engine(self, segments):
         """Engine-routing helper extracted from _translate_segments.
 
@@ -6230,7 +6046,7 @@ class Pipeline:
             self._translate_segments_sambanova(segments, sambanova_key)
             return
         elif engine == "groq" and groq_key:
-            self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.05, "Using Groq (gpt-oss-120b) for translation...")
             self._translate_segments_groq(segments, groq_key)
             return
         elif engine == "gemma4" and gemini_key:
@@ -6329,7 +6145,7 @@ class Pipeline:
             self._report("translate", 0.05, "Using GPT-4o for premium translation...")
             self._translate_segments_openai(segments, openai_key)
         elif groq_key:
-            self._report("translate", 0.05, "Using Groq (Llama 3.3 70B) for translation...")
+            self._report("translate", 0.05, "Using Groq (gpt-oss-120b) for translation...")
             self._translate_segments_groq(segments, groq_key)
         elif sambanova_key:
             self._report("translate", 0.05, "Using SambaNova (Llama 3.3 70B) for translation...")
@@ -6375,7 +6191,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-pro", contents=prompt)
+                        model=GEMINI_LLM_MODEL, contents=prompt)
                     translations = self._parse_numbered_translations(response.text, len(batch))
                     for i, seg in enumerate(batch):
                         seg["text_translated"] = translations[i] if translations[i] else seg["text"]
@@ -6530,7 +6346,7 @@ class Pipeline:
                              f"Translated batch {completed[0]}/{total_batches} (Gemma 4 parallel)")
 
     def _translate_segments_groq(self, segments, api_key):
-        """Translate segments using Groq (Llama 3.3 70B) — fast, free, context-aware."""
+        """Translate segments using Groq (gpt-oss-120b) — fast, free, context-aware."""
         from groq import Groq
         client = Groq(api_key=api_key)
 
@@ -6551,7 +6367,7 @@ class Pipeline:
             for attempt in range(retries):
                 try:
                     response = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model=GROQ_LLM_MODEL,
                         messages=[
                             {"role": "system", "content": system_msg},
                             {"role": "user", "content": user_msg},
@@ -6618,7 +6434,7 @@ class Pipeline:
 
     # Engine configs for OpenAI-compatible APIs (all using Llama 3.3 70B)
     TURBO_ENGINE_CONFIG = {
-        "Groq": ("https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
+        "Groq": ("https://api.groq.com/openai/v1/chat/completions", GROQ_LLM_MODEL),
         "SambaNova": ("https://api.sambanova.ai/v1/chat/completions", "Meta-Llama-3.3-70B-Instruct"),
     }
 
@@ -7071,38 +6887,90 @@ class Pipeline:
                     or "that's an error" in low or "<html" in low
                     or "<!doctype" in low)
 
+        import threading as _th
+        failed = []            # segments left in the source language
+        rate_limited = [False]
+        consecutive_429 = [0]
+        stop = _th.Event()     # set once the job can't succeed, or on cancel
+        fail_limit = max(2, 0.05 * total)
+
         def translate_one(idx_seg):
             idx, seg = idx_seg
-            retries = 3
+            text = seg.get("text", "")
+            # Symbols / punctuation only ("♪", "..."): nothing to translate,
+            # and not a failure.
+            if not any(c.isalpha() for c in text):
+                seg["text_translated"] = text
+                return idx
+            retries = 4
             for attempt in range(retries):
+                if stop.is_set() or self._cancel_check():
+                    seg["text_translated"] = text
+                    failed.append(idx)
+                    return idx
                 try:
                     translator = GoogleTranslator(source=src, target=self.cfg.target_language)
-                    result = translator.translate(seg["text"])
+                    result = translator.translate(text)
+                    consecutive_429[0] = 0
                     if _is_garbage(result):
                         if attempt < retries - 1:
-                            import time; time.sleep(1.5 * (attempt + 1))
+                            stop.wait(1.5 * (attempt + 1))
                             continue
                         # All retries returned garbage — keep original
-                        seg["text_translated"] = seg["text"]
+                        seg["text_translated"] = text
+                        failed.append(idx)
                     else:
-                        seg["text_translated"] = result or seg["text"]
+                        seg["text_translated"] = result or text
                     break
-                except Exception:
+                except Exception as e:
+                    # Google answers bursts with "Too many requests" (429); a
+                    # 1.5 s retry just hits the same wall, so back off longer.
+                    too_many = "too many requests" in str(e).lower() or "TooManyRequests" in type(e).__name__
+                    if too_many:
+                        rate_limited[0] = True
+                        consecutive_429[0] += 1
+                        # A sustained block: every worker is hitting 429.
+                        # Retrying only prolongs the block and the wait.
+                        if consecutive_429[0] >= 40:
+                            stop.set()
                     if attempt < retries - 1:
-                        import time; time.sleep(1.5 * (attempt + 1))
+                        # stop.wait ends early on cancel / a doomed job
+                        stop.wait((5, 15, 30)[attempt] if too_many else 1.5 * (attempt + 1))
                     else:
-                        seg["text_translated"] = seg["text"]
+                        seg["text_translated"] = text
+                        failed.append(idx)
+            if len(failed) > fail_limit:
+                stop.set()
             return idx
 
         # 20 parallel workers — Google Translate handles this fine
-        with ThreadPoolExecutor(max_workers=20) as pool:
+        pool = ThreadPoolExecutor(max_workers=20)
+        try:
             futures = {pool.submit(translate_one, (i, s)): i for i, s in enumerate(segments)}
             for future in as_completed(futures):
                 completed[0] += 1
+                if self._cancel_check():
+                    stop.set()
                 if completed[0] % 20 == 0 or completed[0] == total:
                     self._report("translate", 0.05 + 0.90 * (completed[0] / total),
                                  f"Google Translate: {completed[0]}/{total}")
+        finally:
+            if self._cancel_check():
+                stop.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+        self._check_cancelled()
 
+        # Untranslated lines would be voiced in English by the Hindi voice and
+        # the job would still say "Complete" — fail loudly instead.
+        if failed and len(failed) > max(2, 0.05 * total):
+            why = ("Google is rate-limiting this PC ('Too many requests')" if rate_limited[0]
+                   else "Google returned errors")
+            raise RuntimeError(
+                f"Google Translate failed for {len(failed)}/{total} segments — {why}. "
+                f"Wait 30-60 min and retry, or pick another Translation engine (Groq/Gemini) in Settings.")
+        if failed:
+            self._report("translate", 0.97,
+                         f"Google Translate: {len(failed)} segment(s) left untranslated after retries")
         self._report("translate", 1.0, f"Google Translate complete: {total} segments")
 
     def _translate_segments_google_polish(self, segments):
@@ -7225,7 +7093,7 @@ class Pipeline:
                         from google import genai
                         client = genai.Client(api_key=key)
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash-preview-05-20",
+                            model=GEMINI_LLM_MODEL,
                             contents=polish_system + "\n\n" + user_msg)
                         polished = self._parse_numbered_translations(response.text, len(batch))
                     except Exception:
@@ -7411,7 +7279,7 @@ class Pipeline:
                             from google import genai
                             client = genai.Client(api_key=key)
                             r = client.models.generate_content(
-                                model="gemini-2.5-flash-preview-05-20",
+                                model=GEMINI_LLM_MODEL,
                                 contents=polish_system + "\n\n" + user_msg)
                             return self._parse_numbered_translations(r.text, len(batch))
                         except Exception:
@@ -7763,6 +7631,17 @@ class Pipeline:
     SPEED_MIN = 1.0 / 1.1    # 0.909 — slowest we allow (1.1x slower than natural)
     SPEED_MAX = 1.25          # fastest we allow (1.25x faster than natural)
 
+    # ── Tempo Match constants (per-segment fit ladder) ──
+    # Research band: ±10-15% speech-rate change is imperceptible; a single
+    # atempo pass on clean TTS speech stays natural up to ~1.25x.
+    TEMPO_ATEMPO_MAX = 1.25        # max single atempo fine-fit ratio
+    TEMPO_MIN_SLOT_SEC = 0.4       # slots shorter than this skip the ladder
+    TEMPO_MIN_RESIDUAL_PAUSE = 0.15  # seconds of borrowed gap always left intact
+    TEMPO_EDGE_RATE_MAX = 100      # Edge-TTS silently clamps rates above +100%
+    TEMPO_TAIL_SHAVE = 0.03        # fit-target shave: atempo slop lands in padding, not speech
+    TEMPO_STUB_SEC = 0.05          # audio shorter than this = failed TTS stub
+    TEMPO_INTER_PAUSE = 0.15       # pause between sentence-children inside a parent slot
+
     # Spec-aligned duration fitting thresholds (per production-grade dubbing spec)
     FIT_PASS_MS = 80          # ≤80ms error → accept as-is (no stretch)
     FIT_STRETCH_MS = 150      # ≤150ms → fine stretch within preferred ratio
@@ -7898,15 +7777,20 @@ class Pipeline:
         results.sort(key=lambda x: x[0])
         return [r[1] for r in results]
 
-    def _build_timeline_no_cut(self, tts_data, total_duration, prefix=""):
+    def _build_timeline_no_cut(self, tts_data, total_duration, prefix="",
+                               exact=False):
         """Place TTS segments on a timeline WITHOUT cutting any audio.
 
         Uses FFmpeg adelay filter to place each segment at its correct time,
         then amix to combine. Handles arbitrarily long videos without loading
         the entire timeline into RAM (avoids OOM on 12h+ videos).
+
+        exact=True (Tempo Match): the timeline is EXACTLY total_duration —
+        no extension for overruns, and every ffmpeg call is bounded with -t.
+        Without -t the adelay+apad+amix graph pads forever and never exits.
         """
         # Extend total_duration to fit all reflowed segments
-        if tts_data:
+        if tts_data and not exact:
             last = max(tts_data, key=lambda s: s.get("start", 0) + s.get("duration", 0))
             actual_end = last.get("start", 0) + last.get("duration", 0) + 0.5
             total_duration = max(total_duration, actual_end)
@@ -7928,14 +7812,14 @@ class Pipeline:
         # FFmpeg's filter complexity limits (~500 inputs max)
         CHUNK_SIZE = 200
         if len(tts_data) <= CHUNK_SIZE:
-            self._build_timeline_chunk(tts_data, total_duration, output)
+            self._build_timeline_chunk(tts_data, total_duration, output, exact=exact)
         else:
             # Build chunks, then merge
             chunk_paths = []
             for ci in range(0, len(tts_data), CHUNK_SIZE):
                 chunk = tts_data[ci:ci + CHUNK_SIZE]
                 chunk_out = self.cfg.work_dir / f"{prefix}timeline_chunk_{ci:04d}.wav"
-                self._build_timeline_chunk(chunk, total_duration, chunk_out)
+                self._build_timeline_chunk(chunk, total_duration, chunk_out, exact=exact)
                 chunk_paths.append(chunk_out)
                 self._report("assemble",
                              0.2 + 0.3 * ((ci + CHUNK_SIZE) / len(tts_data)),
@@ -7964,8 +7848,9 @@ class Pipeline:
                             [self._ffmpeg, "-y"] + inputs + [
                                 "-filter_complex",
                                 f"amix=inputs={len(batch)}:duration=longest:normalize=0",
-                                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                                "-acodec", "pcm_s16le", str(merge_out)],
+                                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS)]
+                            + (["-t", f"{total_duration:.3f}"] if exact else [])
+                            + ["-acodec", "pcm_s16le", str(merge_out)],
                             check=True, capture_output=True,
                         )
                         next_paths.append(merge_out)
@@ -7981,11 +7866,16 @@ class Pipeline:
 
         return output
 
-    def _build_timeline_chunk(self, tts_data, total_duration, output: Path):
+    def _build_timeline_chunk(self, tts_data, total_duration, output: Path,
+                              exact=False):
         """Build a WAV timeline for a chunk of TTS segments using FFmpeg adelay + amix.
 
         Segments are pre-reflowed by _truncate_overlaps() so they don't overlap.
         Each segment plays at full duration — no trimming.
+
+        exact=True bounds the output with -t total_duration — REQUIRED for the
+        Tempo Match path: the adelay+apad+amix graph is otherwise infinite
+        (apad pads forever, amix duration=longest waits forever).
         """
         inputs = []
         filter_parts = []
@@ -8019,10 +7909,547 @@ class Pipeline:
         self._run_proc(
             [self._ffmpeg, "-y"] + inputs + [
                 "-filter_complex", filter_complex,
-                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                "-acodec", "pcm_s16le", str(output)],
+                "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS)]
+            + (["-t", f"{total_duration:.3f}"] if exact else [])
+            + ["-acodec", "pcm_s16le", str(output)],
             check=True, capture_output=True,
         )
+
+    # ── Tempo Match: per-segment fit + anchored assembly ────────────────
+
+    def _atempo_exact_fit(self, wav_path, ratio: float, target_dur: float,
+                          output_path) -> None:
+        """Speed a WAV by `ratio` and land EXACTLY on target_dur.
+
+        atempo's own length math has ~1% slop, so we never trust it:
+        `apad` + `-t` makes the clip sample-exact regardless of filter
+        internals. Deliberately atempo-only (no rubberband) so output is
+        identical on every ffmpeg build.
+        """
+        filters = []
+        t = max(ratio, 0.5)
+        while t > 2.0:
+            filters.append("atempo=2.0")
+            t /= 2.0
+        filters.append(f"atempo={t:.4f}")
+        af = ",".join(filters) + ",apad"
+        self._run_proc(
+            [self._ffmpeg, "-y", "-i", str(wav_path),
+             "-af", af, "-t", f"{max(target_dur, 0.05):.3f}",
+             "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+             "-acodec", "pcm_s16le", str(output_path)],
+            check=True, capture_output=True,
+        )
+
+    def _tempo_edge_trim(self, wav_path) -> None:
+        """Trim ONLY leading/trailing silence in place (no internal edits).
+
+        Used under tempo_match when _enhance_tts_wav is a no-op
+        (post_tts_level=='none' / audio_untouchable): Edge-TTS bakes
+        0.7-1.3s of trailing silence into every MP3, which would
+        systematically inflate every fit measurement.
+        """
+        try:
+            import soundfile as _sf
+            import numpy as _np
+            data, srate = _sf.read(str(wav_path))
+            mono = _np.mean(data, axis=1) if data.ndim > 1 else data
+            frame_len = max(1, int(srate * 0.01))
+            n_frames = len(mono) // frame_len
+            if n_frames < 3:
+                return
+            energy = _np.array([
+                _np.sqrt(_np.mean(mono[i * frame_len:(i + 1) * frame_len] ** 2))
+                for i in range(n_frames)
+            ])
+            loud = _np.nonzero(energy > 0.01)[0]
+            if len(loud) == 0:
+                return
+            s = max(0, (int(loud[0]) - 1)) * frame_len
+            e = min(len(data), (int(loud[-1]) + 2) * frame_len)
+            if e - s < len(data):
+                _sf.write(str(wav_path), data[s:e], srate)
+        except Exception:
+            pass  # trimming is best-effort; measurement still works untrimmed
+
+    def _tempo_fit_segments(self, tts_data, segments):
+        """Tempo Match fit ladder — fit dubbed speech INTO the original slots.
+
+        Groups sentence-children back to their PARENT Whisper segment (child
+        timestamps are synthetic), then per group:
+
+          slot   = parent_end - parent_start          (original speaker tempo)
+          borrow = min(real trailing silence - 150ms, tempo_gap_borrow_ms)
+          budget = slot + borrow
+
+          r0 = measured_audio / budget
+          a) r0 <= 1.0                → place as-is (rest of slot stays silent)
+          b) r0 <= 1.25 & <= user max → one atempo exact-fit (imperceptible band)
+          c) r0 >  1.25               → re-synthesize once at Edge rate +N%
+                                        (validated vs pass-1), then atempo trim
+          d) still over user max      → cap at user max, overflow into the
+                                        physical gap; if even that fails,
+                                        hard-trim + flag for manual review
+
+        Every decision derives ONLY from ffprobe/soundfile measurements.
+        Records go to self._tempo_fit_records for the QA report.
+        """
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not tts_data:
+            return tts_data
+
+        cfg = self.cfg
+        max_speed = float(getattr(cfg, "tempo_max_speedup", 1.5) or 1.5)
+        max_speed = min(max(max_speed, 1.05), 3.0)
+        borrow_cap = max(0, int(getattr(cfg, "tempo_gap_borrow_ms", 500) or 0)) / 1000.0
+        level = getattr(cfg, "post_tts_level", "full")
+        enhance_noop = (level == "none"
+                        or getattr(cfg, "audio_untouchable", False))
+        work_dir = cfg.work_dir
+
+        # ── Group entries by parent Whisper segment ──
+        def _seg_for(entry):
+            si = entry.get("_seg_idx")
+            if si is not None and segments and 0 <= si < len(segments):
+                return segments[si]
+            return None
+
+        groups = {}   # key -> list of (order, entry, seg)
+        order_of = {}
+        for oi, entry in enumerate(tts_data):
+            seg = _seg_for(entry)
+            if seg is not None and "_parent_idx" in seg:
+                key = ("p", seg["_parent_idx"])
+                p_start = float(seg.get("_parent_start", seg.get("start", 0)))
+                p_end = float(seg.get("_parent_end", seg.get("end", p_start)))
+            else:
+                key = ("s", oi)
+                src = seg if seg is not None else entry
+                p_start = float(src.get("start", 0))
+                p_end = float(src.get("end", p_start))
+            g = groups.setdefault(key, {"start": p_start, "end": p_end,
+                                        "members": [], "gap": 0.0})
+            g["members"].append((oi, entry, seg))
+            gap_src = seg if seg is not None else entry
+            g["gap"] = max(g["gap"], float(gap_src.get("_orig_gap", 0.0) or 0.0))
+            order_of[key] = min(order_of.get(key, oi), oi)
+
+        ordered = sorted(groups.items(), key=lambda kv: kv[1]["start"])
+        total_groups = len(ordered)
+        records = []
+        self._report("assemble", 0.10,
+                     f"[TempoFit] Fitting {len(tts_data)} segments into "
+                     f"{total_groups} original slots (max {max_speed:.1f}x)...")
+
+        def _measure(path):
+            d = self._get_duration(Path(path))
+            return max(0.0, d)
+
+        def _resynth_child(entry, seg, rate_pct, tag):
+            """Pass-2: re-synthesize one child at +N% Edge rate. Returns
+            (wav_path, duration) or None if pass-2 is rejected."""
+            # Pass-2 is Edge-only. If pass-1 could have come from any other
+            # engine (XTTS clone, CosyVoice, Chatterbox, Sarvam, ElevenLabs,
+            # Google, ...), re-synthesizing here would swap the voice
+            # mid-video — bail and let the atempo ladder absorb the excess.
+            non_edge = (getattr(cfg, "use_cosyvoice", False)
+                        or getattr(cfg, "use_coqui_xtts", False)
+                        or getattr(cfg, "use_chatterbox", False)
+                        or getattr(cfg, "use_sarvam_bulbul", False)
+                        or getattr(cfg, "use_elevenlabs", False)
+                        or getattr(cfg, "use_google_tts", False)
+                        or getattr(cfg, "use_fish_speech", False)
+                        or getattr(cfg, "use_indic_parler", False))
+            if non_edge or not getattr(cfg, "use_edge_tts", True):
+                return None
+            text_src = ""
+            if seg is not None:
+                text_src = (seg.get("_expected_text")
+                            or seg.get("text_translated")
+                            or seg.get("text", "")).strip()
+            if not text_src:
+                return None
+            text = self._prepare_tts_text(text_src)
+            voice = cfg.tts_voice
+            vmap = getattr(self, "_voice_map", None)
+            if vmap and seg is not None and "speaker_id" in seg:
+                voice = vmap.get(seg["speaker_id"], cfg.tts_voice)
+            mp3 = work_dir / f"tempo2_{tag}.mp3"
+            wav = work_dir / f"tempo2_{tag}.wav"
+            try:
+                asyncio.run(self._edge_tts_single(
+                    text, mp3, voice=voice, rate=f"+{int(rate_pct)}%"))
+                if not mp3.exists() or mp3.stat().st_size < 200:
+                    return None
+                self._run_proc(
+                    [self._ffmpeg, "-y", "-i", str(mp3),
+                     "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                     str(wav)],
+                    check=True, capture_output=True)
+                mp3.unlink(missing_ok=True)
+                self._enhance_tts_wav(wav)
+                if enhance_noop:
+                    self._tempo_edge_trim(wav)
+                return (wav, _measure(wav))
+            except Exception as e:
+                print(f"[TempoFit] pass-2 synth failed ({tag}): {e}", flush=True)
+                return None
+
+        def _fit_group(gi_key_g):
+            gi, (key, g) = gi_key_g
+            members = sorted(g["members"], key=lambda m: float(m[1].get("start", 0)))
+            p_start, p_end = g["start"], g["end"]
+            # _close_segment_gaps already folded the trailing silence INTO the
+            # slot (end was extended to next start), so the parent span is
+            # speech + silence. _orig_gap (snapshotted before folding) tells
+            # us how much is silence: the REAL speech slot is span - gap, and
+            # "borrowing" means letting speech eat into that folded silence.
+            slot_closed = max(p_end - p_start, 0.05)
+            gap = min(max(0.0, g["gap"]), slot_closed)
+            slot = max(slot_closed - gap, 0.05)     # original speech portion
+            borrow = min(max(0.0, gap - self.TEMPO_MIN_RESIDUAL_PAUSE), borrow_cap)
+            budget = slot + borrow
+            # Absolute physical ceiling: never past the next parent's start.
+            hard_ceiling = max(slot_closed - 0.05, slot)
+
+            rec = {"slot": round(slot, 3), "slot_closed": round(slot_closed, 3),
+                   "gap": round(gap, 3),
+                   "budget": round(budget, 3), "start": round(p_start, 3),
+                   "n_children": len(members), "tier": "fit",
+                   "rate_pct": 0, "atempo": 1.0, "flagged": False,
+                   "overflow_ms": 0}
+
+            # ── Measure pass-1 children (re-probe, never trust stale) ──
+            durs = []
+            for oi, entry, seg in members:
+                wav = entry.get("wav")
+                if not wav or not Path(wav).exists():
+                    durs.append(0.0)
+                    continue
+                if enhance_noop:
+                    self._tempo_edge_trim(Path(wav))
+                durs.append(_measure(wav))
+
+            # ── Stub guard: near-empty audio is a TTS failure, not "a fit" ──
+            for k, (oi, entry, seg) in enumerate(members):
+                text_here = ""
+                if seg is not None:
+                    text_here = (seg.get("text_translated") or seg.get("text", "")).strip()
+                if durs[k] < self.TEMPO_STUB_SEC and text_here:
+                    redo = _resynth_child(entry, seg, 0, f"stub_{gi}_{k}")
+                    if redo and redo[1] >= self.TEMPO_STUB_SEC:
+                        entry["wav"] = redo[0]
+                        durs[k] = redo[1]
+                    else:
+                        # Sticky: later tiers may overwrite rec["tier"], but a
+                        # permanently-empty child must still reach review.
+                        rec["tier"] = "empty"
+                        rec["flagged"] = True
+                        rec["has_empty_child"] = True
+
+            n_live = sum(1 for d in durs if d >= self.TEMPO_STUB_SEC)
+            pauses = self.TEMPO_INTER_PAUSE * max(0, n_live - 1)
+            d0 = sum(durs) + pauses
+            rec["d0"] = round(d0, 3)
+
+            if d0 <= 0.001:
+                rec["tier"] = "empty"
+                rec["flagged"] = True
+                self._tempo_place(members, durs, p_start)
+                return rec
+
+            # ── Short-slot guard: interjections skip the ladder ──
+            if slot < self.TEMPO_MIN_SLOT_SEC:
+                if d0 <= hard_ceiling:
+                    rec["tier"] = "short_slot"
+                    rec["overflow_ms"] = int(max(0.0, d0 - slot) * 1000)
+                    self._tempo_place(members, durs, p_start)
+                    return rec
+                budget = hard_ceiling  # too long even for that → normal ladder
+
+            # Pauses are placed at FULL length (never compressed), so every
+            # ratio is computed over the speech portion against a
+            # pause-reduced target — placed span = speech/ratio + pauses.
+            fit_target = max(budget - self.TEMPO_TAIL_SHAVE, 0.1)
+            r0 = (d0 - pauses) / max(fit_target - pauses, 0.1)
+            rec["r0"] = round(r0, 3)
+            rate_pct = 0
+
+            # ── Tier c: re-synthesize once at the needed Edge rate ──
+            if r0 > self.TEMPO_ATEMPO_MAX:
+                needed = min(r0, max_speed)
+                rate_pct = int(math.ceil((needed - 1.0) * 100))
+                rate_pct = int(math.ceil(rate_pct / 5.0) * 5)     # cache-friendly steps
+                rate_pct = max(5, min(rate_pct,
+                                      int((max_speed - 1.0) * 100),
+                                      self.TEMPO_EDGE_RATE_MAX))
+                new_durs = list(durs)
+                for k, (oi, entry, seg) in enumerate(members):
+                    if durs[k] < self.TEMPO_STUB_SEC:
+                        continue
+                    redo = _resynth_child(entry, seg, rate_pct, f"{gi}_{k}")
+                    if redo is None:
+                        continue
+                    wav2, d1 = redo
+                    expected = durs[k] / (1.0 + rate_pct / 100.0)
+                    # Acceptance rule: pass-2 must be shorter than pass-1 and
+                    # not truncated (>= 60% of the linear expectation).
+                    if self.TEMPO_STUB_SEC < d1 < durs[k] and d1 >= 0.6 * expected:
+                        entry["wav"] = wav2
+                        new_durs[k] = d1
+                    # else: keep pass-1 child; atempo below absorbs the excess
+                durs = new_durs
+                pauses = self.TEMPO_INTER_PAUSE * max(
+                    0, sum(1 for d in durs if d >= self.TEMPO_STUB_SEC) - 1)
+                d0 = sum(durs) + pauses
+                rec["tier"] = "two_pass"
+                rec["rate_pct"] = rate_pct
+                rec["d1"] = round(d0, 3)
+                r0 = (d0 - pauses) / max(fit_target - pauses, 0.1)
+
+            engine_factor = 1.0 + rate_pct / 100.0
+
+            # ── Fine fit / placement ──
+            if r0 <= 1.0:
+                if rec["tier"] == "fit" and rate_pct == 0:
+                    rec["tier"] = "fit"
+                self._tempo_place(members, durs, p_start)
+                return rec
+
+            # atempo ratio allowed by the user's TOTAL speed ceiling
+            allowed_atempo = min(self.TEMPO_ATEMPO_MAX, max_speed / engine_factor)
+            ratio = r0
+            if ratio <= allowed_atempo:
+                if rec["tier"] == "fit":
+                    rec["tier"] = "atempo_only"
+            else:
+                # Over the user's ceiling — cap and try to overflow into the
+                # folded silence beyond what we already borrowed.
+                ratio = max(allowed_atempo, 1.0)
+                capped_total = (d0 - pauses) / ratio + pauses
+                if capped_total <= hard_ceiling + 0.001:
+                    rec["tier"] = "over_cap"
+                    rec["flagged"] = True
+                    rec["overflow_ms"] = int(max(0.0, capped_total - budget) * 1000)
+                else:
+                    # Even the folded silence can't hold it. Speech is never
+                    # deleted, and the next anchor is sacred — so the ONLY
+                    # remaining move is to exceed the user's speed cap for
+                    # this one group, fit exactly into the physical ceiling,
+                    # and flag it loudly for manual review.
+                    rec["tier"] = "hard_cap"
+                    rec["flagged"] = True
+                    rec["overflow_ms"] = int((capped_total - hard_ceiling) * 1000)
+                    ratio = (d0 - pauses) / max(hard_ceiling - 0.05 - pauses, 0.1)
+
+            rec["atempo"] = round(ratio, 4)
+            if ratio > 1.001:
+                fitted_durs = []
+                for k, (oi, entry, seg) in enumerate(members):
+                    if durs[k] < self.TEMPO_STUB_SEC:
+                        fitted_durs.append(durs[k])
+                        continue
+                    child_target = durs[k] / ratio
+                    out = work_dir / f"tempo_fit_{gi:04d}_{k}.wav"
+                    try:
+                        self._atempo_exact_fit(entry["wav"], ratio,
+                                               child_target, out)
+                        entry["wav"] = out
+                        fitted_durs.append(child_target)
+                    except Exception as e:
+                        print(f"[TempoFit] atempo failed g{gi} c{k}: {e} "
+                              f"— keeping unfitted audio", flush=True)
+                        fitted_durs.append(durs[k])
+                durs = fitted_durs
+            self._tempo_place(members, durs, p_start)
+            return rec
+
+        done = 0
+        indexed = list(enumerate(ordered))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fit_group, item): item[0] for item in indexed}
+            results = [None] * len(indexed)
+            for fut in as_completed(futures):
+                gi = futures[fut]
+                try:
+                    results[gi] = fut.result()
+                except Exception as e:
+                    print(f"[TempoFit] group {gi} failed: {e}", flush=True)
+                    results[gi] = {"tier": "error", "flagged": True,
+                                   "error": str(e)}
+                done += 1
+                if done % 10 == 0 or done == total_groups:
+                    self._report("assemble",
+                                 0.10 + 0.04 * (done / max(total_groups, 1)),
+                                 f"[TempoFit] {done}/{total_groups} slots fitted")
+
+        records = [r for r in results if r]
+        self._tempo_fit_records = records
+
+        # Manual-review queue for the hard cases
+        review = []
+        for r in records:
+            if r.get("flagged") and (r.get("tier") in ("hard_cap", "empty", "error")
+                                     or r.get("has_empty_child")):
+                review.append({"start": r.get("start"), "slot": r.get("slot"),
+                               "tier": r.get("tier"),
+                               "overflow_ms": r.get("overflow_ms", 0),
+                               "issues": [f"tempo_match {r.get('tier')}"]})
+        if review:
+            try:
+                self._save_manual_review_queue(review)
+            except Exception:
+                pass
+
+        hist = {}
+        for r in records:
+            hist[r.get("tier", "?")] = hist.get(r.get("tier", "?"), 0) + 1
+        hist_s = ", ".join(f"{v} {k}" for k, v in sorted(hist.items()))
+        self._report("assemble", 0.14, f"[TempoFit] Done: {hist_s}")
+
+        for t in tts_data:
+            t["_tempo_fitted"] = True
+        tts_data.sort(key=lambda t: float(t.get("start", 0)))
+        return tts_data
+
+    @staticmethod
+    def _tempo_place(members, durs, p_start):
+        """Place children sequentially from the parent's REAL start anchor."""
+        pos = p_start
+        placed_any = False
+        for k, (oi, entry, seg) in enumerate(members):
+            d = durs[k] if k < len(durs) else 0.0
+            if placed_any and d >= Pipeline.TEMPO_STUB_SEC:
+                pos += Pipeline.TEMPO_INTER_PAUSE
+            entry["start"] = pos
+            entry["end"] = pos + d
+            entry["duration"] = d
+            if d >= Pipeline.TEMPO_STUB_SEC:
+                placed_any = True
+                pos += d
+
+    def _assemble_anchored(self, video_path, audio_raw, tts_data,
+                           total_video_duration):
+        """Tempo Match assembly: video untouched, audio anchored to original
+        timestamps, output duration == source duration by construction.
+
+        1. Fit ladder (if not already run) — audio fits its slots.
+        2. Timeline WAV, then FORCED to exactly the target length with
+           apad + -t (never trust amix arithmetic).
+        3. Optional original-background mix (also re-trimmed to length).
+        4. Mux with stream-copied video. No setpts. No per-segment encode.
+        """
+        print("[Assembly] Using: _assemble_anchored (Tempo Match)", flush=True)
+
+        if not any(t.get("_tempo_fitted") for t in tts_data):
+            segs = getattr(self, "_split_tts_segments", None) or self.segments
+            tts_data = self._tempo_fit_segments(tts_data, segs)
+
+        # dub_duration clips the OUTPUT — the canvas must match the window,
+        # not the full source (a 10-min window on a 95-min video must not
+        # produce 95 minutes of silent video).
+        dub_dur_min = getattr(self.cfg, "dub_duration", 0) or 0
+        effective = float(total_video_duration)
+        if dub_dur_min > 0:
+            effective = min(effective, dub_dur_min * 60.0)
+        # Never cut fitted speech: extend to the last placed segment if a
+        # boundary segment runs slightly past the window edge.
+        last_end = max((float(t.get("start", 0)) + float(t.get("duration", 0))
+                        for t in tts_data
+                        if t.get("wav") and Path(t["wav"]).exists()),
+                       default=0.0)
+        effective = min(max(effective, last_end + 0.25),
+                        float(total_video_duration))
+
+        self._report("assemble", 0.15,
+                     f"Anchored timeline ({effective:.1f}s, exact length)...")
+        timeline = self._build_timeline_no_cut(tts_data, effective,
+                                               prefix="anchored_", exact=True)
+
+        exact = self.cfg.work_dir / "anchored_exact.wav"
+        self._run_proc(
+            [self._ffmpeg, "-y", "-i", str(timeline),
+             "-af", "apad", "-t", f"{effective:.3f}",
+             "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+             "-acodec", "pcm_s16le", str(exact)],
+            check=True, capture_output=True,
+        )
+
+        final_audio = exact
+        if getattr(self.cfg, "mix_original", False):
+            mixed = self._mix_audio(audio_raw, exact,
+                                    getattr(self.cfg, "original_volume", 0.1))
+            mixed_exact = self.cfg.work_dir / "anchored_mixed_exact.wav"
+            self._run_proc(
+                [self._ffmpeg, "-y", "-i", str(mixed),
+                 "-af", "apad", "-t", f"{effective:.3f}",
+                 "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
+                 "-acodec", "pcm_s16le", str(mixed_exact)],
+                check=True, capture_output=True,
+            )
+            final_audio = mixed_exact
+
+        # Trim the video only when a dub window applies (stream copy; the
+        # cut lands on a keyframe — ±a fraction of a second of slop).
+        video_in = Path(video_path)
+        if effective < float(total_video_duration) - 0.5:
+            clip = self.cfg.work_dir / "anchored_video_clip.mp4"
+            self._run_proc(
+                [self._ffmpeg, "-y", "-i", str(video_path),
+                 "-t", f"{effective:.3f}", "-c", "copy", str(clip)],
+                check=True, capture_output=True,
+            )
+            if clip.exists() and clip.stat().st_size > 0:
+                video_in = clip
+
+        self._report("assemble", 0.85, "Muxing (video stream-copied, "
+                                       "no time changes)...")
+        self._mux_replace_audio(video_in, final_audio, self.cfg.output_path)
+
+        out_dur = self._get_duration(self.cfg.output_path)
+        delta_ms = (out_dur - effective) * 1000.0
+        self._report("assemble", 0.97,
+                     f"Sync check: output {out_dur:.2f}s vs target "
+                     f"{effective:.2f}s (Δ{delta_ms:+.0f}ms)")
+
+        try:
+            job_id = self.cfg.work_dir.parent.name if self.cfg.work_dir else "unknown"
+            self._write_tempo_qa_report(job_id, out_dur, effective)
+        except Exception as e:
+            print(f"[TempoQA] report failed: {e}", flush=True)
+
+    def _write_tempo_qa_report(self, job_id: str, out_dur: float,
+                               target_dur: float):
+        """Machine-readable per-run report: logs/tempo_qa_<job_id>.json."""
+        records = getattr(self, "_tempo_fit_records", None) or []
+        import json as _json
+        hist = {}
+        max_over = 0
+        for r in records:
+            hist[r.get("tier", "?")] = hist.get(r.get("tier", "?"), 0) + 1
+            max_over = max(max_over, int(r.get("overflow_ms", 0) or 0))
+        flagged = [r for r in records if r.get("flagged")]
+        report = {
+            "job_id": job_id,
+            "output_duration": round(out_dur, 3),
+            "target_duration": round(target_dur, 3),
+            "duration_delta_ms": round((out_dur - target_dur) * 1000, 1),
+            "tier_histogram": hist,
+            "max_overflow_ms": max_over,
+            "flagged_segments": flagged,
+            "segments": records,
+        }
+        log_dir = Path(__file__).parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        path = log_dir / f"tempo_qa_{job_id}.json"
+        path.write_text(_json.dumps(report, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+        hist_s = ", ".join(f"{v} {k}" for k, v in sorted(hist.items()))
+        self._report("assemble", 0.99,
+                     f"Tempo QA: {hist_s} | {len(flagged)} flagged | "
+                     f"Δ{(out_dur - target_dur) * 1000:+.0f}ms -> {path.name}")
 
     # ── Video-adapts-to-audio assembly ──────────────────────────────────
     # Maximum video slowdown: 1.1x (setpts=1.1*PTS makes it 10% slower)
@@ -8619,7 +9046,7 @@ class Pipeline:
         A segment like "यह अच्छा है। अब आगे बढ़ते हैं।" becomes two segments.
         """
         split = []
-        for seg in segments:
+        for pi, seg in enumerate(segments):
             text = seg.get("text_translated", seg.get("text", "")).strip()
             if not text:
                 split.append(seg)
@@ -8636,7 +9063,8 @@ class Pipeline:
             # Distribute time proportionally by character count
             total_chars = sum(len(s) for s in sentences)
             seg_start = seg.get("start", 0)
-            seg_dur = seg.get("end", seg_start) - seg_start
+            seg_end = seg.get("end", seg_start)
+            seg_dur = seg_end - seg_start
             pos = seg_start
 
             for sent in sentences:
@@ -8647,6 +9075,17 @@ class Pipeline:
                 new_seg["text"] = sent
                 new_seg["start"] = pos
                 new_seg["end"] = pos + sent_dur
+                # Tempo Match: child start/end above are SYNTHETIC (char-count
+                # proportional). Stamp the parent's REAL Whisper anchors so the
+                # fit ladder works at parent granularity — children float
+                # inside the parent slot, drift can never cross a real anchor.
+                # If the segment is itself a chunk (_chunk_segments_for_tts),
+                # dict(seg) already carries the chunker's real anchors — keep
+                # them so all chunks + their sentences group to ONE slot.
+                if "_parent_idx" not in seg:
+                    new_seg["_parent_idx"] = pi
+                    new_seg["_parent_start"] = seg_start
+                    new_seg["_parent_end"] = seg_end
                 split.append(new_seg)
                 pos += sent_dur
 
@@ -9711,7 +10150,7 @@ class Pipeline:
                         json={
                             "text": text,
                             "target_language_code": lang_code,
-                            "speaker": speaker,
+                            "speaker": self._sarvam_speaker_for_seg(seg),
                             "model": "bulbul:v3",
                             "pace": 1.0,
                             "temperature": 0.6,
@@ -9856,7 +10295,7 @@ class Pipeline:
                         json={
                             "text": text,
                             "target_language_code": lang_code,
-                            "speaker": speaker,
+                            "speaker": self._sarvam_speaker_for_seg(seg),
                             "model": "bulbul:v3",
                             "pace": 1.0,
                             "temperature": 0.6,
@@ -10501,11 +10940,13 @@ class Pipeline:
         except Exception:
             pass
 
-    def _sarvam_tts_single_mp3(self, text: str, mp3_path) -> bool:
+    def _sarvam_tts_single_mp3(self, text: str, mp3_path, speaker: str = "shubh") -> bool:
         """Synthesize a single segment via Sarvam Bulbul v3 → MP3.
 
-        Returns True if the file was written successfully, False otherwise.
-        Uses API key rotation with auto-failover on quota errors.
+        voice: the Edge voice this segment should have had; picks a Sarvam
+        speaker of the same gender. Returns True if the file was written
+        successfully, False otherwise. Uses API key rotation with
+        auto-failover on quota errors.
         """
         import requests as _requests
         import base64
@@ -10544,7 +10985,7 @@ class Pipeline:
                     json={
                         "text": text,
                         "target_language_code": lang_code,
-                        "speaker": "shubh",
+                        "speaker": speaker,
                         "model": "bulbul:v3",
                         "pace": 1.0,
                         "temperature": 0.6,
@@ -10753,8 +11194,7 @@ class Pipeline:
         callers can treat "unknown" as "don't retry".
         """
         try:
-            ffprobe = self._ffmpeg.replace("ffmpeg", "ffprobe") \
-                if "ffmpeg" in self._ffmpeg else "ffprobe"
+            ffprobe = getattr(self, "_ffprobe", None) or shutil.which("ffprobe") or "ffprobe"
             result = self._run_proc(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", str(mp3_path)],
@@ -11051,7 +11491,9 @@ class Pipeline:
                 if not raw_text:
                     return None
                 text = self._prepare_tts_text(raw_text)
-                voice = self.cfg.tts_voice  # still Madhur — consistent voice
+                # Retries must keep the segment's OWN speaker voice (the same
+                # lookup _tts_edge uses), never the global default voice.
+                voice = self._voice_for_segment(seg)
                 rate = self.cfg.tts_rate
                 retry_dir = self.cfg.work_dir / "tts_word_verify_retry"
                 retry_dir.mkdir(exist_ok=True)
@@ -11335,6 +11777,13 @@ class Pipeline:
             retried_total = 0
 
             for ord_, idx in enumerate(mismatched_indices):
+                self._check_cancelled()
+                # Each segment can take up to 4 Edge calls + Whisper passes;
+                # report per segment so the UI never sits frozen at 93%.
+                self._report("synthesize",
+                             0.93 + 0.05 * ord_ / max(1, len(mismatched_indices)),
+                             f"Word verification: retry {ord_ + 1}/{len(mismatched_indices)} "
+                             f"(recovered {recovered})")
                 tts = tts_data[idx]
                 seg_idx = tts.get("_seg_idx", idx)
                 if not (0 <= seg_idx < len(segments)):
@@ -12242,8 +12691,36 @@ class Pipeline:
         # output matches the original runtime. Capped at tts_rate_ceiling.
         # In manual mode, the user's Speech Rate slider value is used as-is.
         rate_mode = (getattr(self.cfg, "tts_rate_mode", "auto") or "auto").lower()
-        if rate_mode == "auto":
+        if getattr(self.cfg, "tempo_match", False):
+            # Tempo Match: pass-1 is ALWAYS natural pace. The per-segment fit
+            # ladder (_tempo_fit_segments) measures each segment afterwards and
+            # computes any speedup per slot — a global rate would fight it.
+            self.cfg.tts_rate = "+0%"
+            self._report("synthesize", 0.05,
+                         "Tempo Match ON — pass-1 at natural rate "
+                         "(per-segment fit after synthesis)")
+        elif rate_mode == "auto" and getattr(self, "_auto_rate_locked", False):
+            # Auto rate is a per-JOB decision made on the first full pass.
+            # Retry passes call _tts_edge with only the failed segments;
+            # recomputing from that tiny word count against the full source
+            # duration clamps to -50% (half-speed speech) and would overwrite
+            # the job's rate for every later retry.
+            print(f"[RATE-AUTO] Reusing job rate {self.cfg.tts_rate} for "
+                  f"{len(segments)}-segment retry pass", flush=True)
+        elif rate_mode == "auto":
             source_dur = getattr(self, "_source_video_duration", 0.0) or 0.0
+            # dub_duration clips the OUTPUT to the first N minutes, so the
+            # rate target must be that window — not the full source runtime.
+            # Otherwise a 95-min source with a 10-min window computes a
+            # massive slowdown (-50%) and assembly stretches the video 2x+.
+            dub_dur_min = getattr(self.cfg, "dub_duration", 0) or 0
+            if dub_dur_min > 0:
+                window_sec = float(dub_dur_min) * 60.0
+                if source_dur <= 0 or source_dur > window_sec:
+                    print(f"[RATE-AUTO] dub_duration={dub_dur_min}m — rate "
+                          f"target capped to {window_sec:.0f}s window "
+                          f"(full source is {source_dur:.0f}s)", flush=True)
+                    source_dur = window_sec
             if source_dur <= 0:
                 source_dur = float(budget.get("total_slot", 0.0) or 0.0)
             total_words = int(budget.get("total_words", 0) or 0)
@@ -12267,6 +12744,7 @@ class Pipeline:
                          f"Auto rate: {auto_rate} (calibrated {calibrated_wpm:.0f} WPM, "
                          f"matches {source_dur:.0f}s source, {total_words} words)")
             self.cfg.tts_rate = auto_rate
+            self._auto_rate_locked = True
         else:
             print(f"[RATE-AUTO] Mode=manual — using user rate "
                   f"{self.cfg.tts_rate} as-is", flush=True)
@@ -12487,8 +12965,11 @@ class Pipeline:
 
                 # ── Sarvam Bulbul v3 fallback (no more Edge retries) ──
                 if _sarvam_fallback_available:
-                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3)
+                    _fb_spk = self._sarvam_speaker_for_voice(seg_voice)
+                    sarvam_ok = self._sarvam_tts_single_mp3(text, mp3, speaker=_fb_spk)
                     if sarvam_ok:
+                        self.result_warnings.append(
+                            f"segment {i} voiced by Sarvam '{_fb_spk}' instead of {seg_voice} (Edge failed)")
                         _sarvam_fallback_count[0] += 1
                         if _sarvam_fallback_count[0] <= 10:
                             print(f"[TTS-SARVAM] Seg {i}: Sarvam Bulbul fallback succeeded",
@@ -12612,9 +13093,13 @@ class Pipeline:
 
                 rescued = False
                 if _sarvam_fallback_available:
-                    rescued = self._sarvam_tts_single_mp3(text, mp3)
+                    _seg_voice = self._voice_for_segment(seg)
+                    _fb_spk = self._sarvam_speaker_for_voice(_seg_voice)
+                    rescued = self._sarvam_tts_single_mp3(text, mp3, speaker=_fb_spk)
                     if rescued:
                         sarvam_rescued += 1
+                        self.result_warnings.append(
+                            f"segment {i} voiced by Sarvam '{_fb_spk}' instead of {_seg_voice} (Edge failed)")
 
                 if rescued:
                     seg["_tts_mp3"] = mp3
@@ -12718,6 +13203,12 @@ class Pipeline:
                 retry_qc = self._rerender_edge_segment(tts_text, seg_voice, wav, expected_dur)
                 rerender_count = retry_qc.get("attempt", 0) + 1
                 manual_review = retry_qc.get("manual_review", False)
+                _used = (retry_qc.get("text_used") or tts_text).strip()
+                if _used != tts_text.strip():
+                    # Retry text was simplified/shortened: record it, never silently.
+                    self.result_warnings.append(
+                        f"segment {i} @ {seg.get('start', 0):.1f}s spoken with SHORTENED text after "
+                        f"QC retries ({len(_used.split())}/{len(tts_text.split())} words)")
 
                 if manual_review:
                     print(f"[QC] Seg {i} -> MANUAL REVIEW after {rerender_count} rerenders", flush=True)
@@ -13048,13 +13539,7 @@ class Pipeline:
     # ── Duration & tempo adjustment ───────────────────────────────────────
     def _get_duration(self, media_path: Path) -> float:
         """Get duration of a media file in seconds using ffprobe."""
-        ffmpeg_path = Path(self._ffmpeg)
-        if ffmpeg_path.is_absolute():
-            ffprobe = str(ffmpeg_path.parent / "ffprobe")
-            if sys.platform == "win32" and not ffprobe.endswith(".exe"):
-                ffprobe += ".exe"
-        else:
-            ffprobe = shutil.which("ffprobe") or "ffprobe"
+        ffprobe = getattr(self, "_ffprobe", None) or shutil.which("ffprobe") or "ffprobe"
         try:
             result = self._run_proc(
                 [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
@@ -13133,10 +13618,13 @@ class Pipeline:
         return adjusted
 
     # ── Audio mixing ─────────────────────────────────────────────────────
-    def _separate_background(self, audio_raw: Path) -> Path:
+    def _separate_background(self, audio_raw: Path) -> Optional[Path]:
         """Use demucs to extract instrumental/background track (no vocals).
         For long audio (>10min), splits into chunks to avoid GPU OOM.
-        Returns path to the no-vocals audio file, or audio_raw as fallback."""
+
+        Returns the no-vocals track, or None if separation is unavailable or
+        failed for ANY chunk. The original (English-dialogue) audio is never
+        returned as a stand-in for "background"."""
         bg_path = self.cfg.work_dir / "background_music.wav"
         if bg_path.exists():
             return bg_path
@@ -13150,7 +13638,12 @@ class Pipeline:
 
             if total_duration <= CHUNK_SECS:
                 # Short audio — process in one shot
-                return self._demucs_single(audio_raw, bg_path)
+                self._report("assemble", 0.85,
+                             "Separating vocals from background music (Demucs)...")
+                bg = self._demucs_single(audio_raw, bg_path)
+                if bg is None:
+                    raise RuntimeError("demucs produced no background track")
+                return bg
 
             # Long audio — split, process chunks, concatenate
             print(f"[DEMUCS] Audio is {total_duration/60:.0f}min, splitting into {CHUNK_MINS}min chunks...", flush=True)
@@ -13158,6 +13651,11 @@ class Pipeline:
             chunk_bg_paths = []
 
             for ci in range(num_chunks):
+                if self._cancel_check():
+                    print("[DEMUCS] Cancelled during background separation", flush=True)
+                    return audio_raw
+                self._report("assemble", 0.85,
+                             f"Separating background (Demucs) — chunk {ci+1}/{num_chunks}...")
                 start = ci * CHUNK_SECS
                 chunk_audio = self.cfg.work_dir / f"demucs_chunk_{ci:03d}.wav"
                 chunk_bg = self.cfg.work_dir / f"demucs_bg_{ci:03d}.wav"
@@ -13178,22 +13676,17 @@ class Pipeline:
                 if result == chunk_bg and chunk_bg.exists():
                     chunk_bg_paths.append(chunk_bg)
                 else:
-                    # Demucs failed for this chunk — use original audio chunk as fallback
-                    fallback = self.cfg.work_dir / f"demucs_fallback_{ci:03d}.wav"
-                    self._run_proc(
-                        [self._ffmpeg, "-y", "-i", str(audio_raw),
-                         "-ss", str(start), "-t", str(CHUNK_SECS),
-                         "-ar", str(self.SAMPLE_RATE), "-ac", str(self.N_CHANNELS),
-                         "-acodec", "pcm_s16le", str(fallback)],
-                        check=True, capture_output=True,
-                    )
-                    chunk_bg_paths.append(fallback)
+                    # A failed chunk would put raw English dialogue into the
+                    # "background" bed. Abort separation instead.
+                    for p in chunk_bg_paths:
+                        p.unlink(missing_ok=True)
+                    raise RuntimeError(f"demucs failed on chunk {ci + 1}/{num_chunks}")
 
                 print(f"[DEMUCS] Chunk {ci+1}/{num_chunks} done", flush=True)
 
             # Concatenate all chunk backgrounds
             if not chunk_bg_paths:
-                return audio_raw
+                return None
             concat_list = self.cfg.work_dir / "demucs_concat.txt"
             concat_list.write_text(
                 "\n".join(f"file '{str(p).replace(chr(92), '/')}'" for p in chunk_bg_paths),
@@ -13216,17 +13709,21 @@ class Pipeline:
             return bg_path
 
         except ImportError:
-            print("[DEMUCS] demucs not installed, falling back to raw audio", flush=True)
+            msg = "demucs not installed: no background bed (original audio NOT used as background)"
         except Exception as e:
-            print(f"[DEMUCS] Separation failed: {e}, falling back to raw audio", flush=True)
-        return audio_raw
+            msg = f"background separation failed ({e}): no background bed (original audio NOT used)"
+        print(f"[DEMUCS] {msg}", flush=True)
+        self.result_warnings.append(msg)
+        return None
 
-    def _demucs_single(self, audio_path: Path, output_path: Path) -> Path:
+    def _demucs_single(self, audio_path: Path, output_path: Path) -> Optional[Path]:
         """Run demucs on a single audio file and return the no-vocals track."""
         try:
             import demucs.separate
             demucs_out = self.cfg.work_dir / "demucs_out"
             print(f"[DEMUCS] Separating {audio_path.name}...", flush=True)
+            self._report("assemble", 0.86,
+                         f"Demucs isolating background from {audio_path.name} (GPU)...")
             demucs.separate.main([
                 "--two-stems", "vocals",
                 "-n", "htdemucs",
@@ -13247,33 +13744,67 @@ class Pipeline:
             print(f"[DEMUCS] no_vocals.wav not found for {audio_path.name}", flush=True)
         except Exception as e:
             print(f"[DEMUCS] Failed on {audio_path.name}: {e}", flush=True)
-        return audio_path
+        return None  # caller treats None as "separation failed"
 
     def _mix_audio(self, original: Path, tts: Path, original_vol: float) -> Path:
-        # Use background-only track (no vocals) instead of full original
+        # Keep the original BACKGROUND (music/SFX) under the Hindi voice. We mix
+        # the vocal-free Demucs stem — never the raw original — so the English
+        # speech is removed and only the bed remains beneath the dubbed voice.
+        # If separation failed, output the dub alone rather than mixing the
+        # English dialogue back in under the label "background".
         bg_track = self._separate_background(original)
+        if bg_track is None:
+            return tts
         mixed = self.cfg.work_dir / "audio_mixed.wav"
-        self._run_proc(
-            [
-                self._ffmpeg, "-y",
-                "-i", str(tts),
-                "-i", str(bg_track),
-                "-filter_complex",
-                (
-                    f"[0:a]asplit=2[tts_out][tts_sc];"
-                    f"[1:a]volume={original_vol}[bg_raw];"
-                    f"[bg_raw][tts_sc]sidechaincompress="
-                    f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
-                    f"[tts_out][bg_duck]amix=inputs=2:duration=longest:dropout_transition=2[out]"
-                ),
-                "-map", "[out]",
-                "-ar", str(self.SAMPLE_RATE),
-                "-ac", str(self.N_CHANNELS),
-                str(mixed),
-            ],
-            check=True,
-            capture_output=True,
-        )
+
+        def _run_mix(alter: bool):
+            # Bed pre-chain. Any alteration is DURATION-PRESERVING (pitch + EQ
+            # only, never tempo) so the bed stays aligned to the per-segment
+            # stretched video timeline.
+            bg_pre = f"volume={original_vol}"
+            if alter and getattr(self.cfg, "bg_alter", False):
+                pitch = float(getattr(self.cfg, "bg_pitch", 1.03) or 1.0)
+                if abs(pitch - 1.0) > 0.001:
+                    bg_pre += f",rubberband=pitch={pitch:.4f}"
+                # Gentle spectral tilt further shifts the audio fingerprint.
+                bg_pre += ",equalizer=f=2500:t=q:w=2:g=-2,equalizer=f=180:t=q:w=2:g=1.5"
+            self._run_proc(
+                [
+                    self._ffmpeg, "-y",
+                    "-i", str(tts),
+                    "-i", str(bg_track),
+                    "-filter_complex",
+                    (
+                        f"[0:a]asplit=2[tts_out][tts_sc];"
+                        f"[1:a]{bg_pre}[bg_raw];"
+                        f"[bg_raw][tts_sc]sidechaincompress="
+                        f"threshold=0.02:ratio=3:attack=20:release=300:makeup=1[bg_duck];"
+                        f"[tts_out][bg_duck]amix=inputs=2:duration=longest:dropout_transition=2[out]"
+                    ),
+                    "-map", "[out]",
+                    "-ar", str(self.SAMPLE_RATE),
+                    "-ac", str(self.N_CHANNELS),
+                    str(mixed),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        want_alter = bool(getattr(self.cfg, "bg_alter", False))
+        self._report("assemble", 0.88,
+                     "Mixing background (fingerprint-break: pitch+EQ) under voice..."
+                     if want_alter else "Mixing background under voice...")
+        try:
+            _run_mix(alter=True)
+        except Exception as e:
+            if want_alter:
+                # rubberband/EQ can be missing in some ffmpeg builds — retry with
+                # a plain unaltered mix so the job never dies on this step.
+                print(f"[Mix] Altered mix failed ({e}) — retrying without "
+                      f"fingerprint-break", flush=True)
+                _run_mix(alter=False)
+            else:
+                raise
         return mixed
 
     # ── Video split / concat ─────────────────────────────────────────────
@@ -14196,44 +14727,47 @@ class Pipeline:
         return segment_map
 
     def _verify_tts_completeness(self, tts_data, text_segments):
-        """Verify ALL non-empty segments have audio before proceeding to assembly.
+        """Verify every non-empty segment has audio, by segment identity.
 
-        Logs a clear warning for any segments that are missing. Does NOT block
-        assembly (to avoid losing a 90% complete job), but provides visibility
-        into exactly which segments are missing and why.
+        Coverage is counted per unique segment (``_seg_idx``, with a start-time
+        fallback), so duplicate audio for one segment can never hide a missing
+        segment. Assembly still proceeds so expensive work is not lost, but a
+        gap marks the result as ``draft_incomplete`` (``self.result_status``)
+        and every missing segment is listed in ``self.result_warnings``.
 
         Returns the count of missing segments.
         """
-        # Count non-empty input segments
         non_empty = [i for i, seg in enumerate(text_segments)
                      if seg.get("text_translated", seg.get("text", "")).strip()]
-        produced = len(tts_data)
-        missing_count = len(non_empty) - produced
+        produced_idxs = {t.get("_seg_idx") for t in tts_data
+                         if "_seg_idx" in t and t.get("wav") and Path(t["wav"]).exists()}
+        produced_starts = {round(t.get("start", -1), 2) for t in tts_data
+                           if "_seg_idx" not in t and t.get("wav")}
+        missing_details = []
+        for i in non_empty:
+            seg = text_segments[i]
+            seg_idx = seg.get("_seg_idx", i)
+            if seg_idx in produced_idxs or round(seg.get("start", 0), 2) in produced_starts:
+                continue
+            text_preview = seg.get("text_translated", seg.get("text", ""))[:60]
+            missing_details.append(f"segment {i} @ {seg.get('start', 0):.1f}s: {text_preview!r}")
 
-        if missing_count > 0:
-            # Find which segment indices are missing
-            produced_starts = {round(t.get("start", -1), 2) for t in tts_data}
-            produced_idxs = {t.get("_seg_idx") for t in tts_data if "_seg_idx" in t}
-            missing_details = []
-            for i in non_empty:
-                seg = text_segments[i]
-                seg_start = round(seg.get("start", 0), 2)
-                seg_idx = seg.get("_seg_idx", i)
-                if seg_idx not in produced_idxs and seg_start not in produced_starts:
-                    text_preview = seg.get("text_translated", seg.get("text", ""))[:60]
-                    missing_details.append(f"  Seg {i} @ {seg.get('start', 0):.1f}s: {text_preview!r}")
-            if missing_details:
-                print(f"[TTS-COMPLETE] WARNING: {len(missing_details)} segments "
-                      f"missing audio out of {len(non_empty)} non-empty:", flush=True)
-                for detail in missing_details[:20]:  # cap log output
-                    print(detail, flush=True)
-                if len(missing_details) > 20:
-                    print(f"  ... and {len(missing_details) - 20} more", flush=True)
+        if missing_details:
+            print(f"[TTS-COMPLETE] WARNING: {len(missing_details)} segments "
+                  f"missing audio out of {len(non_empty)} non-empty:", flush=True)
+            for detail in missing_details[:20]:  # cap log output
+                print("  " + detail, flush=True)
+            if len(missing_details) > 20:
+                print(f"  ... and {len(missing_details) - 20} more", flush=True)
+            self.result_status = "draft_incomplete"
+            self.result_warnings.append(
+                f"{len(missing_details)} of {len(non_empty)} segments have NO dubbed audio")
+            self.result_warnings.extend("missing " + d for d in missing_details[:50])
         else:
-            print(f"[TTS-COMPLETE] All {produced}/{len(non_empty)} non-empty "
+            print(f"[TTS-COMPLETE] All {len(non_empty)} non-empty "
                   f"segments have audio — ready for assembly", flush=True)
 
-        return max(0, missing_count)
+        return len(missing_details)
 
     # ── Librosa Deep QC (process-isolated, thread-safe) ─────────────────
     @staticmethod
@@ -14439,7 +14973,11 @@ class Pipeline:
                 # and assembly handles the overflow. We still flag silence
                 # (ratio < 0.15 = "only 15% of expected") because that
                 # indicates a real failure (TTS produced almost nothing).
-                no_pressure = getattr(self.cfg, 'tts_no_time_pressure', True)
+                # tempo_match implies full no-pressure QC semantics: the fit
+                # ladder handles duration AFTER this gate, so long pass-1
+                # audio must never trigger a text-rewriting re-render here.
+                no_pressure = (getattr(self.cfg, 'tts_no_time_pressure', True)
+                               or getattr(self.cfg, 'tempo_match', False))
                 if ratio > 2.5 and not no_pressure:
                     issues.append(f"TTS {ratio:.1f}x longer than slot")
                 elif ratio < 0.15:
@@ -14520,31 +15058,72 @@ class Pipeline:
         audio_dur = self._get_duration(audio_path)
         video_dur = self._get_duration(video_path)
 
-        cmd = [
-            self._ffmpeg, "-y",
-            "-i", str(video_path),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
-        ]
+        # ── Visual transforms (Content-ID / duplicate evasion) ──
+        # When enabled, apply hflip/hue/zoom + metadata strip HERE as a single
+        # re-encode pass over the whole video (it is otherwise stream-copied),
+        # giving one uniform fingerprint break. Cheap on NVENC; skipped entirely
+        # when the toggle is off so the fast lossless -c:v copy path is kept.
+        vx = ""
+        if getattr(self.cfg, "visual_transforms", False):
+            try:
+                from dubbing.srtdub import _build_vx_filter
+                vx = _build_vx_filter(
+                    bool(getattr(self.cfg, "vx_hflip", False)),
+                    float(getattr(self.cfg, "vx_hue", 0.0) or 0.0),
+                    float(getattr(self.cfg, "vx_zoom", 1.0) or 1.0),
+                )
+            except Exception as e:
+                print(f"[Mux] visual-transform build failed ({e}) — skipping", flush=True)
+                vx = ""
+        strip_meta = (["-map_metadata", "-1"]
+                      if (getattr(self.cfg, "visual_transforms", False)
+                          and getattr(self.cfg, "vx_strip_metadata", True)) else [])
+        if vx:
+            print(f"[Mux] Visual transforms ON — filter chain: {vx}", flush=True)
+
+        if vx:
+            # Re-encode video once with the transform chain applied.
+            cmd = [
+                self._ffmpeg, "-y",
+                "-i", str(video_path),
+                "-i", str(audio_path),
+                "-filter:v", vx,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                *self._video_encode_args(),  # NVENC when available
+                *strip_meta,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
+            ]
+        else:
+            cmd = [
+                self._ffmpeg, "-y",
+                "-i", str(video_path),
+                "-i", str(audio_path),
+                "-c:v", "copy",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                *strip_meta,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
+            ]
 
         if audio_dur > video_dur + 1.0:
             # Audio is longer — DON'T let FFmpeg cut it at video end
             # Loop last video frame to cover remaining audio
             print(f"[Mux] Audio ({audio_dur:.0f}s) > Video ({video_dur:.0f}s) "
                   f"— extending video to match audio", flush=True)
-            # Re-encode video with loop to match audio length
+            # Re-encode video with loop to match audio length (vx folded in when on)
             cmd = [
                 self._ffmpeg, "-y",
                 "-stream_loop", "-1",  # loop video
                 "-i", str(video_path),
                 "-i", str(audio_path),
+                *(["-filter:v", vx] if vx else []),
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 *self._video_encode_args(),  # NVENC when available
+                *strip_meta,
                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                 "-c:a", "aac", "-b:a", self.cfg.audio_bitrate,
                 "-t", f"{audio_dur:.3f}",  # output = audio length (NOT video length)

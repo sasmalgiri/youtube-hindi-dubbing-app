@@ -37,8 +37,6 @@ export interface JobCreateRequest {
     use_coqui_xtts?: boolean;
     use_fish_speech?: boolean;
     use_edge_tts?: boolean;
-    prefer_youtube_subs?: boolean;
-    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
@@ -56,6 +54,12 @@ export interface JobCreateRequest {
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
+    whisper_gpu_fallback?: boolean;
+    whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     step_by_step?: boolean;
     use_new_pipeline?: boolean;
@@ -88,16 +92,10 @@ export interface JobCreateRequest {
     segmenter?: string;
     segmenter_buffer_pct?: number;
     max_sentences_per_cue?: number;
-    yt_transcript_mode?: string;
-    yt_segment_mode?: string;
-    yt_text_correction?: boolean;
-    yt_replace_mode?: string;
     tts_chunk_words?: number;
     gap_mode?: string;
-    // ── WordChunk mode ──
-    wc_chunk_size?: number;          // 4 | 8 | 12
-    wc_max_stretch?: number;         // 1.0 – 5.0
-    wc_transcript?: string;          // optional pasted transcript override
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
     // ── SRT Direct mode ──
     sd_srt_content?: string;         // full SRT content (required for srtdub mode)
     sd_max_stretch?: number;         // 1.0 – 10.0
@@ -105,6 +103,12 @@ export interface JobCreateRequest {
     sd_vx_hflip?: boolean;           // horizontal mirror
     sd_vx_hue?: number;              // hue shift degrees (-30..+30)
     sd_vx_zoom?: number;             // zoom + crop back (1.0 = off, 1.05 = 5% zoom)
+    // ── Hindi dialogue profile (pipeline_mode = 'hindi_dialogue') ──
+    dialogue_tts_providers?: string;        // e.g. "edge" or "sarvam,edge" (paid only if listed)
+    dialogue_translation_engines?: string;  // e.g. "gemini,groq,cerebras"
+    dialogue_num_speakers?: number;         // 0 = detect
+    dialogue_background?: 'auto' | 'demucs' | 'none';
+    dialogue_verify?: 'auto' | 'on' | 'off';
 }
 
 export interface JobConfig {
@@ -134,9 +138,13 @@ export interface JobConfig {
     fast_assemble?: boolean;
     enable_sentence_gap?: boolean;
     enable_duration_fit?: boolean;
-    prefer_youtube_subs?: boolean;
-    use_yt_translate?: boolean;
     use_whisperx?: boolean;
+    whisper_gpu_fallback?: boolean;
+    whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     enable_manual_review?: boolean;
     transcribe_only?: boolean;
@@ -173,12 +181,10 @@ export interface JobConfig {
     segmenter?: string;
     segmenter_buffer_pct?: number;
     max_sentences_per_cue?: number;
-    yt_transcript_mode?: string;
-    yt_segment_mode?: string;
-    yt_text_correction?: boolean;
-    yt_replace_mode?: string;
     tts_chunk_words?: number;
     gap_mode?: string;
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
 }
 
 export interface JobStatus {
@@ -199,6 +205,9 @@ export interface JobStatus {
     saved_video?: string | null;
     description?: string | null;
     qa_score?: number | null;
+    // Multi-speaker outcome (per part in split jobs) + sticky failure warning
+    speakers?: { speaker: string; gender: string; voice: string; seconds: number; part?: number }[];
+    speaker_warning?: string | null;
     chain_languages?: string[];
     chain_parent_id?: string | null;
     // TTS budget metrics — populated after _pretts_word_budget runs
@@ -207,6 +216,10 @@ export interface JobStatus {
     avg_words_per_sent?: number;
     max_seg_words?: number;
     max_sent_words?: number;
+    // Hindi dialogue profile: honest outcome + report
+    result_status?: 'completed' | 'completed_with_warnings' | 'draft_incomplete' | 'failed' | 'cancelled' | null;
+    status_reasons?: string[];
+    report_path?: string | null;
 }
 
 export interface TranscriptSegment {
@@ -389,6 +402,10 @@ export function resultSrtUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/srt`;
 }
 
+export function dialogueReportUrl(id: string, fmt: 'md' | 'json' = 'md'): string {
+    return `${API_BASE}/api/jobs/${id}/report?fmt=${fmt}`;
+}
+
 export function sourceSrtUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/source-srt`;
 }
@@ -428,8 +445,6 @@ export interface LinkPreset {
     use_coqui_xtts?: boolean;
     use_fish_speech?: boolean;
     use_edge_tts?: boolean;
-    prefer_youtube_subs?: boolean;
-    use_yt_translate?: boolean;
     multi_speaker?: boolean;
     transcribe_only?: boolean;
     audio_priority?: boolean;
@@ -447,6 +462,12 @@ export interface LinkPreset {
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
+    whisper_gpu_fallback?: boolean;
+    whisper_fallback_model?: string;
+    visual_transforms?: boolean;
+    vx_hflip?: boolean;
+    vx_hue?: number;
+    vx_zoom?: number;
     simplify_english?: boolean;
     step_by_step?: boolean;
     use_new_pipeline?: boolean;
@@ -469,7 +490,7 @@ export interface LinkPreset {
     purge_on_new_url?: boolean;
     pipeline_mode?: string;
     srt_needs_translation?: boolean;
-    // ── AV Sync + Segmenter + YouTube ──
+    // ── AV Sync + Segmenter ──
     av_sync_mode?: string;
     max_audio_speedup?: number;
     min_video_speed?: number;
@@ -479,12 +500,10 @@ export interface LinkPreset {
     segmenter?: string;
     segmenter_buffer_pct?: number;
     max_sentences_per_cue?: number;
-    yt_transcript_mode?: string;
-    yt_segment_mode?: string;
-    yt_text_correction?: boolean;
-    yt_replace_mode?: string;
     tts_chunk_words?: number;
     gap_mode?: string;
+    tempo_match?: boolean;
+    tempo_max_speedup?: number;
 }
 
 export interface SavedLink {

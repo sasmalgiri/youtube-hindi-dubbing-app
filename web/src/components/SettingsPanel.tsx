@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { getGlossary, addGlossaryEntry, deleteGlossaryEntry } from '@/lib/api';
 
 export interface DubbingSettings {
@@ -20,8 +20,6 @@ export interface DubbingSettings {
     use_coqui_xtts: boolean;
     use_fish_speech: boolean;
     use_edge_tts: boolean;
-    prefer_youtube_subs: boolean;
-    use_yt_translate: boolean;
     multi_speaker: boolean;
     transcribe_only: boolean;
     audio_priority: boolean;
@@ -39,6 +37,12 @@ export interface DubbingSettings {
     dub_chain: string[];
     enable_manual_review: boolean;
     use_whisperx: boolean;
+    whisper_gpu_fallback: boolean;     // local Whisper GPU fallback when WhisperX is "not proper"
+    whisper_fallback_model: string;    // "large-v3" | "medium"
+    visual_transforms: boolean;        // Content-ID / duplicate evasion (classic mode)
+    vx_hflip: boolean;                 // horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: number;                    // hue shift degrees
+    vx_zoom: number;                   // zoom + crop back (1.0 = off)
     simplify_english: boolean;
     step_by_step: boolean;
     use_new_pipeline: boolean;
@@ -76,17 +80,11 @@ export interface DubbingSettings {
     segmenter: string;               // "dp" | "sentence"
     segmenter_buffer_pct: number;    // Hindi expansion buffer (default 0.20)
     max_sentences_per_cue: number;   // max sentences per segment (default 2)
-    // ── YouTube Transcript Mode ──
-    yt_transcript_mode: string;      // "yt_timeline" | "whisper_timeline"
-    yt_segment_mode: string;         // "sentence" | "wordcount"
-    yt_text_correction: boolean;     // correct Whisper text using YouTube subs
-    yt_replace_mode: string;         // "full" | "diff"
     tts_chunk_words: number;         // 0=off, 4/8/12=chunk size for TTS
     gap_mode: string;                // "none" | "micro" | "full"
-    // ── WordChunk mode ──
-    wc_chunk_size?: number;          // 4 | 8 | 12
-    wc_max_stretch?: number;         // 1.0 – 20.0
-    wc_transcript?: string;          // optional pasted transcript override
+    // ── Tempo Match (per-segment fit) ──
+    tempo_match?: boolean;           // fit dubbed speech into each original slot (video never slowed)
+    tempo_max_speedup?: number;      // max speech speed-up (default 1.5)
     // ── SRT Direct mode ──
     sd_srt_content?: string;         // full SRT content (required for srtdub mode)
     sd_max_stretch?: number;         // 1.0 – 20.0
@@ -198,6 +196,38 @@ function GlossaryEditor() {
     );
 }
 
+function CollapsibleGroup({ title, subtitle, defaultOpen = false, master, onMaster, greyOnOff = true, children }: {
+    title: string; subtitle?: string; defaultOpen?: boolean;
+    master?: boolean; onMaster?: (v: boolean) => void; greyOnOff?: boolean; children: ReactNode;
+}) {
+    const [open, setOpen] = useState(defaultOpen);
+    return (
+        <div className="rounded-lg border border-border bg-white/[0.02]">
+            <div className="flex items-center justify-between gap-2 px-3 py-2.5">
+                <button type="button" onClick={() => setOpen(o => !o)} className="flex items-center gap-2 flex-1 text-left min-w-0">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                        className={`text-text-muted shrink-0 transition-transform ${open ? 'rotate-90' : ''}`}><path d="m9 18 6-6-6-6" /></svg>
+                    <div className="min-w-0">
+                        <p className="text-sm font-medium text-text-primary truncate">{title}</p>
+                        {subtitle && <p className="text-[11px] text-text-muted truncate">{subtitle}</p>}
+                    </div>
+                </button>
+                {onMaster && (
+                    <button type="button" title={`Toggle ${title}`} onClick={() => onMaster(!master)}
+                        className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${master ? 'bg-primary' : 'bg-white/10'}`}>
+                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${master ? 'translate-x-6' : 'translate-x-1'}`} />
+                    </button>
+                )}
+            </div>
+            {open && (
+                <div className={`px-3 pb-3 pt-1 space-y-3 border-t border-border ${(onMaster && !master && greyOnOff) ? 'opacity-40 pointer-events-none' : ''}`}>
+                    {children}
+                </div>
+            )}
+        </div>
+    );
+}
+
 export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi' }: SettingsPanelProps) {
     const [open, setOpen] = useState(false);
 
@@ -216,11 +246,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [settings.pipeline_mode, settings.asr_model]);
 
-    // SRT Direct and WordChunk have REQUIRED inputs inside the advanced panel
-    // (the SRT textarea / transcript). Auto-expand so users don't think the
-    // tab did nothing.
+    // SRT Direct has a REQUIRED input inside the advanced panel (the SRT
+    // textarea). Auto-expand so users don't think the tab did nothing.
     useEffect(() => {
-        if (settings.pipeline_mode === 'srtdub' || settings.pipeline_mode === 'wordchunk') {
+        if (settings.pipeline_mode === 'srtdub') {
             setOpen(true);
         }
     }, [settings.pipeline_mode]);
@@ -253,22 +282,15 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                 const isHybrid = mode === 'hybrid';
                 const isNew = mode === 'new';
                 const isOneFlow = mode === 'oneflow';
-                const isWordChunk = mode === 'wordchunk';
                 const isSrtDub = mode === 'srtdub';
                 const isSrtMode = settings._input_mode === 'srt';
 
                 // ── Dependency flags ──
                 const isVoiceClone = settings.audio_untouchable && settings.use_coqui_xtts && !settings.use_edge_tts;
-                const ytTranslateOn = settings.use_yt_translate;
-                const ytSubsOn = settings.prefer_youtube_subs;
-                const transcribeOnly = settings.transcribe_only;
-                // Whisper disabled when YouTube provides subs, New pipeline, OneFlow, WordChunk, SrtDub, or SRT mode
-                const whisperDisabled = ytTranslateOn || ytSubsOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
-                const whisperxDisabled = whisperDisabled;
-                // Translation disabled when YT gives Hindi directly, or in TTS-only modes
-                const translationDisabled = ytTranslateOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
-                // Simplify disabled when no English source or in TTS-only modes
-                const simplifyDisabled = ytTranslateOn || isOneFlow || isWordChunk || isSrtDub || isSrtMode;
+                const tempoOn = settings.tempo_match ?? false;
+                const whisperDisabled = isOneFlow || isSrtDub || isSrtMode;
+                const translationDisabled = isOneFlow || isSrtDub || isSrtMode;
+                const simplifyDisabled = isOneFlow || isSrtDub || isSrtMode;
 
                 return (<div className="px-5 pb-5 space-y-5 animate-slide-up border-t border-border pt-4">
                     {/* ── Quick Start Tip — always visible at top of advanced ── */}
@@ -276,7 +298,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         <p className="text-xs font-medium text-blue-400 mb-1">Quick Start — defaults are good for most videos</p>
                         <ul className="text-[11px] text-text-muted space-y-0.5 list-disc list-inside">
                             <li><b className="text-text-secondary">Hindi dubbing</b>: leave everything default → paste URL → submit</li>
-                            <li><b className="text-text-secondary">Long video (1h+)</b>: turn on <i>Use YouTube Transcript</i> → skips slow Whisper step</li>
                             <li><b className="text-text-secondary">Best Hindi voice</b>: enable <i>CosyVoice 2</i> or <i>Sarvam Bulbul v3</i></li>
                             <li><b className="text-text-secondary">Already have a translated SRT</b>: switch input mode to <i>SRT</i> → upload it</li>
                         </ul>
@@ -284,7 +305,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                     {/* ── Pipeline Mode Banner ── */}
                     <div className={`rounded-lg p-3 text-xs ${isSrtDub ? 'bg-teal-500/10 border border-teal-500/30 text-teal-400' :
-                        isWordChunk ? 'bg-purple-500/10 border border-purple-500/30 text-purple-400' :
                             isOneFlow ? 'bg-red-500/10 border border-red-500/30 text-red-400' :
                                 isNew ? 'bg-green-500/10 border border-green-500/30 text-green-400' :
                                     isHybrid ? 'bg-amber-500/10 border border-amber-500/30 text-amber-400' :
@@ -292,7 +312,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         }`}>
                         <p className="font-medium mb-1">
                             {isSrtDub ? 'SRT Direct (Your SRT → TTS → Stretch)' :
-                                isWordChunk ? 'WordChunk (YouTube + Super-Stretch)' :
                                     isOneFlow ? 'OneFlow (Fastest)' :
                                         isNew ? 'New Pipeline (Experimental)' :
                                             isHybrid ? 'Hybrid Pipeline (Recommended)' :
@@ -300,7 +319,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </p>
                         <p className="text-[10px] opacity-80">
                             {isSrtDub ? 'You provide a perfect translated SRT. We TTS each cue verbatim → concatenate back-to-back with zero gap → stretch video 1-10× to match audio. If audio still overflows after max stretch, we freeze-pad the last frame. Audio is NEVER trimmed.' :
-                                isWordChunk ? 'YouTube English subs → split by sentence → Google Translate each → Edge-TTS each → concatenate → video stretched 1-5× to match audio. No Whisper.' :
                                     isOneFlow ? 'Groq Whisper → Google Translate (100 workers) → Edge-TTS (150 workers) → fixed 1.15x → video adapts. No LLM, no cue rebuild, just speed.' :
                                         isNew ? 'Parakeet ASR + WhisperX timing + DP cue builder + glossary lock. All new modular code.' :
                                             isHybrid ? 'Whisper ASR (all options) + DP cue builder + glossary + Hindi fitting + QC gates. Best quality + proven infrastructure.' :
@@ -609,73 +627,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </div>
                     )}
 
-                    {/* ── WordChunk-specific controls ── */}
-                    {isWordChunk && (
-                        <div className="rounded-lg p-4 bg-purple-500/5 border border-purple-500/20 space-y-4">
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Chunk size (words per TTS clip)
-                                </label>
-                                <div className="flex gap-2">
-                                    {[4, 8, 12].map(n => (
-                                        <button
-                                            key={n}
-                                            type="button"
-                                            onClick={() => onChange({ ...settings, wc_chunk_size: n } as any)}
-                                            className={`px-4 py-2 text-xs rounded border transition-colors ${((settings as any).wc_chunk_size ?? 8) === n
-                                                ? 'bg-purple-500 text-white border-purple-500'
-                                                : 'bg-white/5 text-text-muted border-border hover:bg-white/10'
-                                                }`}
-                                        >
-                                            {n} words
-                                        </button>
-                                    ))}
-                                </div>
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    Smaller = tighter sync; larger = smoother prosody.
-                                </p>
-                            </div>
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Max video stretch: {((settings as any).wc_max_stretch ?? 20.0).toFixed(1)}×
-                                </label>
-                                <input
-                                    type="range"
-                                    min="1"
-                                    max="20"
-                                    step="0.5"
-                                    aria-label="Maximum video stretch multiplier"
-                                    title="Maximum video stretch multiplier"
-                                    value={(settings as any).wc_max_stretch ?? 20.0}
-                                    onChange={e => onChange({ ...settings, wc_max_stretch: parseFloat(e.target.value) } as any)}
-                                    className="w-full accent-purple-500"
-                                />
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    Cap for slowing video to match audio. Video never speeds up.
-                                </p>
-                            </div>
-
-                            <div>
-                                <label className="text-xs font-medium text-purple-300 block mb-2">
-                                    Transcript override (optional)
-                                </label>
-                                <textarea
-                                    rows={6}
-                                    placeholder="Paste the English transcript here to skip YouTube subs fetch. Leave blank to auto-download subs. Copy from YouTube's transcript panel or any other source — timestamps and speaker labels are stripped automatically."
-                                    aria-label="Pasted English transcript override"
-                                    value={(settings as any).wc_transcript ?? ""}
-                                    onChange={e => onChange({ ...settings, wc_transcript: e.target.value } as any)}
-                                    className="w-full bg-white/5 border border-border rounded px-3 py-2 text-xs text-text-primary placeholder:text-text-muted/60 focus:outline-none focus:border-purple-500 font-mono"
-                                />
-                                <p className="text-[10px] text-text-muted mt-1">
-                                    {((settings as any).wc_transcript ?? "").trim()
-                                        ? `Using pasted transcript (${((settings as any).wc_transcript ?? "").trim().length} chars) — YouTube subs fetch SKIPPED`
-                                        : "Leave empty to auto-fetch YouTube English subs via yt-dlp."}
-                                </p>
-                            </div>
-                        </div>
-                    )}
-
                     {/* SRT Mode: lock transcription + translation (SRT already has translated text) */}
                     {isSrtMode && (
                         <div className="rounded-lg bg-purple-500/5 border border-purple-500/20 p-3">
@@ -724,6 +675,8 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                     {/* ── Transcription + Translation: HIDDEN in SRT mode and SRT Direct ── */}
                     {!isSrtMode && !isSrtDub && (<>
+                        {/* ── GROUP 1 — Transcription ── */}
+                        <CollapsibleGroup title="Transcription" subtitle="ASR model, chaining, lip-sync, English simplify">
                         {/* ── Transcription Section ── */}
                         {/* Classic + Hybrid: show Whisper options. New: ASR engine picker. */}
                         <div>
@@ -740,11 +693,11 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </>
                                 ) : (
                                     <>
-                                        <b className="text-text-secondary">Recommended:</b> use <i>Groq</i> (cloud, fastest) or <i>Use YouTube Transcript</i> below if the video has captions.
+                                        <b className="text-text-secondary">Recommended:</b> use <i>Groq</i> (cloud, fastest).
                                         Local models only matter if Groq is rate-limited.
                                     </>
                                 )}
-                                {whisperDisabled && !isNew && <span className="text-yellow-400 ml-1"> — Whisper currently skipped, using YouTube subs</span>}
+                                {whisperDisabled && !isNew && <span className="text-yellow-400 ml-1"> — Whisper skipped in this mode</span>}
                             </p>
                             <div className="space-y-3">
                                 <div className={(whisperDisabled && !isNew) ? 'opacity-40 pointer-events-none' : ''}>
@@ -781,188 +734,8 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
                                 </div>
 
-                                {/* YouTube Subtitles — disabled when YT Auto-Translate is on */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">Use YouTube Transcript ⚡</p>
-                                        <p className="text-xs text-text-muted">
-                                            Skip Whisper completely — download YouTube&apos;s caption file (~5-10s). Best for lectures, TED talks, tutorials with clean audio. Falls back to Whisper if no captions exist.
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— disabled: YT Translate is on (cascade includes this automatically)</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YouTube Subtitles"
-                                        onClick={() => update({
-                                            prefer_youtube_subs: !settings.prefer_youtube_subs,
-                                            ...(!settings.prefer_youtube_subs ? { use_yt_translate: false } : {}),
-                                        })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.prefer_youtube_subs ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.prefer_youtube_subs ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YouTube Auto-Translate — the CASCADE toggle */}
-                                <div className={`flex items-center justify-between ${(ytSubsOn || transcribeOnly || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">YT Auto-Translate ⚡⚡ <span className="text-[10px] text-green-400">CASCADE</span></p>
-                                        <p className="text-xs text-text-muted">
-                                            <b>Recommended.</b> Full cascade: tries YouTube Hindi first (best quality, fastest).
-                                            If Hindi unavailable/429, falls back to YouTube English subs + Google Translate.
-                                            If no subs at all, falls back to Whisper. All with retries + Premium cookies.
-                                            {ytSubsOn && <span className="text-yellow-400 ml-1">— disabled: YT Transcript is on</span>}
-                                            {transcribeOnly && !ytSubsOn && <span className="text-yellow-400 ml-1">— disabled: Transcribe Only is on</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YouTube Translate"
-                                        onClick={() => update({
-                                            use_yt_translate: !settings.use_yt_translate,
-                                            ...(!settings.use_yt_translate ? { prefer_youtube_subs: false, transcribe_only: false } : {}),
-                                        })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.use_yt_translate ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.use_yt_translate ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YT Text Correction — works WITH Whisper, not instead of it */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || ytSubsOn || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">YT Text Correction</p>
-                                        <p className="text-xs text-text-muted">
-                                            Whisper runs normally (keeps precise timestamps). YouTube subs fix text errors — proper nouns, punctuation, hallucinations. Best of both.
-                                            {(ytTranslateOn || ytSubsOn) && <span className="text-yellow-400 ml-1">— disabled: YT subs mode already replaces Whisper</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle YT Text Correction"
-                                        onClick={() => update({ yt_text_correction: !settings.yt_text_correction })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.yt_text_correction ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.yt_text_correction ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
-                                </div>
-
-                                {/* YT Replace Mode — only visible when YT Text Correction is ON */}
-                                {settings.yt_text_correction && !ytTranslateOn && !ytSubsOn && !isOneFlow && !isSrtMode && (
-                                    <div className="flex items-center justify-between ml-4">
-                                        <div>
-                                            <p className="text-xs font-medium text-text-secondary">Replace Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                {settings.yt_replace_mode === 'full'
-                                                    ? 'Full — replace all Whisper text with YouTube text. Clean names but loses Whisper punctuation.'
-                                                    : 'Diff — word-level comparison, only swap words that differ (names, nouns, misspellings). Keeps Whisper punctuation.'}
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_replace_mode: 'diff' })}
-                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.yt_replace_mode === 'diff'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Diff
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_replace_mode: 'full' })}
-                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.yt_replace_mode === 'full'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Full
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Translation Glossary — words to keep/transliterate */}
-                                <GlossaryEditor />
-
-                                {/* YouTube Transcript Mode — only visible when YT subs are enabled */}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <p className="text-sm text-text-primary">YT Transcript Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                How YouTube subs are structured before feeding to TTS pipeline.
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            {([
-                                                { mode: 'yt_timeline', label: 'YT Timeline', desc: 'Fast (no Whisper)' },
-                                                { mode: 'whisper_timeline', label: 'Whisper Timeline', desc: 'Precise (slower)' },
-                                            ] as const).map(({ mode, label }) => (
-                                                <button
-                                                    key={mode}
-                                                    type="button"
-                                                    onClick={() => update({ yt_transcript_mode: mode })}
-                                                    className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_transcript_mode === mode
-                                                        ? 'bg-primary text-white'
-                                                        : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                        }`}
-                                                >
-                                                    {label}
-                                                </button>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="text-[10px] text-text-muted -mt-1 ml-1">
-                                        {settings.yt_transcript_mode === 'whisper_timeline'
-                                            ? 'YouTube text + Whisper precise timestamps. Runs Whisper for timing only, uses YouTube text (better quality). Slower but exact slot durations.'
-                                            : 'YouTube text + YouTube timelines. Fast, no Whisper needed.'}
-                                    </div>
-                                )}
-
-                                {/* Segment Split Mode — only visible when YT subs are enabled */}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <p className="text-sm text-text-primary">Segment Split Mode</p>
-                                            <p className="text-xs text-text-muted">
-                                                How text is split into segments for TTS.
-                                            </p>
-                                        </div>
-                                        <div className="flex rounded-lg overflow-hidden border border-border">
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_segment_mode: 'sentence' })}
-                                                className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_segment_mode === 'sentence'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Sentence
-                                            </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => update({ yt_segment_mode: 'wordcount' })}
-                                                className={`px-3 py-1.5 text-xs font-medium transition-colors ${settings.yt_segment_mode === 'wordcount'
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                Word Count
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-                                {(ytTranslateOn || ytSubsOn) && (
-                                    <div className="text-[10px] text-text-muted -mt-1 ml-1">
-                                        {settings.yt_segment_mode === 'wordcount'
-                                            ? 'Even word-count split (~20 words/segment). Uniform speed, works without punctuation. Gaps removed anyway.'
-                                            : '2 sentences per segment (atomic, never split). Needs punctuation in captions. Auto-falls back to word count if no punctuation detected.'}
-                                    </div>
-                                )}
-
-                                {/* Chain Dub — disabled when YT Translate or New pipeline */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                {/* Chain Dub — disabled when New pipeline */}
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                                     <div>
                                         <p className="text-sm text-text-primary">Chain Dub (English → Hindi)</p>
                                         <p className="text-xs text-text-muted">Dub to English first using subs, then English to Hindi (best for non-English videos)</p>
@@ -976,21 +749,19 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
 
-                                {/* WhisperX — disabled when Whisper skipped or New pipeline (built-in) */}
-                                <div className={`flex items-center justify-between ${(whisperxDisabled || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                {/* WhisperX now lives in the dedicated Word Timing module (single
+                                    source of truth). Breadcrumb shows state + where to change it. */}
+                                <div className="flex items-center justify-between py-1">
                                     <div>
                                         <p className="text-sm text-text-primary">WhisperX Alignment</p>
                                         <p className="text-xs text-text-muted">
-                                            Force word-level timestamp alignment (requires whisperx)
-                                            {whisperDisabled && <span className="text-yellow-400 ml-1">— needs Whisper</span>}
+                                            Managed in the <span className="text-primary">Word Timing</span> panel above.
+                                            {whisperDisabled && <span className="text-yellow-400 ml-1">— Whisper skipped this mode</span>}
                                         </p>
                                     </div>
-                                    <button
-                                        type="button" title="Toggle WhisperX Alignment" onClick={() => update({ use_whisperx: !settings.use_whisperx })}
-                                        className={`w-11 h-6 rounded-full transition-colors relative ${settings.use_whisperx ? 'bg-primary' : 'bg-white/10'}`}
-                                    >
-                                        <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.use_whisperx ? 'translate-x-6' : 'translate-x-1'}`} />
-                                    </button>
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full shrink-0 ${settings.use_whisperx ? 'bg-primary/20 text-primary' : 'bg-white/10 text-text-muted'}`}>
+                                        {settings.use_whisperx ? 'ON' : 'OFF'}
+                                    </span>
                                 </div>
 
                                 {/* Wav2Lip lip-sync — post-assembly, opt-in. Needs GPU + backend/wav2lip/ + checkpoint */}
@@ -1015,7 +786,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                         <p className="text-sm text-text-primary">Simplify English</p>
                                         <p className="text-xs text-text-muted">
                                             Rewrite complex English into simple sentences — much better Hindi
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— not needed with YT Translate</span>}
                                         </p>
                                     </div>
                                     <button
@@ -1090,6 +860,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             )}
                         </div>
 
+                        </CollapsibleGroup>
+
+                        {/* ── GROUP 2 — Translation ── */}
+                        <CollapsibleGroup title="Translation" subtitle="Engine, glossary, transcribe-only, multi-speaker">
                         {/* ── Translation Section ── */}
                         <div className={translationDisabled ? 'opacity-40 pointer-events-none' : ''}>
                             <p className="text-sm font-medium text-text-primary mb-1">Step 2 — Translation</p>
@@ -1100,7 +874,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </p>
                             <p className="text-[10px] text-text-muted mb-3">
                                 <b className="text-text-secondary">Recommended:</b> <i>Google</i> = fastest free (used by default). <i>Gemma 4</i> = best Hindi quality but needs GEMINI_API_KEY. <i>Cerebras</i> = ultra-fast LLM, also good.
-                                {ytTranslateOn && <span className="text-yellow-400 ml-1"> Skipped — YouTube already translated.</span>}
                             </p>
                             <div className="grid grid-cols-6 gap-2 mb-3">
                                 {[
@@ -1155,6 +928,9 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </div>
                         </div>
 
+                        {/* Translation Glossary — words to keep/transliterate */}
+                        <GlossaryEditor />
+
                         {/* ── New Pipeline Features (hybrid + new only) ── */}
                         {(isHybrid || isNew) && (
                             <div className="rounded-lg bg-green-500/5 border border-green-500/20 p-3 space-y-2">
@@ -1188,32 +964,28 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </div>
                         )}
 
-                        {/* Transcribe Only — disabled when YT Auto-Translate or New pipeline */}
-                        <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        {/* Transcribe Only — disabled when New pipeline */}
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                                 <p className="text-sm text-text-primary">Transcribe Only</p>
                                 <p className="text-xs text-text-muted">
                                     Get SRT to translate yourself (e.g. with Claude), then upload back
-                                    {ytTranslateOn && <span className="text-yellow-400 ml-1">— off: YT Translate active</span>}
                                 </p>
                             </div>
                             <button
                                 type="button" title="Toggle Transcribe Only"
-                                onClick={() => update({
-                                    transcribe_only: !settings.transcribe_only,
-                                    ...(!settings.transcribe_only ? { use_yt_translate: false } : {}),
-                                })}
+                                onClick={() => update({ transcribe_only: !settings.transcribe_only })}
                                 className={`w-11 h-6 rounded-full transition-colors relative ${settings.transcribe_only ? 'bg-primary' : 'bg-white/10'}`}
                             >
                                 <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.transcribe_only ? 'translate-x-6' : 'translate-x-1'}`} />
                             </button>
                         </div>
 
-                        {/* Multi-Speaker Voices — disabled when YT Translate or New pipeline */}
-                        <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        {/* Multi-Speaker Voices — disabled when New pipeline */}
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
                             <div>
                                 <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
-                                <p className="text-xs text-text-muted">Detect speakers & assign distinct voices (needs HF_TOKEN, adds ~30s)</p>
+                                <p className="text-xs text-text-muted">Detect each speaker, give men male and women female Hindi voices (GPU ~20-40s per 10 min; first run downloads ~1.5 GB)</p>
                             </div>
                             <button
                                 type="button" title="Toggle Multi-speaker" onClick={() => update({ multi_speaker: !settings.multi_speaker })}
@@ -1228,10 +1000,13 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             `} />
                             </button>
                         </div>
+                        </CollapsibleGroup>
 
                     </>)}
                     {/* ── End of Transcription + Translation (hidden in SRT mode) ── */}
 
+                    {/* ── GROUP 3 — Voice & TTS Engine ── */}
+                    <CollapsibleGroup title="Voice & TTS Engine" subtitle="Voice picker, speech rate, engine toggles">
                     {/* TTS Engines + Rate Mode — HIDDEN in SRT Direct (Edge-TTS only, no auto-rate) */}
                     {!isSrtDub && (<>
                         {/* TTS Engines */}
@@ -1564,12 +1339,75 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             <span>1.75x</span>
                         </div>
                     </div>
+                    </CollapsibleGroup>
 
-                    {/* Mix Background Music — SUSPENDED (permanently disabled) */}
-
-                    {/* ── Audio & Performance Section — HIDDEN in SRT Direct (it has its own assembly) ── */}
+                    {/* ── GROUP 4 — Background Music (master toggle) ── */}
                     {!isSrtDub && (
-                        <div>
+                        <CollapsibleGroup
+                            title="Background Music"
+                            subtitle="Demucs bed under the voice, pitch/EQ-altered"
+                            master={settings.mix_original}
+                            onMaster={(v) => update({ mix_original: v })}
+                        >
+                            <div className={(isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}>
+                                <p className="text-sm text-text-primary">Keep Background Music</p>
+                                <p className="text-xs text-text-muted">
+                                    Demucs isolates the original music/SFX and mixes it (auto-ducked) under the Hindi voice.
+                                    The bed is pitch/EQ-shifted to reduce Content-ID matching — this lowers, but does not
+                                    guarantee, avoiding a music copyright claim. Adds a GPU separation step.
+                                </p>
+                            </div>
+                        </CollapsibleGroup>
+                    )}
+
+                    {/* ── GROUPS 5-7 — Assembly / Verification / Advanced (hidden in SRT Direct) ── */}
+                    {!isSrtDub && (<>
+                        {/* ── GROUP 5 — Audio & Video Assembly ── */}
+                        <CollapsibleGroup title="Audio & Video Assembly" subtitle="Sync, sound processing, bitrate, encode">
+                            {/* Tempo Match (per-segment) — master fit switch */}
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="flex-1 pr-3">
+                                    <p className="text-sm text-text-primary">Tempo Match (per-segment)</p>
+                                    <p className="text-xs text-text-muted">Dubbed speech fits each original time slot. Video is never slowed; output length = source length.</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle Tempo Match" onClick={() => update({ tempo_match: !tempoOn })}
+                                    className={`
+                                    w-11 h-6 rounded-full transition-colors relative shrink-0
+                                    ${tempoOn ? 'bg-primary' : 'bg-white/10'}
+                                `}
+                                >
+                                    <div className={`
+                                    w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                    ${tempoOn ? 'translate-x-6' : 'translate-x-1'}
+                                `} />
+                                </button>
+                            </div>
+                            {tempoOn && (
+                                <div className="mb-3">
+                                    <p className="text-xs text-text-secondary mb-1.5">Max speech speed-up</p>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        {[
+                                            { value: 1.3, label: '1.3×', desc: 'Most natural' },
+                                            { value: 1.5, label: '1.5×', desc: 'Recommended' },
+                                            { value: 2.0, label: '2.0×', desc: 'Everything fits' },
+                                        ].map((m) => (
+                                            <button key={m.value} type="button"
+                                                onClick={() => update({ tempo_max_speedup: m.value })}
+                                                className={`
+                                                px-2 py-1.5 rounded-lg text-xs font-medium transition-all text-center
+                                                ${(settings.tempo_max_speedup ?? 1.5) === m.value
+                                                        ? 'bg-primary/20 text-primary border border-primary/30'
+                                                        : 'bg-white/5 text-text-muted border border-white/5 hover:border-white/20'}
+                                            `}
+                                            >
+                                                <div>{m.label}</div>
+                                                <div className="text-[10px] opacity-60">{m.desc}</div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                             <p className="text-sm font-medium text-text-primary mb-1">Step 4 — Audio &amp; Video Assembly</p>
                             {isVoiceClone && (
                                 <div className="rounded-lg p-2 mb-2 bg-violet-500/10 border border-violet-500/30">
@@ -1705,10 +1543,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </p>
 
                                     {/* ── Module 1: Per-Segment Slot Recompute ── */}
-                                    <div className="rounded-lg border border-white/10 p-3 mb-3">
+                                    <div className={`rounded-lg border border-white/10 p-3 mb-3 ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                         <div className="flex items-center justify-between mb-2">
                                             <div>
-                                                <p className="text-xs font-medium text-text-primary">Module 1 — Per-Segment Slot Recompute</p>
+                                                <p className="text-xs font-medium text-text-primary">Module 1 — Per-Segment Slot Recompute{tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}</p>
                                                 <p className="text-[10px] text-text-muted">Speed audio up to cap, then expand each segment&apos;s slot by word-weight. Each video segment gets its own speed.</p>
                                             </div>
                                         </div>
@@ -1778,10 +1616,10 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
 
                                     {/* ── Module 2: Global Stretch ── */}
-                                    <div className="rounded-lg border border-white/10 p-3 mb-3">
+                                    <div className={`rounded-lg border border-white/10 p-3 mb-3 ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                         <div className="flex items-center justify-between">
                                             <div>
-                                                <p className="text-xs font-medium text-text-primary">Module 2 — Global Stretch</p>
+                                                <p className="text-xs font-medium text-text-primary">Module 2 — Global Stretch{tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}</p>
                                                 <p className="text-[10px] text-text-muted">One uniform video speed for the whole video. Simple: total TTS audio at speed X vs original video length.</p>
                                             </div>
                                             <button
@@ -1905,37 +1743,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
                                 </div>
 
-                                {/* TTS Chunk Words — split translated text into small chunks */}
-                                <div className="flex items-center justify-between">
-                                    <div>
-                                        <p className="text-xs font-medium text-text-secondary">TTS Chunk Size</p>
-                                        <p className="text-xs text-text-muted">
-                                            {settings.tts_chunk_words === 0 ? 'Off — TTS gets full segments (best natural sound).'
-                                                : `${settings.tts_chunk_words} words per TTS call — prevents truncation but less natural prosody.`}
-                                        </p>
-                                    </div>
-                                    <div className="flex rounded-lg overflow-hidden border border-border">
-                                        {([
-                                            { val: 0, label: 'Off' },
-                                            { val: 4, label: '4w' },
-                                            { val: 8, label: '8w' },
-                                            { val: 12, label: '12w' },
-                                        ] as const).map(({ val, label }) => (
-                                            <button
-                                                key={val}
-                                                type="button"
-                                                onClick={() => update({ tts_chunk_words: val })}
-                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.tts_chunk_words === val
-                                                    ? 'bg-primary text-white'
-                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
-                                                    }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-
                                 {/* Duration Fitting (speed-up/slow-down) */}
                                 <div className="flex items-center justify-between">
                                     <div>
@@ -1985,33 +1792,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </div>
                                 </div>
 
-                                {/* Download Mode — remux (fast) vs encode (compatible) */}
-                                <div>
-                                    <p className="text-xs text-text-secondary mb-0.5">Download Mode</p>
-                                    <p className="text-[10px] text-text-muted mb-1.5"><b>Remux</b> = instant container swap (fast, current default). <b>Encode</b> = old behaviour, ffmpeg re-encodes during merge — slower but always works if a video&apos;s codec combo breaks remux.</p>
-                                    <div className="grid grid-cols-2 gap-2">
-                                        {[
-                                            { value: 'remux', label: 'Remux', desc: 'Fast (default)' },
-                                            { value: 'encode', label: 'Encode', desc: 'Slow but compatible' },
-                                        ].map((m) => (
-                                            <button
-                                                type="button"
-                                                key={m.value}
-                                                onClick={() => update({ download_mode: m.value })}
-                                                className={`
-                                                px-2 py-2 rounded-lg text-xs text-center transition-all border
-                                                ${settings.download_mode === m.value
-                                                        ? 'bg-primary/20 border-primary text-primary-light'
-                                                        : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
-                                            `}
-                                            >
-                                                <div className="font-medium">{m.label}</div>
-                                                <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-
                                 {/* Encode Speed */}
                                 <div>
                                     <p className="text-xs text-text-secondary mb-0.5">Video Encode Speed</p>
@@ -2046,7 +1826,70 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     <p className="text-xs text-green-400 font-medium">Assembly: Per-segment NVENC (4x parallel)</p>
                                     <p className="text-[10px] text-green-400/70">Audio priority — video adapts per sentence. GPU-accelerated encoding.</p>
                                 </div>
+                            </div>
+                        </CollapsibleGroup>
 
+                        {/* ── GROUP 5b — Visual Transforms (Content-ID evasion, master toggle) ── */}
+                        <CollapsibleGroup
+                            title="Visual Transforms"
+                            subtitle="Content-ID / duplicate evasion (classic mode)"
+                            master={settings.visual_transforms ?? true}
+                            onMaster={(v) => update({ visual_transforms: v })}
+                        >
+                            <p className="text-[11px] text-text-muted">
+                                Applied once at the final mux (hue shift + slight zoom + metadata strip) to break the
+                                video fingerprint. Imperceptible.
+                                <span className="text-yellow-400"> Only for content you have the right to dub.</span>
+                            </p>
+
+                            {/* Mirror (hflip) */}
+                            <div className="flex items-center justify-between">
+                                <div className="pr-3">
+                                    <p className="text-sm text-text-primary">Mirror (horizontal flip)</p>
+                                    <p className="text-[11px] text-text-muted">Strongest break — but flips any on-screen text/logos. Off by default.</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle Mirror" onClick={() => update({ vx_hflip: !settings.vx_hflip })}
+                                    className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${settings.vx_hflip ? 'bg-primary' : 'bg-white/10'}`}
+                                >
+                                    <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.vx_hflip ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+
+                            {/* Hue shift */}
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <p className="text-sm text-text-primary">Hue shift</p>
+                                    <span className="text-xs text-text-muted">{settings.vx_hue ?? 4}°</span>
+                                </div>
+                                <input type="range" min={0} max={15} step={1} value={settings.vx_hue ?? 4}
+                                    onChange={e => update({ vx_hue: parseFloat(e.target.value) })}
+                                    className="w-full accent-primary" />
+                                <p className="text-[10px] text-text-muted">0 = off · 4° recommended (imperceptible)</p>
+                            </div>
+
+                            {/* Zoom */}
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <p className="text-sm text-text-primary">Zoom + crop</p>
+                                    <span className="text-xs text-text-muted">{(settings.vx_zoom ?? 1.04).toFixed(2)}×</span>
+                                </div>
+                                <input type="range" min={1.0} max={1.1} step={0.01} value={settings.vx_zoom ?? 1.04}
+                                    onChange={e => update({ vx_zoom: parseFloat(e.target.value) })}
+                                    className="w-full accent-primary" />
+                                <p className="text-[10px] text-text-muted">1.00 = off · 1.04 recommended (zoom in, crop back)</p>
+                            </div>
+                        </CollapsibleGroup>
+
+                        {/* ── GROUP 6 — Verification & Review (master toggle) ── */}
+                        <CollapsibleGroup
+                            title="Verification & Review"
+                            subtitle="Master = word-match verify; retry / manual review stay independent"
+                            master={settings.tts_word_match_verify}
+                            onMaster={(v) => update({ tts_word_match_verify: v })}
+                            greyOnOff={false}
+                        >
+                            <div className="space-y-3">
                                 {/* Manual Review Queue */}
                                 <div className="flex items-center justify-between">
                                     <div>
@@ -2147,20 +1990,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                                 ~15–25 minutes extra.
                                             </p>
                                         </div>
-                                        <button
-                                            type="button"
-                                            title="Toggle Post-TTS Word-Match Verify"
-                                            onClick={() => update({ tts_word_match_verify: !settings.tts_word_match_verify })}
-                                            className={`
-                                            w-11 h-6 rounded-full transition-colors relative shrink-0
-                                            ${settings.tts_word_match_verify ? 'bg-primary' : 'bg-white/10'}
-                                        `}
-                                        >
-                                            <div className={`
-                                            w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
-                                            ${settings.tts_word_match_verify ? 'translate-x-6' : 'translate-x-1'}
-                                        `} />
-                                        </button>
                                     </div>
                                     {settings.tts_word_match_verify && (
                                         <div className="mt-2 ml-1">
@@ -2231,12 +2060,98 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     )}
                                 </div>
 
-                                {/* No Time Pressure on TTS — master switch */}
+                                {/* Step-by-Step Review — disabled when New pipeline */}
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                    <div>
+                                        <p className="text-sm text-text-primary">Step-by-Step Review</p>
+                                        <p className="text-xs text-text-muted">
+                                            Pause after transcription & translation to review output before continuing
+                                        </p>
+                                    </div>
+                                    <button
+                                        type="button" title="Toggle Step-by-Step Review" onClick={() => update({ step_by_step: !settings.step_by_step })}
+                                        className={`
+                                        w-11 h-6 rounded-full transition-colors relative
+                                        ${settings.step_by_step ? 'bg-primary' : 'bg-white/10'}
+                                    `}
+                                    >
+                                        <div className={`
+                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
+                                        ${settings.step_by_step ? 'translate-x-6' : 'translate-x-1'}
+                                    `} />
+                                    </button>
+                                </div>
+                            </div>
+                        </CollapsibleGroup>
+
+                        {/* ── GROUP 7 — Advanced / Misc ── */}
+                        <CollapsibleGroup title="Advanced / Misc" subtitle="Chunking, download, workers, diagnostics, limits">
+                            <div className="space-y-3">
+                                {/* TTS Chunk Words — split translated text into small chunks */}
                                 <div className="flex items-center justify-between">
+                                    <div>
+                                        <p className="text-xs font-medium text-text-secondary">TTS Chunk Size</p>
+                                        <p className="text-xs text-text-muted">
+                                            {settings.tts_chunk_words === 0 ? 'Off — TTS gets full segments (best natural sound).'
+                                                : `${settings.tts_chunk_words} words per TTS call — prevents truncation but less natural prosody.`}
+                                        </p>
+                                    </div>
+                                    <div className="flex rounded-lg overflow-hidden border border-border">
+                                        {([
+                                            { val: 0, label: 'Off' },
+                                            { val: 4, label: '4w' },
+                                            { val: 8, label: '8w' },
+                                            { val: 12, label: '12w' },
+                                        ] as const).map(({ val, label }) => (
+                                            <button
+                                                key={val}
+                                                type="button"
+                                                onClick={() => update({ tts_chunk_words: val })}
+                                                className={`px-3 py-1 text-[10px] font-medium transition-colors ${settings.tts_chunk_words === val
+                                                    ? 'bg-primary text-white'
+                                                    : 'bg-white/5 text-text-muted hover:bg-white/10'
+                                                    }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* Download Mode — remux (fast) vs encode (compatible) */}
+                                <div>
+                                    <p className="text-xs text-text-secondary mb-0.5">Download Mode</p>
+                                    <p className="text-[10px] text-text-muted mb-1.5"><b>Remux</b> = instant container swap (fast, current default). <b>Encode</b> = old behaviour, ffmpeg re-encodes during merge — slower but always works if a video&apos;s codec combo breaks remux.</p>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {[
+                                            { value: 'remux', label: 'Remux', desc: 'Fast (default)' },
+                                            { value: 'encode', label: 'Encode', desc: 'Slow but compatible' },
+                                        ].map((m) => (
+                                            <button
+                                                type="button"
+                                                key={m.value}
+                                                onClick={() => update({ download_mode: m.value })}
+                                                className={`
+                                                px-2 py-2 rounded-lg text-xs text-center transition-all border
+                                                ${settings.download_mode === m.value
+                                                        ? 'bg-primary/20 border-primary text-primary-light'
+                                                        : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}
+                                            `}
+                                            >
+                                                <div className="font-medium">{m.label}</div>
+                                                <div className="text-[10px] opacity-70 mt-0.5">{m.desc}</div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* No Time Pressure on TTS — master switch */}
+                                <div className={`flex items-center justify-between ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
                                     <div className="flex-1 pr-3">
                                         <p className="text-sm text-text-primary">
                                             TTS: No Time Pressure{' '}
                                             <span className="text-[10px] text-green-400">DEFAULT ON · RECOMMENDED</span>
+                                            {tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}
                                         </p>
                                         <p className="text-xs text-text-muted">
                                             Master switch: when ON, TTS produces full natural-pace audio for
@@ -2460,28 +2375,6 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
 
-                                {/* Step-by-Step Review — disabled when YT Translate or New pipeline */}
-                                <div className={`flex items-center justify-between ${(ytTranslateOn || isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
-                                    <div>
-                                        <p className="text-sm text-text-primary">Step-by-Step Review</p>
-                                        <p className="text-xs text-text-muted">
-                                            Pause after transcription & translation to review output before continuing
-                                            {ytTranslateOn && <span className="text-yellow-400 ml-1">— off: YT Translate skips these steps</span>}
-                                        </p>
-                                    </div>
-                                    <button
-                                        type="button" title="Toggle Step-by-Step Review" onClick={() => update({ step_by_step: !settings.step_by_step })}
-                                        className={`
-                                        w-11 h-6 rounded-full transition-colors relative
-                                        ${settings.step_by_step ? 'bg-primary' : 'bg-white/10'}
-                                    `}
-                                    >
-                                        <div className={`
-                                        w-4 h-4 rounded-full bg-white absolute top-1 transition-transform
-                                        ${settings.step_by_step ? 'translate-x-6' : 'translate-x-1'}
-                                    `} />
-                                    </button>
-                                </div>
                             </div>
 
                             {/* Dub Duration Limit */}
@@ -2562,8 +2455,8 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     ))}
                                 </div>
                             </div>
-                        </div>
-                    )}
+                        </CollapsibleGroup>
+                    </>)}
                     {/* ── End of Audio & Performance Section (hidden in SRT Direct) ── */}
                 </div>);
             })()}

@@ -7,7 +7,7 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
-import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob } from '@/lib/api';
+import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob, dialogueReportUrl } from '@/lib/api';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -206,8 +206,6 @@ export default function JobPage() {
                                             {BoolPill('Fast Assemble', c.fast_assemble)}
                                             {BoolPill('Sentence Gap', c.enable_sentence_gap)}
                                             {BoolPill('Duration Fit', c.enable_duration_fit)}
-                                            {BoolPill('YT Subs', c.prefer_youtube_subs)}
-                                            {BoolPill('YT Translate', c.use_yt_translate)}
                                             {BoolPill('WhisperX', c.use_whisperx)}
                                             {BoolPill('Simplify EN', c.simplify_english)}
                                             {BoolPill('Manual Review', c.enable_manual_review)}
@@ -245,6 +243,64 @@ export default function JobPage() {
                                 </>
                             );
                         })()}
+                    </div>
+                )}
+
+                {/* Multi-speaker outcome: who spoke, detected gender, Hindi voice */}
+                {status?.speaker_warning && (
+                    <div className="glass-card p-4 border border-amber-500/30">
+                        <p className="text-sm font-medium text-amber-400">Multi-speaker did not run</p>
+                        <p className="text-xs text-text-muted mt-1">{status.speaker_warning}</p>
+                    </div>
+                )}
+                {status?.speakers && status.speakers.length > 0 && (
+                    <div className="glass-card p-4">
+                        <p className="text-sm font-medium text-text-primary mb-2">
+                            Speakers ({new Set(status.speakers.map((s) => s.voice)).size} voices)
+                        </p>
+                        <div className="space-y-1.5">
+                            {status.speakers.map((s, i) => (
+                                <div key={`${s.part ?? 0}-${s.speaker}-${i}`} className="flex items-center justify-between text-xs">
+                                    <div className="flex items-center gap-2">
+                                        <span className={`px-1.5 py-0.5 rounded font-medium ${s.gender === 'female' ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'}`}>
+                                            {s.gender === 'female' ? 'F' : 'M'}
+                                        </span>
+                                        <span className="text-text-secondary">
+                                            {s.part != null ? `Part ${s.part} · ` : ''}{s.speaker}
+                                        </span>
+                                        <span className="text-text-muted">{Math.round(s.seconds)}s</span>
+                                    </div>
+                                    <span className="text-text-primary">
+                                        {s.voice.split('-').pop()?.replace('Neural', '')}
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {/* Hindi dialogue profile: honest result status + report */}
+                {status?.result_status && (
+                    <div className="glass-card p-4">
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${
+                                    status.result_status === 'completed' ? 'bg-green-500/20 text-green-400' :
+                                    status.result_status === 'completed_with_warnings' ? 'bg-amber-500/20 text-amber-400' :
+                                    'bg-red-500/20 text-red-400'}`}>
+                                    {status.result_status.replace(/_/g, ' ')}
+                                </span>
+                                {(status.status_reasons || []).length > 0 && (
+                                    <ul className="mt-2 text-xs text-text-muted list-disc pl-4 space-y-0.5">
+                                        {(status.status_reasons || []).slice(0, 6).map((r, i) => <li key={i}>{r}</li>)}
+                                    </ul>
+                                )}
+                            </div>
+                            <a href={dialogueReportUrl(jobId)} target="_blank" rel="noreferrer"
+                               className="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-text-primary whitespace-nowrap">
+                                Open report
+                            </a>
+                        </div>
                     </div>
                 )}
 

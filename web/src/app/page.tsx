@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import URLInput from '@/components/URLInput';
 import LanguageSelector, { LANGUAGES } from '@/components/LanguageSelector';
 import SettingsPanel, { type DubbingSettings } from '@/components/SettingsPanel';
+import WordTimingPanel from '@/components/WordTimingPanel';
 import PresetTabs from '@/components/PresetTabs';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
@@ -22,7 +23,7 @@ export default function HomePage() {
         // ── Stage 5: Translation — Google (parallel x20, FASTEST free) ──
         translation_engine: 'google',
         tts_rate: '+0%',
-        mix_original: false,
+        mix_original: true,   // keep original background music/SFX (Demucs) under the Hindi voice
         video_slow_to_match: true,
         original_volume: 0.10,
         // ── Stage 8: TTS (Managed Quad Parallel) ──
@@ -35,8 +36,6 @@ export default function HomePage() {
         use_coqui_xtts: false,              // OFF: Edge-TTS only for speed
         use_fish_speech: false,
         use_edge_tts: true,                  // Cloud: fallback overflow
-        prefer_youtube_subs: true,           // ON: skip Whisper if YouTube has subs (huge speed for long videos)
-        use_yt_translate: true,          // ON: try YouTube Hindi auto-translate first
         multi_speaker: false,
         transcribe_only: false,
         // ── Stage 13: Assembly (split-the-diff: audio 1.35x + video 1.50x) ──
@@ -56,7 +55,13 @@ export default function HomePage() {
         fast_assemble: false,
         dub_chain: [],
         enable_manual_review: false,
-        use_whisperx: false,
+        use_whisperx: true,
+        whisper_gpu_fallback: true,          // local Whisper on GPU if WhisperX not proper
+        whisper_fallback_model: 'large-v3',  // large-v3 | medium
+        visual_transforms: true,             // Content-ID / duplicate evasion (classic mode)
+        vx_hflip: false,                     // mirror (flips on-screen text) — opt-in
+        vx_hue: 4.0,                         // hue shift degrees (imperceptible)
+        vx_zoom: 1.04,                       // zoom + crop back
         simplify_english: false,             // OFF: translation 35% word cap handles it
         step_by_step: false,
         use_new_pipeline: false,
@@ -65,6 +70,7 @@ export default function HomePage() {
         tts_word_match_verify: true,         // ON: per-segment Whisper word verify + retry on mismatch
         tts_word_match_tolerance: 0.15,      // ±15% wiggle room for word count match
         tts_word_match_model: 'auto',        // 'auto' picks turbo on GPU, tiny on CPU
+        tts_word_match_max_segments: 1000,   // auto-disable per-segment word verify above N cues
         long_segment_trace: true,            // ON: write long-segment lifecycle JSON report per job
         long_segment_threshold_words: 15,    // segments with >=15 words are traced
         tts_no_time_pressure: true,          // ON: TTS gets every word, post-processing handles slots
@@ -91,15 +97,11 @@ export default function HomePage() {
         segmenter: 'dp',                     // DP optimal by default
         segmenter_buffer_pct: 0.20,
         max_sentences_per_cue: 2,
-        yt_transcript_mode: 'yt_timeline',   // Option 1: YT text + YT timeline (fast, no Whisper)
-        yt_segment_mode: 'sentence',         // "sentence" (2 per seg) or "wordcount" (~20 words/seg)
-        yt_text_correction: true,            // correct Whisper text using YouTube subs as reference
-        yt_replace_mode: 'diff',             // "full" (total replace) | "diff" (only fix wrong words)
         tts_chunk_words: 0,                  // 0=off, 4/8/12=chunk translated text before TTS
         gap_mode: 'micro',                   // "none" (0s) | "micro" (0.2s) | "full" (original gaps)
-        wc_chunk_size: 8,                    // WordChunk mode: words per TTS chunk (4/8/12)
-        wc_max_stretch: 5.0,                 // WordChunk mode: max video slowdown (1.0-5.0×)
-        wc_transcript: '',                   // WordChunk mode: optional pasted transcript (skips YouTube fetch)
+        // ── Tempo Match (per-segment fit) ──
+        tempo_match: false,                  // OFF: dubbed speech fits each original slot, video never slowed
+        tempo_max_speedup: 1.5,              // max speech speed-up when Tempo Match is ON
         sd_srt_content: '',                  // SRT Direct mode: full SRT content (paste or file upload)
         sd_max_stretch: 10.0,                // SRT Direct mode: max video stretch (1.0-10.0×)
         sd_audio_speed: 1.25,                // SRT Direct mode: post-TTS audio speedup (atempo)
@@ -128,13 +130,12 @@ export default function HomePage() {
     const stripModeBloat = useCallback((s: typeof settings) => {
         const cleaned: any = { ...s };
         if (cleaned.pipeline_mode !== 'srtdub') delete cleaned.sd_srt_content;
-        if (cleaned.pipeline_mode !== 'wordchunk') delete cleaned.wc_transcript;
         return cleaned;
     }, []);
 
     // Same rule for the saved-link preset — never persist blob fields.
     const stripForPreset = useCallback((s: typeof settings) => {
-        const { sd_srt_content, wc_transcript, transcript_srt_content, ...rest } = s as any;
+        const { sd_srt_content, transcript_srt_content, ...rest } = s as any;
         return { source_language: sourceLanguage, target_language: targetLanguage, ...rest };
     }, [sourceLanguage, targetLanguage]);
 
@@ -249,7 +250,7 @@ export default function HomePage() {
 
                     {/* Saved Links */}
                     <div className="mt-4">
-                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} />
+                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) })} />
                     </div>
 
                     {error && (
@@ -281,7 +282,7 @@ export default function HomePage() {
                     targetLanguage={targetLanguage}
                 />
 
-                {/* Pipeline Switcher — 6 modes (hidden in SRT mode — only Classic applies) */}
+                {/* Pipeline Switcher — 7 modes (hidden in SRT mode — only Classic applies) */}
                 {settings._input_mode !== 'srt' && (
                     <div className="flex flex-col gap-2 px-1">
                         <div className="flex flex-wrap gap-1 rounded-xl border border-border p-1">
@@ -290,8 +291,8 @@ export default function HomePage() {
                                 { mode: 'hybrid', label: 'Hybrid', color: 'bg-amber-500' },
                                 { mode: 'new', label: 'New (DP)', color: 'bg-green-500' },
                                 { mode: 'oneflow', label: 'OneFlow', color: 'bg-red-500' },
-                                { mode: 'wordchunk', label: 'WordChunk', color: 'bg-purple-500' },
                                 { mode: 'srtdub', label: 'SRT Direct', color: 'bg-teal-500' },
+                                { mode: 'hindi_dialogue', label: 'Hindi Dialogue', color: 'bg-pink-500' },
                             ].map(({ mode, label, color }) => (
                                 <button
                                     key={mode}
@@ -312,8 +313,8 @@ export default function HomePage() {
                                 hybrid: 'Old shell + new DP core (best of both)',
                                 new: 'Parakeet + WhisperX + DP cues + glossary (experimental)',
                                 oneflow: 'Groq Whisper → Google Translate → Edge-TTS → 1.15x (FASTEST)',
-                                wordchunk: 'YouTube English subs → sentence split → Google Translate → TTS → super-stretch video (1-5×)',
                                 srtdub: 'Your Hindi SRT → TTS each cue verbatim → 0-gap concat → stretch 1-10× + freeze-pad (audio never trimmed)',
+                                hindi_dialogue: 'Speaker-aware: diarization → per-speaker Hindi voices → contextual translation → original video speed + honest report (recommended for conversations)',
                             }) as Record<string, string>)[settings.pipeline_mode || 'classic']}
                         </span>
                     </div>
@@ -374,6 +375,9 @@ export default function HomePage() {
                         </span>
                     )}
                 </div>
+
+                {/* Word Timing — dedicated module (backend/dubbing/word_timing.py) */}
+                <WordTimingPanel settings={settings} onChange={setSettings} />
 
                 {/* Advanced Settings */}
                 <SettingsPanel settings={settings} onChange={setSettings} targetLanguage={targetLanguage} />

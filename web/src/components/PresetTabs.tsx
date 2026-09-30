@@ -62,7 +62,7 @@ export default function PresetTabs({ currentSettings, onApply, onLanguageChange,
             // Presets capture modes + knobs, not per-job content. Strip blob
             // fields (pasted SRT, pasted transcript) so saved presets stay small
             // and don't leak one job's content into other jobs.
-            const { sd_srt_content, wc_transcript, ...presetSafeSettings } = currentSettings as any;
+            const { sd_srt_content, ...presetSafeSettings } = currentSettings as any;
             const fullSettings = {
                 source_language: sourceLanguage,
                 target_language: targetLanguage,

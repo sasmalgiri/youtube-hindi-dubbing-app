@@ -19,6 +19,15 @@ if _env_file.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
+# Load torch (and its bundled cuDNN 9) BEFORE anything in this process can
+# import faster-whisper/CTranslate2. If CTranslate2 runs on the GPU first, the
+# next cuDNN-heavy torch op (Demucs) dies with "Could not load symbol
+# cudnnGetLibConfig" (exit 127) -- reproduced 2026-10-01; torch-first fixes it.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 import asyncio
 import json
 import math
@@ -231,6 +240,10 @@ class Job:
     saved_video: Optional[str] = None   # Path to saved video file
     description: Optional[str] = None   # YouTube description
     qa_score: Optional[float] = None    # Transcription QA score (0-1)
+    # Multi-speaker outcome: [{speaker, gender, voice, seconds, part?}] and a
+    # sticky warning when it was requested but fell back to one voice.
+    speakers: List[Dict] = field(default_factory=list)
+    speaker_warning: Optional[str] = None
     # Word/sentence budget — populated from pipeline._tts_budget after a
     # successful run() so the UI can show "X words across Y sentences"
     total_words: int = 0
@@ -246,6 +259,11 @@ class Job:
     pause_event: threading.Event = field(default_factory=threading.Event)
     pipeline_ref: Optional[Any] = None  # Reference to Pipeline for step-by-step state
     worker_thread: Optional[Any] = None  # threading.Thread running this job — used by cancel
+    # Honest result status for the hindi_dialogue profile:
+    # completed | completed_with_warnings | draft_incomplete | failed | cancelled
+    result_status: Optional[str] = None
+    status_reasons: List[str] = field(default_factory=list)
+    report_path: Optional[str] = None    # report.md of a hindi_dialogue job
 
 
 class JobCreateRequest(BaseModel):
@@ -267,8 +285,6 @@ class JobCreateRequest(BaseModel):
     use_google_tts: bool = False
     use_coqui_xtts: bool = False
     use_edge_tts: bool = True
-    prefer_youtube_subs: bool = True
-    use_yt_translate: bool = True   # ON: try YouTube Hindi auto-translate first (best quality)
     multi_speaker: bool = False
     transcribe_only: bool = False
     audio_priority: bool = True
@@ -289,7 +305,14 @@ class JobCreateRequest(BaseModel):
     fast_assemble: bool = False
     dub_chain: List[str] = []
     enable_manual_review: bool = False
-    use_whisperx: bool = False         # WhisperX forced alignment for tighter word timestamps
+    use_whisperx: bool = True          # WhisperX forced alignment for tighter word timestamps (on by default; whisperx installed)
+    whisper_gpu_fallback: bool = True  # local Whisper GPU fallback when WhisperX is 'not proper'
+    whisper_fallback_model: str = "large-v3"   # fallback model: large-v3 | medium
+    # ── Visual transforms (Content-ID / duplicate evasion) — classic mode ──
+    visual_transforms: bool = True
+    vx_hflip: bool = False              # horizontal mirror (flips on-screen text — opt-in)
+    vx_hue: float = 4.0                 # hue shift degrees (imperceptible)
+    vx_zoom: float = 1.04               # zoom + crop back (1.0 = off)
     simplify_english: bool = False     # OFF: translation 35% word cap handles it
     enable_tts_verify_retry: bool = False  # OFF: 70% false-positive rate on Hindi turns 5s cleanup into 2h bottleneck
     # Inline TTS truncation guard: catches Edge-TTS WebSocket drops that
@@ -316,6 +339,11 @@ class JobCreateRequest(BaseModel):
     long_segment_threshold_words: int = 15
     # No time pressure on TTS: TTS gets every word, post-processing handles slots.
     tts_no_time_pressure: bool = True
+    # Tempo Match (per-segment): dubbed speech is fitted into each original
+    # time slot; video is never slowed; output length == source length.
+    tempo_match: bool = False
+    tempo_max_speedup: float = 1.5
+    tempo_gap_borrow_ms: int = 500
     # Dynamic worker scaling — adapts to Edge-TTS rate limits between batches.
     tts_dynamic_workers: bool = True
     tts_dynamic_min: int = 10
@@ -330,11 +358,14 @@ class JobCreateRequest(BaseModel):
     purge_on_new_url: bool = False     # When True: delete prior job's work_dir + caches when a different URL is submitted
     step_by_step: bool = False         # Pause after transcription & translation for review
     use_new_pipeline: bool = False     # Use new modular pipeline (experimental)
-    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "wordchunk" | "srtdub"
-    # ── WordChunk mode options ──
-    wc_chunk_size: int = 8              # 4 | 8 | 12 words per TTS chunk
-    wc_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown
-    wc_transcript: str = ""             # Optional user-pasted transcript — bypasses YouTube subs fetch
+    pipeline_mode: str = "classic"     # "classic" | "hybrid" | "new" | "oneflow" | "srtdub" | "hindi_dialogue"
+    # ── Hindi dialogue profile (pipeline_mode="hindi_dialogue") ──
+    # Speaker diarization always runs in this profile; multi_speaker is implied.
+    dialogue_tts_providers: str = "edge"            # priority list; paid providers only if listed
+    dialogue_translation_engines: str = "gemini,groq,cerebras"
+    dialogue_num_speakers: int = 0                  # 0 = detect automatically
+    dialogue_background: str = "auto"               # "auto" | "demucs" | "none"
+    dialogue_verify: str = "auto"                   # Hindi re-ASR content check: "auto" | "on" | "off"
     # ── SRT Direct mode options ──
     sd_srt_content: str = ""            # Full SRT content (cues verbatim) — required for srtdub mode
     sd_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown; freeze-pads if still short
@@ -357,27 +388,6 @@ class JobCreateRequest(BaseModel):
     segmenter: str = "dp"                # "dp" | "sentence"
     segmenter_buffer_pct: float = 0.20   # Hindi expansion buffer
     max_sentences_per_cue: int = 2       # max sentences per segment
-    # ── YouTube Transcript Mode ──
-    # How YouTube subs are structured before feeding to the proven pipeline:
-    #   "yt_timeline"      — Option 1: YouTube text + YouTube's own timelines.
-    #                        Merge into sentences, group 2 per segment, redistribute
-    #                        slots proportionally by word count. Fast (no Whisper).
-    #   "whisper_timeline" — Option 2: YouTube text + Whisper timestamps.
-    #                        Run Whisper for precise speech timelines, replace its
-    #                        text with YouTube's (better quality). Slower but exact.
-    yt_transcript_mode: str = "yt_timeline"
-    # Segment split mode for YouTube subs:
-    #   "sentence"  — group 2 complete sentences per segment (needs punctuation)
-    #   "wordcount" — split by ~20 words per segment (uniform, no punctuation needed)
-    yt_segment_mode: str = "sentence"
-    # Use YouTube subs as reference to correct Whisper transcription text.
-    # Whisper keeps its precise timestamps, only the TEXT is replaced with
-    # YouTube's (higher quality). The proven pipeline flow stays identical.
-    yt_text_correction: bool = True
-    # How to replace Whisper text with YouTube subs:
-    #   "full" — total replacement (all words from YouTube)
-    #   "diff" — word-level diff, only swap words that differ (keeps Whisper punctuation)
-    yt_replace_mode: str = "diff"
     # TTS chunk size: split translated text into N-word chunks before TTS.
     # 0 = off (use full segments as-is, best prosody).
     # 4/8/12 = chunk size (smaller = no truncation but choppier sound).
@@ -582,7 +592,7 @@ def _generate_youtube_description(job: Job) -> str:
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                 json={
-                    "model": "llama-3.3-70b-versatile",
+                    "model": "openai/gpt-oss-120b",  # llama-3.3-70b-versatile retired Sept 2026
                     "messages": [
                         {"role": "system", "content": "You are a professional YouTube description writer."},
                         {"role": "user", "content": prompt},
@@ -790,6 +800,116 @@ def _translate_srt_content(
     return "\n".join(out_lines)
 
 
+def _apply_legacy_outcome(job: Job, pipeline) -> None:
+    """Surface legacy-pipeline gaps (missing segment audio, shortened retry
+    text, voice substitutions, separation failure) instead of a bare
+    "Complete"."""
+    warnings = list(getattr(pipeline, "result_warnings", None) or [])
+    status = getattr(pipeline, "result_status", "completed") if pipeline is not None else "completed"
+    if not warnings and status == "completed":
+        return
+    if status == "completed":
+        status = "completed_with_warnings"
+    job.result_status = status
+    job.status_reasons = warnings[:50]
+    label = "DRAFT (incomplete)" if status == "draft_incomplete" else "with warnings"
+    job.message = f"{job.message} — {label}: {warnings[0] if warnings else ''}"[:300]
+
+
+def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
+                       english_srt: Optional[Path] = None):
+    """pipeline_mode="hindi_dialogue": the shared speaker-aware dialogue path.
+
+    Runs inside the caller's pipeline semaphore. Never deletes partial assets:
+    a failed or draft job keeps its work folder and report for review.
+    """
+    from dubbing.dialogue.orchestrator import DialogueConfig, run_dialogue
+
+    job_dir = OUTPUTS / job.id
+    work_dir = job_dir / "work"
+    out_dir = job_dir / "dialogue_out"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Visible normalisation of options this profile handles differently.
+    notes = []
+    if getattr(req, "use_yt_translate", False):  # option removed on this branch
+        notes.append("YouTube auto-translated Hindi is not used (it cannot be attached to "
+                     "speaker turns); contextual translation is used instead")
+    if not req.multi_speaker:
+        notes.append("speaker diarization always runs in the Hindi dialogue profile")
+    if req.split_duration:
+        notes.append("split_duration ignored (dialogue profile processes the video in one pass)")
+    for n in notes:
+        print(f"[hindi_dialogue] {n}", flush=True)
+        job.events.append({"type": "note", "message": n})
+
+    source_srt = english_srt
+    transcript = (getattr(req, "transcript_srt_content", "") or "").strip()
+    if transcript and not translated_srt and not source_srt:
+        source_srt = work_dir / "transcript_upload_en.srt"
+        source_srt.write_text(transcript, encoding="utf-8")
+
+    cfg = DialogueConfig(
+        source=req.url, work_dir=work_dir, output_dir=out_dir,
+        source_srt=source_srt, translated_srt=translated_srt,
+        use_youtube_subs=False,  # YouTube-subs input was removed on this branch (092e758)
+        asr="groq" if (req.asr_model or "").startswith("groq") else "auto",
+        asr_model=req.asr_model if req.asr_model not in ("groq-whisper", "groq", "parakeet") else "large-v3",
+        num_speakers=req.dialogue_num_speakers or None,
+        tts_providers=[p.strip() for p in req.dialogue_tts_providers.split(",") if p.strip()] or ["edge"],
+        translation_engines=[e.strip() for e in req.dialogue_translation_engines.split(",") if e.strip()],
+        background=req.dialogue_background, content_verify=req.dialogue_verify,
+        audio_bitrate=req.audio_bitrate,
+        limit_seconds=float(req.dub_duration or 0) * 60.0,
+    )
+    res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
+                       cancel_check=job.cancel_event.is_set)
+
+    job.result_status = res.status
+    job.status_reasons = list(res.reasons)
+    job.report_path = str(res.report_md)
+    job.segments = [{"start": t.source_start, "end": t.source_end, "text": t.source_text,
+                     "text_translated": t.speech_text, "speaker_id": t.speaker_id,
+                     "turn_id": t.turn_id} for t in res.turns]
+    if not job.video_title:
+        job.video_title = (Path(req.url).stem if not re.match(r"^https?://", req.url or "")
+                           else req.url.rstrip("/").split("/")[-1].split("=")[-1]) or "Untitled"
+
+    # Save a titled copy of every deliverable (video, subtitles, report, stems)
+    title = _sanitize_filename(job.video_title)
+    folder = SAVED_DIR / f"{title} [HI Dialogue {res.status}] ({job.id})"
+    try:
+        shutil.copytree(out_dir, folder, dirs_exist_ok=True)
+        job.saved_folder = str(folder)
+        if res.output_video and res.output_video.exists():
+            job.saved_video = str(folder / res.output_video.name)
+    except Exception as e:
+        print(f"[hindi_dialogue] could not copy outputs to {folder}: {e}", flush=True)
+
+    if res.output_video and res.output_video.exists():
+        job.result_path = res.output_video
+    labels = {
+        "completed": "Complete",
+        "completed_with_warnings": "Complete with warnings — see report",
+        "draft_incomplete": "DRAFT (incomplete) — see report for missing/unresolved turns",
+        "cancelled": "Cancelled — partial assets kept",
+        "failed": "Failed — partial assets and report kept",
+    }
+    job.message = labels.get(res.status, res.status)
+    job.overall_progress = 1.0
+    if res.status in ("failed", "cancelled"):
+        job.state = "error"
+        job.error = "; ".join(res.reasons)[:500] or res.status
+        job.events.append({"type": "complete", "state": "error", "error": job.error,
+                           "result_status": res.status})
+    else:
+        job.state = "done"
+        job.events.append({"type": "complete", "state": "done", "result_status": res.status})
+        if job.source_url and res.status == "completed" and not job.chain_languages:
+            _mark_url_completed(job.source_url)
+    _store.save(job)
+
+
 def _run_job(job: Job, req: JobCreateRequest):
     """Run the dubbing pipeline in a background thread."""
     # ── Status helper: every line below sets a visible message AND persists ──
@@ -875,11 +995,29 @@ def _run_job(job: Job, req: JobCreateRequest):
         # Voice was auto-selected or user-chosen above. Use it as-is.
         voice = req.voice
 
+        # ── HINDI DIALOGUE PROFILE: one shared speaker-aware path ──
+        # Per-speaker voices come from the dialogue speaker registry, so the
+        # single-voice Edge lock above does not apply to this profile.
+        if getattr(req, "pipeline_mode", "classic") == "hindi_dialogue":
+            _setup_status("Hindi dialogue profile (speaker-aware)...", 0.40)
+            _run_dialogue_mode(job, req)
+            return
+
+        # Modes that cannot carry per-speaker voices: say so instead of
+        # silently producing a single-voice dub.
+        _mode_now = getattr(req, "pipeline_mode", "classic")
+        if req.multi_speaker and _mode_now in ("new", "oneflow", "wordchunk", "srtdub"):
+            _note = (f"multi_speaker is not supported in pipeline_mode={_mode_now}: output uses ONE "
+                     f"voice. Use pipeline_mode=hindi_dialogue for per-speaker voices.")
+            print(f"[Route] {_note}", flush=True)
+            job.events.append({"type": "note", "message": _note})
+            _setup_status(_note, 0.35)
+
         # ── SPLIT MODE: Split video into parts and dub each ──────────
         # SKIP split mode for pipelines that have their own single-pass
-        # assembly: oneflow, wordchunk, and srtdub all manage video/audio
+        # assembly: oneflow and srtdub both manage video/audio
         # themselves and don't want the classic Pipeline invoked per-part.
-        _split_skipped_for = ("oneflow", "wordchunk", "srtdub")
+        _split_skipped_for = ("oneflow", "srtdub")
         _current_mode = getattr(req, 'pipeline_mode', 'classic')
         if req.split_duration > 0 and _current_mode not in _split_skipped_for:
             _setup_status(f"Split mode: video will be processed in "
@@ -913,8 +1051,6 @@ def _run_job(job: Job, req: JobCreateRequest):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=req.prefer_youtube_subs,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -932,6 +1068,12 @@ def _run_job(job: Job, req: JobCreateRequest):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -945,6 +1087,9 @@ def _run_job(job: Job, req: JobCreateRequest):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -963,10 +1108,6 @@ def _run_job(job: Job, req: JobCreateRequest):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1052,45 +1193,10 @@ def _run_job(job: Job, req: JobCreateRequest):
                 raise RuntimeError(f"SrtDub failed: {e}")
             job.segments = []
 
-        elif pipeline_mode == "wordchunk":
-            # ═══ WORDCHUNK: YouTube Hindi VTT → N-word TTS chunks → super-stretch ═══
-            from dubbing.wordchunk import run_wordchunk
-            try:
-                run_wordchunk(
-                    source_url=req.url,
-                    work_dir=OUTPUTS / job.id / "work",
-                    output_path=out_path,
-                    target_language=req.target_language,
-                    source_language=req.source_language or "en",
-                    tts_voice=req.voice,
-                    tts_rate=req.tts_rate,
-                    audio_bitrate=req.audio_bitrate,
-                    chunk_size=int(getattr(req, "wc_chunk_size", 8) or 8),
-                    max_stretch=float(getattr(req, "wc_max_stretch", 20.0) or 20.0),
-                    transcript_override=getattr(req, "wc_transcript", "") or "",
-                    dub_duration_min=int(getattr(req, "dub_duration", 0) or 0),
-                    on_progress=progress_cb,
-                    cancel_check=job.cancel_event.is_set,
-                )
-                job.result_path = out_path
-                job.video_title = req.url.split("/")[-1]
-            except Exception as e:
-                raise RuntimeError(f"WordChunk failed: {e}")
-            job.segments = []
-
         elif pipeline_mode == "new":
             # The new DP pipeline has some options it can't consume. Normalize.
-            #
-            # IMPORTANT (2026-04-12): prefer_youtube_subs is NO LONGER disabled
-            # for the new pipeline. YouTube's transcript has proper sentence
-            # boundaries, punctuation, and capitalization — it's BETTER input
-            # than any ASR (Whisper, Parakeet, Google ASR). Using YouTube subs
-            # eliminates the fragment-merging problem entirely because the
-            # sentences come pre-segmented correctly from YouTube.
             if (req.asr_model or "").lower() == "groq-whisper":
                 req.asr_model = "parakeet"
-            # req.prefer_youtube_subs — LEFT ALONE (user's choice flows through)
-            # req.use_yt_translate — LEFT ALONE (user's choice flows through)
             req.transcribe_only = False
             req.multi_speaker = False
             req.step_by_step = False
@@ -1127,13 +1233,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             # pieces, destroying the sentence scope. By falling through to
             # Pipeline.run(), we get: merge → translate → TTS → assembly
             # with auto rate, proportional balancing, micro-gaps — all proven.
-            import re as _yt_re
-            _is_url = bool(_yt_re.match(r"^https?://", req.url or ""))
-            _use_classic_for_yt = (
-                _is_url
-                and (req.use_yt_translate or req.prefer_youtube_subs
-                     or getattr(req, 'yt_text_correction', False))
-            )
+            _use_classic_for_yt = False  # YouTube subs removed — always Whisper
 
             if _use_classic_for_yt:
                 # Let Pipeline.run() handle EVERYTHING — it has the YouTube
@@ -1157,6 +1257,8 @@ def _run_job(job: Job, req: JobCreateRequest):
                 job.video_title = pipeline.video_title or "Untitled"
                 job.segments = pipeline.segments
                 job.qa_score = pipeline.qa_score
+                job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+                job.speaker_warning = getattr(pipeline, "speaker_warning", None)
                 _budget = getattr(pipeline, "_tts_budget", None)
                 if _budget:
                     job.total_words = int(_budget.get("total_words", 0))
@@ -1185,10 +1287,26 @@ def _run_job(job: Job, req: JobCreateRequest):
                 }
                 whisper_model_size = _whisper_size_map.get(_asr_choice, "large-v3")
 
+                _untranslated_run = [0]
+
                 def translate_fn(text, hints):
+                    pipeline._check_cancelled()
                     segs = [{"text": text, "start": 0, "end": hints.get("duration_ms", 3000) / 1000}]
                     pipeline._translate_segments(segs)
-                    return segs[0].get("text_translated", text)
+                    out = segs[0].get("text_translated", text)
+                    # One cue per call, so the engine's own ">5% failed" guard
+                    # never fires here: stop after 5 English cues in a row
+                    # instead of voicing untranslated English as "Hindi".
+                    if out.strip() == text.strip() and any(c.isalpha() for c in text):
+                        _untranslated_run[0] += 1
+                        if _untranslated_run[0] >= 5:
+                            raise RuntimeError(
+                                "Translation is failing (5 cues in a row came back untranslated; "
+                                "Google may be rate-limiting this PC). Retry later or pick "
+                                "another Translation engine (Groq/Gemini) in Settings.")
+                    else:
+                        _untranslated_run[0] = 0
+                    return out
 
                 segments = runner.run_full(
                     wav_path, translate_fn=translate_fn,
@@ -1271,23 +1389,37 @@ def _run_job(job: Job, req: JobCreateRequest):
             # Step 3: ASR (old shell — Whisper/YouTube subs, all options work)
             pipeline._run_transcription()
 
+            # Speakers come from the audio, whatever the text source was.
+            if req.multi_speaker:
+                _hy_audio = OUTPUTS / job.id / "work" / "audio_raw.wav"
+                _hy_genders, _hy_ranges = pipeline._diarize(_hy_audio)
+                if _hy_genders and _hy_ranges:
+                    pipeline._assign_speaker_to_segments(pipeline.segments, _hy_ranges)
+                    pipeline._voice_map = pipeline._assign_voices_to_speakers(_hy_genders)
+                else:
+                    pipeline.result_warnings.append(
+                        "multi_speaker requested but diarization was unavailable: one voice used")
+
             # ─── NEW CORE TAKES OVER ───
             # Convert old segments to Word objects
             words = []
             for seg in pipeline.segments:
+                # Carry the segment's speaker on every word so DP cues never
+                # cross a speaker change and TTS can use the speaker's voice.
+                _w_spk = seg.get("speaker_id")
                 if seg.get("words"):
                     for w in seg["words"]:
                         words.append(Word(
                             text=w.get("word", w.get("text", "")),
                             start=w.get("start", 0), end=w.get("end", 0),
-                            source="whisper",
+                            speaker=_w_spk, source="whisper",
                         ))
                 else:
                     for word_text in seg.get("text", "").split():
                         words.append(Word(
                             text=word_text,
                             start=seg.get("start", 0), end=seg.get("end", 0),
-                            source="whisper",
+                            speaker=_w_spk, source="whisper",
                         ))
             words = normalize_words(words)
 
@@ -1360,7 +1492,7 @@ def _run_job(job: Job, req: JobCreateRequest):
                 raise RuntimeError(f"audio_raw.wav not found: {audio_raw_path}")
             pipeline._run_tts_and_assembly(text_segments, audio_raw_path)
 
-        elif pipeline_mode not in ("oneflow", "wordchunk", "srtdub"):
+        elif pipeline_mode not in ("oneflow", "srtdub"):
             # ═══ CLASSIC MONOLITH PIPELINE ═══
             pipeline = Pipeline(cfg, on_progress=progress_cb,
                                 cancel_check=job.cancel_event.is_set,
@@ -1378,10 +1510,12 @@ def _run_job(job: Job, req: JobCreateRequest):
                 pipeline.run()
 
         # OneFlow / WordChunk set their own job data — skip pipeline access
-        if pipeline_mode not in ("oneflow", "wordchunk", "srtdub"):
+        if pipeline_mode not in ("oneflow", "srtdub"):
             job.video_title = pipeline.video_title or "Untitled"
             job.segments = pipeline.segments
             job.qa_score = pipeline.qa_score
+            job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+            job.speaker_warning = getattr(pipeline, "speaker_warning", None)
             # Copy TTS budget metrics (computed by _pretts_word_budget) onto
             # the Job so they show up in the API response and the UI.
             _budget = getattr(pipeline, "_tts_budget", None)
@@ -1456,12 +1590,13 @@ def _run_job(job: Job, req: JobCreateRequest):
         job.state = "done"
         qa_msg = f" (QA: {job.qa_score:.0%})" if job.qa_score is not None else ""
         job.message = f"Complete{qa_msg}"
+        _apply_legacy_outcome(job, pipeline if pipeline_mode not in ("oneflow", "wordchunk", "srtdub") else None)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 
         # Record job metrics to Supabase (fire-and-forget)
         _render_time = time.time() - _t_start
-        _pipeline_exists = pipeline_mode not in ("oneflow", "wordchunk", "srtdub") and 'pipeline' in locals()
+        _pipeline_exists = pipeline_mode not in ("oneflow", "srtdub") and 'pipeline' in locals()
         _segs = (pipeline.segments if _pipeline_exists else job.segments) or []
         # Read manual review queue to count segments that needed review
         _mrq_path = OUTPUTS / job.id / "manual_review_queue.json"
@@ -1554,6 +1689,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
     work_dir.mkdir(exist_ok=True)
     split_dir = work_dir / "splits"
     split_dir.mkdir(exist_ok=True)
+    job.speakers = []          # parts append to this; start clean on re-runs
+    job.speaker_warning = None
 
     callback = _make_progress_callback(job)
 
@@ -1602,8 +1739,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=False,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -1620,6 +1755,12 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1633,6 +1774,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -1650,10 +1794,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1665,9 +1805,12 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         job.segments = p.segments
         job.video_title = p.video_title or job.video_title
         job.qa_score = p.qa_score
+        job.speakers = list(getattr(p, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(p, "speaker_warning", None)
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, p)
         job.events.append({"type": "complete", "state": "done"})
         try:
             _save_to_titled_folder(job)
@@ -1678,6 +1821,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
 
     # Step 3: Process each part
     output_parts = []
+    # Titled output folders (sanitized for Windows); parts are saved as they finish.
+    base_title = _sanitize_filename(job.video_title or "Untitled")
+    saved_parts = []
     for part_idx, part_path in enumerate(parts):
         part_num = part_idx + 1
         part_label = f"Part {part_num}/{num_parts}"
@@ -1738,8 +1884,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=False,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -1756,6 +1900,12 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -1769,6 +1919,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -1786,10 +1939,6 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -1799,6 +1948,12 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         job.pipeline_ref = pipeline   # cancel handler can kill in-flight subprocesses
         pipeline.video_title = f"{job.video_title} - Part {part_num}"
         pipeline.run()
+
+        # Each part diarizes its own audio; keep every part's speakers.
+        job.speakers.extend({**d, "part": part_num}
+                            for d in (getattr(pipeline, "speaker_summary", []) or []))
+        if getattr(pipeline, "speaker_warning", None):
+            job.speaker_warning = f"Part {part_num}: {pipeline.speaker_warning}"
 
         # Accumulate per-part TTS budget into the Job totals so the UI shows
         # the cumulative count across the whole split job, not just one part.
@@ -1819,21 +1974,21 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         if part_out.exists():
             output_parts.append((part_num, part_out))
             print(f"[SPLIT] Part {part_num}/{num_parts} complete: {part_out}", flush=True)
+            # Save each finished part NOW: if a later part fails (e.g. Google
+            # rate-limits part 5 of 6), the error path must not take hours of
+            # already-dubbed parts down with it.
+            part_title = f"{base_title} - Part {part_num}"
+            dest_dir = SAVED_DIR / part_title
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / f"{part_title}.mp4"
+            shutil.copy2(part_out, dest_path)
+            saved_parts.append(str(dest_path))
+            job.saved_video = job.saved_video or str(dest_path)
+            _store.save(job)
+            print(f"[SPLIT] Saved: {dest_path}", flush=True)
 
     if not output_parts:
         raise RuntimeError("No parts were produced")
-
-    # Save all parts to titled folders — sanitize title for Windows filesystem
-    base_title = _sanitize_filename(job.video_title or "Untitled")
-    saved_parts = []
-    for part_num, part_out in output_parts:
-        part_title = f"{base_title} - Part {part_num}"
-        dest_dir = SAVED_DIR / part_title
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = dest_dir / f"{part_title}.mp4"
-        shutil.copy2(part_out, dest_path)
-        saved_parts.append(str(dest_path))
-        print(f"[SPLIT] Saved: {dest_path}", flush=True)
 
     job.result_path = output_parts[0][1]  # First part for preview
     job.saved_folder = str(SAVED_DIR / base_title) if len(output_parts) == 1 else str(SAVED_DIR)
@@ -1873,7 +2028,6 @@ def _queue_chain_next(parent_job: Job):
         url=input_path,
         source_language=parent_job.target_language,  # Previous output language
         target_language=next_lang,
-        prefer_youtube_subs=False,  # No YouTube subs for local file
         asr_model=_orig.asr_model if _orig else "large-v3",
         translation_engine=_orig.translation_engine if _orig else "auto",
         tts_rate=_orig.tts_rate if _orig else "+0%",
@@ -1905,6 +2059,9 @@ def _queue_chain_next(parent_job: Job):
         use_whisperx=getattr(_orig, 'use_whisperx', False) if _orig else False,
         simplify_english=getattr(_orig, 'simplify_english', False) if _orig else False,
         tts_no_time_pressure=getattr(_orig, 'tts_no_time_pressure', True) if _orig else True,
+        tempo_match=getattr(_orig, 'tempo_match', False) if _orig else False,
+        tempo_max_speedup=getattr(_orig, 'tempo_max_speedup', 1.5) if _orig else 1.5,
+        tempo_gap_borrow_ms=getattr(_orig, 'tempo_gap_borrow_ms', 500) if _orig else 500,
         tts_rate_mode=getattr(_orig, 'tts_rate_mode', 'auto') if _orig else 'auto',
         tts_rate_ceiling=getattr(_orig, 'tts_rate_ceiling', '+25%') if _orig else '+25%',
         tts_rate_target_wpm=getattr(_orig, 'tts_rate_target_wpm', 130) if _orig else 130,
@@ -1921,8 +2078,6 @@ def _queue_chain_next(parent_job: Job):
         keep_subject_english=getattr(_orig, 'keep_subject_english', False) if _orig else False,
         gap_mode=getattr(_orig, 'gap_mode', 'micro') if _orig else 'micro',
         tts_chunk_words=getattr(_orig, 'tts_chunk_words', 0) if _orig else 0,
-        yt_text_correction=getattr(_orig, 'yt_text_correction', True) if _orig else True,
-        yt_replace_mode=getattr(_orig, 'yt_replace_mode', 'diff') if _orig else 'diff',
     )
 
     job = Job(
@@ -2324,9 +2479,6 @@ def create_job(req: JobCreateRequest):
         first_lang = req.dub_chain[0]
         remaining = req.dub_chain[1:]
         req.target_language = first_lang
-        # Force YouTube subs for first step (use existing English subs)
-        if first_lang == "en":
-            req.prefer_youtube_subs = True
     else:
         remaining = []
 
@@ -2366,8 +2518,6 @@ async def create_job_upload(
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
     use_edge_tts: str = Form("true"),
-    prefer_youtube_subs: str = Form("true"),
-    use_yt_translate: str = Form("false"),
     multi_speaker: str = Form("false"),
     transcribe_only: str = Form("false"),
     audio_priority: str = Form("true"),
@@ -2382,7 +2532,7 @@ async def create_job_upload(
     dub_duration: int = Form(0),
     fast_assemble: str = Form("false"),
     enable_manual_review: str = Form("false"),
-    use_whisperx: str = Form("false"),
+    use_whisperx: str = Form("true"),
     simplify_english: str = Form("false"),
     step_by_step: str = Form("false"),
     voice: str = Form("hi-IN-SwaraNeural"),
@@ -2396,18 +2546,11 @@ async def create_job_upload(
     segmenter: str = Form("dp"),
     segmenter_buffer_pct: float = Form(0.20),
     max_sentences_per_cue: int = Form(2),
-    yt_transcript_mode: str = Form("yt_timeline"),
-    yt_segment_mode: str = Form("sentence"),
-    yt_text_correction: str = Form("true"),
-    yt_replace_mode: str = Form("diff"),
     tts_chunk_words: int = Form(0),
     gap_mode: str = Form("micro"),
     preset_name: str = Form(""),
-    # Pipeline mode + mode-specific fields (WordChunk + SRT Direct)
+    # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
-    wc_chunk_size: int = Form(8),
-    wc_max_stretch: float = Form(20.0),
-    wc_transcript: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -2452,8 +2595,6 @@ async def create_job_upload(
             use_coqui_xtts=_bool(use_coqui_xtts),
             use_fish_speech=False,
             use_edge_tts=_bool(use_edge_tts),
-            prefer_youtube_subs=_bool(prefer_youtube_subs),
-            use_yt_translate=_bool(use_yt_translate),
             multi_speaker=_bool(multi_speaker),
             transcribe_only=_bool(transcribe_only),
             audio_priority=_bool(audio_priority),
@@ -2483,17 +2624,10 @@ async def create_job_upload(
             segmenter=segmenter,
             segmenter_buffer_pct=segmenter_buffer_pct,
             max_sentences_per_cue=max_sentences_per_cue,
-            yt_transcript_mode=yt_transcript_mode,
-            yt_segment_mode=yt_segment_mode,
-            yt_text_correction=_bool(yt_text_correction),
-            yt_replace_mode=yt_replace_mode,
             tts_chunk_words=tts_chunk_words,
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
-            wc_chunk_size=wc_chunk_size,
-            wc_max_stretch=wc_max_stretch,
-            wc_transcript=wc_transcript,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -2538,6 +2672,15 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
         job.message = "Starting (SRT provided, skipping transcription)..."
         _store.save(job)
 
+        if getattr(req, "pipeline_mode", "classic") == "hindi_dialogue":
+            # Hindi SRT supplied: translation is skipped, but speakers still come
+            # from audio diarization of the original video.
+            if getattr(req, "srt_needs_translation", False):
+                _run_dialogue_mode(job, req, english_srt=srt_path)
+            else:
+                _run_dialogue_mode(job, req, translated_srt=srt_path)
+            return
+
         job_dir = OUTPUTS / job.id
         work_dir = job_dir / "work"
         out_path = job_dir / "dubbed.mp4"
@@ -2565,8 +2708,6 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             use_coqui_xtts=req.use_coqui_xtts,
             use_fish_speech=req.use_fish_speech,
             use_edge_tts=req.use_edge_tts,
-            prefer_youtube_subs=req.prefer_youtube_subs,
-            use_yt_translate=req.use_yt_translate,
             multi_speaker=req.multi_speaker,
             transcribe_only=req.transcribe_only,
             audio_priority=req.audio_priority,
@@ -2583,6 +2724,12 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             fast_assemble=req.fast_assemble,
             enable_manual_review=req.enable_manual_review,
             use_whisperx=req.use_whisperx,
+            whisper_gpu_fallback=getattr(req, 'whisper_gpu_fallback', True),
+            whisper_fallback_model=getattr(req, 'whisper_fallback_model', 'large-v3'),
+            visual_transforms=getattr(req, 'visual_transforms', True),
+            vx_hflip=getattr(req, 'vx_hflip', False),
+            vx_hue=getattr(req, 'vx_hue', 4.0),
+            vx_zoom=getattr(req, 'vx_zoom', 1.04),
             simplify_english=req.simplify_english,
             step_by_step=req.step_by_step,
             enable_tts_verify_retry=req.enable_tts_verify_retry,
@@ -2596,6 +2743,9 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             long_segment_trace=getattr(req, 'long_segment_trace', True),
             long_segment_threshold_words=getattr(req, 'long_segment_threshold_words', 15),
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True),
+            tempo_match=getattr(req, 'tempo_match', False),
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5),
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500),
             tts_dynamic_workers=getattr(req, 'tts_dynamic_workers', True),
             tts_dynamic_min=getattr(req, 'tts_dynamic_min', 10),
             tts_dynamic_max=getattr(req, 'tts_dynamic_max', 120),
@@ -2614,10 +2764,6 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             segmenter=getattr(req, 'segmenter', 'dp'),
             segmenter_buffer_pct=getattr(req, 'segmenter_buffer_pct', 0.20),
             max_sentences_per_cue=getattr(req, 'max_sentences_per_cue', 2),
-            yt_transcript_mode=getattr(req, 'yt_transcript_mode', 'yt_timeline'),
-            yt_segment_mode=getattr(req, 'yt_segment_mode', 'sentence'),
-            yt_text_correction=getattr(req, 'yt_text_correction', True),
-            yt_replace_mode=getattr(req, 'yt_replace_mode', 'diff'),
             tts_chunk_words=getattr(req, 'tts_chunk_words', 0),
             gap_mode=getattr(req, 'gap_mode', 'micro'),
         )
@@ -2645,6 +2791,9 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
 
         job.result_path = out_path
         job.segments = pipeline.segments
+        # SRT speaker labels -> per-speaker voices (or a failure warning)
+        job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(pipeline, "speaker_warning", None)
 
         # Auto-save to titled folder
         try:
@@ -2673,6 +2822,7 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, pipeline)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 
@@ -2726,8 +2876,6 @@ async def create_job_with_srt(
     use_google_tts: str = Form("false"),
     use_coqui_xtts: str = Form("false"),
     use_edge_tts: str = Form("true"),
-    prefer_youtube_subs: str = Form("true"),
-    use_yt_translate: str = Form("false"),
     multi_speaker: str = Form("false"),
     audio_priority: str = Form("true"),
     audio_untouchable: str = Form("false"),
@@ -2741,7 +2889,7 @@ async def create_job_with_srt(
     dub_duration: int = Form(0),
     fast_assemble: str = Form("false"),
     enable_manual_review: str = Form("false"),
-    use_whisperx: str = Form("false"),
+    use_whisperx: str = Form("true"),
     simplify_english: str = Form("false"),
     step_by_step: str = Form("false"),
     srt_needs_translation: str = Form("false"),
@@ -2756,18 +2904,11 @@ async def create_job_with_srt(
     segmenter: str = Form("dp"),
     segmenter_buffer_pct: float = Form(0.20),
     max_sentences_per_cue: int = Form(2),
-    yt_transcript_mode: str = Form("yt_timeline"),
-    yt_segment_mode: str = Form("sentence"),
-    yt_text_correction: str = Form("true"),
-    yt_replace_mode: str = Form("diff"),
     tts_chunk_words: int = Form(0),
     gap_mode: str = Form("micro"),
     preset_name: str = Form(""),
-    # Pipeline mode + mode-specific fields (WordChunk + SRT Direct)
+    # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
-    wc_chunk_size: int = Form(8),
-    wc_max_stretch: float = Form(20.0),
-    wc_transcript: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -2830,8 +2971,6 @@ async def create_job_with_srt(
             use_coqui_xtts=_bool(use_coqui_xtts),
             use_fish_speech=False,
             use_edge_tts=_bool(use_edge_tts),
-            prefer_youtube_subs=_bool(prefer_youtube_subs),
-            use_yt_translate=_bool(use_yt_translate),
             multi_speaker=_bool(multi_speaker),
             audio_priority=_bool(audio_priority),
             audio_untouchable=_bool(audio_untouchable),
@@ -2860,17 +2999,10 @@ async def create_job_with_srt(
             segmenter=segmenter,
             segmenter_buffer_pct=segmenter_buffer_pct,
             max_sentences_per_cue=max_sentences_per_cue,
-            yt_transcript_mode=yt_transcript_mode,
-            yt_segment_mode=yt_segment_mode,
-            yt_text_correction=_bool(yt_text_correction),
-            yt_replace_mode=yt_replace_mode,
             tts_chunk_words=tts_chunk_words,
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
-            wc_chunk_size=wc_chunk_size,
-            wc_max_stretch=wc_max_stretch,
-            wc_transcript=wc_transcript,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -2948,10 +3080,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         else:
             # Whisper-only run at the size the user picked.
             asr_label = f"Whisper {_asr} + DP Cues"
-    elif getattr(req, "use_yt_translate", False):
-        asr_label = "YouTube Auto-Translate"
-    elif getattr(req, "prefer_youtube_subs", False):
-        asr_label = "YouTube Subtitles"
     elif pipeline_mode == "hybrid":
         asr_label = f"Whisper {getattr(req, 'asr_model', 'large-v3')} + DP Cues"
     else:
@@ -2984,8 +3112,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "fast_assemble": getattr(req, "fast_assemble", False),
         "enable_sentence_gap": getattr(req, "enable_sentence_gap", True),
         "enable_duration_fit": getattr(req, "enable_duration_fit", True),
-        "prefer_youtube_subs": getattr(req, "prefer_youtube_subs", False),
-        "use_yt_translate": getattr(req, "use_yt_translate", False),
         "use_whisperx": getattr(req, "use_whisperx", False),
         "simplify_english": getattr(req, "simplify_english", True),
         "enable_manual_review": getattr(req, "enable_manual_review", True),
@@ -2996,6 +3122,9 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "tts_word_match_verify": getattr(req, "tts_word_match_verify", True),
         "long_segment_trace": getattr(req, "long_segment_trace", True),
         "tts_no_time_pressure": getattr(req, "tts_no_time_pressure", True),
+        "tempo_match": getattr(req, "tempo_match", False),
+        "tempo_max_speedup": getattr(req, "tempo_max_speedup", 1.5),
+        "tempo_gap_borrow_ms": getattr(req, "tempo_gap_borrow_ms", 500),
         "tts_dynamic_workers": getattr(req, "tts_dynamic_workers", True),
         "purge_on_new_url": getattr(req, "purge_on_new_url", False),
         "step_by_step": getattr(req, "step_by_step", False),
@@ -3020,10 +3149,6 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "segmenter": getattr(req, "segmenter", "dp"),
         "segmenter_buffer_pct": getattr(req, "segmenter_buffer_pct", 0.20),
         "max_sentences_per_cue": getattr(req, "max_sentences_per_cue", 2),
-        "yt_transcript_mode": getattr(req, "yt_transcript_mode", "yt_timeline"),
-        "yt_segment_mode": getattr(req, "yt_segment_mode", "sentence"),
-        "yt_text_correction": getattr(req, "yt_text_correction", True),
-        "yt_replace_mode": getattr(req, "yt_replace_mode", "diff"),
         "tts_chunk_words": getattr(req, "tts_chunk_words", 0),
         "gap_mode": getattr(req, "gap_mode", "micro"),
     }
@@ -3052,6 +3177,8 @@ def get_job(job_id: str):
         "saved_video": job.saved_video,
         "description": job.description,
         "qa_score": job.qa_score,
+        "speakers": getattr(job, "speakers", []),
+        "speaker_warning": getattr(job, "speaker_warning", None),
         "chain_languages": job.chain_languages,
         "chain_parent_id": job.chain_parent_id,
         # Word/sentence budget — populated by _pretts_word_budget after TTS finishes
@@ -3060,6 +3187,9 @@ def get_job(job_id: str):
         "avg_words_per_sent": job.avg_words_per_sent,
         "max_seg_words":      job.max_seg_words,
         "max_sent_words":     job.max_sent_words,
+        "result_status":      job.result_status,
+        "status_reasons":     job.status_reasons,
+        "report_path":        job.report_path,
     }
 
 
@@ -3317,6 +3447,22 @@ def get_source_srt(job_id: str):
     )
 
 
+@app.get("/api/jobs/{job_id}/report")
+def get_dialogue_report(job_id: str, fmt: str = "md"):
+    """Quality/coverage report of a hindi_dialogue job (fmt=md|json)."""
+    job = JOBS.get(job_id)
+    if not job or not job.report_path:
+        raise HTTPException(status_code=404, detail="No dialogue report for this job")
+    md = Path(job.report_path)
+    path = md if fmt == "md" else md.with_name("report.json")
+    if not path.exists() and job.saved_folder:
+        path = Path(job.saved_folder) / path.name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file missing")
+    media = "text/markdown; charset=utf-8" if fmt == "md" else "application/json"
+    return FileResponse(path=str(path), media_type=media, filename=path.name)
+
+
 @app.get("/api/jobs/{job_id}/qa")
 def get_qa_report(job_id: str):
     """Get the QA report for a job."""
@@ -3403,6 +3549,9 @@ def _run_resume(job: Job):
             use_whisperx=req.use_whisperx if req else False,
             simplify_english=req.simplify_english if req else True,
             tts_no_time_pressure=getattr(req, 'tts_no_time_pressure', True) if req else True,
+            tempo_match=getattr(req, 'tempo_match', False) if req else False,
+            tempo_max_speedup=getattr(req, 'tempo_max_speedup', 1.5) if req else 1.5,
+            tempo_gap_borrow_ms=getattr(req, 'tempo_gap_borrow_ms', 500) if req else 500,
             tts_rate_mode=getattr(req, 'tts_rate_mode', 'auto') if req else 'auto',
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%') if req else '+25%',
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130) if req else 130,
@@ -3434,6 +3583,9 @@ def _run_resume(job: Job):
 
         job.result_path = out_path
         job.segments = pipeline.segments
+        # Overwrite phase-1 (transcribe-only) speakers with what was dubbed
+        job.speakers = list(getattr(pipeline, "speaker_summary", []) or [])
+        job.speaker_warning = getattr(pipeline, "speaker_warning", None)
         job.video_title = job.video_title or "Untitled"
 
         # Auto-save to titled folder
@@ -3454,6 +3606,7 @@ def _run_resume(job: Job):
         job.overall_progress = 1.0
         job.state = "done"
         job.message = "Complete"
+        _apply_legacy_outcome(job, pipeline)
         job.events.append({"type": "complete", "state": "done"})
         _store.save(job)
 

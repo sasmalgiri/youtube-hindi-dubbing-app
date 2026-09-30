@@ -21,6 +21,8 @@ _STUDIO_QUALITY = {
         "All verifications on, slot auto-fix, simplify+noun-preserve. Slowest, highest fidelity."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         # TTS chain: Sarvam primary, Edge fallback, Sarvam salvages stragglers
         "use_sarvam_bulbul": True,
@@ -56,8 +58,6 @@ _STUDIO_QUALITY = {
         "audio_quality_mode": "quality",
         # ASR: best
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -70,6 +70,8 @@ _BALANCED = {
         "Sarvam salvage. Auto-disables expensive verification above 1000 cues."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_google_tts": True,
         "use_edge_tts": True,
@@ -95,8 +97,6 @@ _BALANCED = {
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -109,6 +109,8 @@ _FAST_PREVIEW = {
         "Use to sanity-check a video before committing to Studio/Balanced."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "oneflow",
         "use_edge_tts": True,
         "use_google_tts": False,
@@ -130,37 +132,6 @@ _FAST_PREVIEW = {
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
         "use_whisperx": False,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
-    },
-}
-
-
-_YOUTUBE_PASSTHROUGH = {
-    "slug": "youtube-hindi-passthrough",
-    "name": "YouTube Hindi Pass-through",
-    "description": (
-        "Uses YouTube's own captions (or auto-translated Hindi) directly — "
-        "skips Whisper entirely. WordChunk mode, fast, good when YouTube already has decent subs."
-    ),
-    "settings": {
-        "pipeline_mode": "wordchunk",
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
-        "yt_transcript_mode": "yt_timeline",
-        "use_edge_tts": True,
-        "use_google_tts": False,
-        "use_sarvam_bulbul": False,
-        "simplify_english": False,
-        "keep_subject_english": False,
-        "slot_verify": "off",
-        "audio_priority": True,
-        "video_slow_to_match": True,
-        "tts_rate_mode": "auto",
-        "tts_rate_ceiling": "+35%",
-        "tts_word_match_verify": False,
-        "audio_bitrate": "192k",
-        "use_whisperx": False,
     },
 }
 
@@ -173,6 +144,8 @@ _SRT_DIRECT = {
         "concat zero-gap, stretch video to fit. No translation, no transcription."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "srtdub",
         "use_sarvam_bulbul": True,
         "use_edge_tts": True,
@@ -199,6 +172,8 @@ _VOICE_CLONE_SAME = {
         "output language. Audio stays untouchable; post-processing disabled."
     ),
     "settings": {
+        "source_language": "hi",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_coqui_xtts": True,
         "use_edge_tts": False,
@@ -264,13 +239,61 @@ _HINDI_REVOICE_CLONE = {
         # Hindi source — don't touch English-source-specific flags.
         "simplify_english": False,
         "keep_subject_english": False,
-        # Force Whisper transcription of the actual Hindi audio. Skipping
-        # YouTube subs here because captions are often edited/mistimed vs
-        # the real speech we need to re-voice.
-        "prefer_youtube_subs": False,
-        "use_yt_translate": False,
         "use_whisperx": True,
         "audio_bitrate": "256k",
+    },
+}
+
+
+_HINDI_REVOICE_EDGE = {
+    "slug": "hindi-revoice-edge",
+    "name": "Hindi Re-Voice (Edge-TTS)",
+    "description": (
+        "Re-voice a HINDI video in Hindi with a clean Edge-TTS voice — no cloning. "
+        "Whisper transcribes the Hindi audio → translation is SKIPPED (same language) "
+        "→ Edge-TTS re-speaks in your chosen Hindi voice → per-cue video stretch to "
+        "match timing. Keeps the video's background music under the new voice. Pick the "
+        "voice in the voice selector (Madhur male / Swara female)."
+    ),
+    "settings": {
+        "source_language": "hi",         # -> sets From = Hindi (triggers the skip-translation path)
+        "target_language": "hi",         # -> sets To = Hindi
+        "pipeline_mode": "classic",
+        # Standard Edge-TTS voice (NOT cloning). Others off.
+        "use_edge_tts": True,
+        "use_coqui_xtts": False,
+        "use_sarvam_bulbul": False,
+        "use_google_tts": False,
+        "use_cosyvoice": False,
+        "use_chatterbox": False,
+        "use_elevenlabs": False,
+        # Same language: skip the English-only simplify + noun-masking steps.
+        "simplify_english": False,
+        "keep_subject_english": False,
+        # Rate-match the re-voice to the source for clean sync (NOT untouchable —
+        # that is a clone-only setting that would leave audio unaligned).
+        "audio_untouchable": False,
+        "use_wav2lip": False,
+        # AV sync: audio drives, video adapts per cue.
+        "audio_priority": True,
+        "video_slow_to_match": True,
+        "tts_no_time_pressure": True,
+        "tts_rate_mode": "auto",
+        "tts_rate_ceiling": "+25%",
+        "tts_rate_target_wpm": 130,
+        "slot_verify": "dry_run",
+        "av_sync_mode": "original",
+        # ASR + verification (same quality bar as Balanced).
+        "use_whisperx": True,
+        "tts_word_match_verify": True,
+        "tts_word_match_tolerance": 0.15,
+        "tts_truncation_threshold": 0.30,
+        # Keep the video's background music/SFX under the new voice.
+        "mix_original": True,
+        # Output.
+        "audio_bitrate": "192k",
+        "post_tts_level": "minimal",
+        "audio_quality_mode": "fast",
     },
 }
 
@@ -283,6 +306,8 @@ _BUDGET = {
         "Minimal verification, Edge-TTS overflow, Sarvam salvage if key present."
     ),
     "settings": {
+        "source_language": "en",
+        "target_language": "hi",
         "pipeline_mode": "classic",
         "use_google_tts": True,
         "use_edge_tts": True,
@@ -304,8 +329,6 @@ _BUDGET = {
         "post_tts_level": "minimal",
         "audio_quality_mode": "fast",
         "use_whisperx": True,
-        "prefer_youtube_subs": True,
-        "use_yt_translate": True,
     },
 }
 
@@ -314,10 +337,10 @@ _BUILTIN_PRESETS: List[Dict] = [
     _BALANCED,
     _STUDIO_QUALITY,
     _FAST_PREVIEW,
-    _YOUTUBE_PASSTHROUGH,
     _SRT_DIRECT,
     _VOICE_CLONE_SAME,
     _HINDI_REVOICE_CLONE,
+    _HINDI_REVOICE_EDGE,
     _BUDGET,
 ]
 
