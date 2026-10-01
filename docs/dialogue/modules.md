@@ -92,10 +92,11 @@ The **Free — Online** preset uses no paid service:
   - The model card's licence is Apache-2.0. Open discussions question commercial use of its outputs
     because of its training data.
 - **IndicTrans2** translates line by line, so it can't use dialogue context such as gendered verbs or
-  formality across lines. It breaks on transformers 5.x, and IndicTransToolkit has no Windows wheels.
-  On Windows use Ollama (e.g. `ollama pull gemma3:12b`), or IndicTrans2 inside WSL.
+  formality across lines. It breaks on transformers 5.x. On this PC it runs in the app's own Python
+  3.10 (IndicTransToolkit 1.1.1 + transformers 4.51.3), no separate venv needed.
 - **Local model library conflicts:** Indic Parler pins `transformers==4.46.1`, while IndicTrans2 needs
-  ≥ 4.51. Each runs in its own persistent worker process, optionally under its own venv (see below).
+  ≥ 4.51. Each runs in its own persistent worker process. Indic Parler is offered only when its Python
+  meets those pins, so it shows as missing until `setup_local_ai.bat` has given it its own venv.
 
 ### Other free/open-source dubbing tools (checked 2026-10-01)
 
@@ -115,8 +116,8 @@ per-turn identity checks, honest draft statuses, and this module matrix.
    - `ai4bharat/indic-parler-tts`
    - `ai4bharat/indictrans2-en-indic-dist-200M` (only for IndicTrans2)
 2. **Voices:** run `setup_local_ai.bat`. It creates `backend\.venvs\parler` and writes
-   `INDIC_PARLER_PYTHON` to `backend\.env`. It was written without a Windows PC; if a step fails, send
-   the error.
+   `INDIC_PARLER_PYTHON` to `backend\.env`. It uses Python 3.10 and installs only into that venv, never
+   into the app's own Python. It has not been run end to end yet; if a step fails, send the error.
 3. **Translation:** install Ollama, run `ollama pull gemma3:12b` (about 8 GB, fits a 12 GB GPU) and
    set `OLLAMA_MODEL=gemma3:12b` in `backend\.env`. If no model is set, the app picks your first pulled
    model and says so.

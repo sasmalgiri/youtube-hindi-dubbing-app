@@ -160,9 +160,9 @@ STAGES: Tuple[Stage, ...] = (
                      "offline. 4 Hindi speakers (Rohit, Aman, Divya, Rani) + style variants. "
                      "Needs a GPU for usable speed.",
                      requires=(Req("runtime", "parler",
-                                   "pip install git+https://github.com/huggingface/parler-tts.git "
-                                   "(pins transformers 4.46.1: best in a separate venv, set "
-                                   "INDIC_PARLER_PYTHON; see setup_local_ai.bat)"),
+                                   "run setup_local_ai.bat: parler-tts pins transformers 4.46.1, so "
+                                   "it gets its own Python env (INDIC_PARLER_PYTHON). Never pip "
+                                   "install parler-tts into the app's own Python"),
                                Req("env", "HF_TOKEN", "accept the ai4bharat/indic-parler-tts terms on "
                                    "huggingface.co and set HF_TOKEN"), _GPU)),
               Choice("indicf5", "IndicF5 (local, experimental)", "Clones curated, authorised "
