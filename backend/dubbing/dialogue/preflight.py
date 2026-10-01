@@ -91,8 +91,13 @@ def run_preflight(work_root: Path = None, providers: List[str] = ("edge",),
     except Exception:
         add("torch", False, "not installed (needed by pyannote/demucs)", level="warning")
 
-    add("demucs (background separation)", _module_version("demucs"),
-        "not installed: output will be Hindi dialogue without background", level="warning")
+    add("audio-separator (background separation, preferred)", _module_version("audio_separator"),
+        'not installed: pip install "audio-separator[gpu]" (Demucs is used if present)',
+        level="warning")
+    add("demucs (background separation fallback)", _module_version("demucs"),
+        "not installed" + ("" if _module_version("audio_separator")
+                           else ": output will be Hindi dialogue without background"),
+        level="warning")
 
     # Translation
     from .translation import OpenAICompatClient

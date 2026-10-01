@@ -83,6 +83,11 @@ class FakeLLM:
 
     def complete(self, system, user):
         req = json.loads(user)
+        if "transcript" in req:    # whole-video story brief
+            return json.dumps({"speakers": {"SPEAKER_00": {"gender": "male", "evidence": "he"},
+                                            "SPEAKER_01": {"gender": "female", "evidence": "she"}},
+                               "address": {"SPEAKER_00 -> SPEAKER_01": "tum"},
+                               "names": {"Riya": "रिया"}, "summary": "two friends"})
         if "turns" not in req:     # rewrite request
             return json.dumps({"hi": req["hindi"]}, ensure_ascii=False)
         return json.dumps({"translations": [{"id": t["id"], "hi": HINDI[t["text"]]} for t in req["turns"]],
@@ -158,6 +163,10 @@ def test_mixed_dialogue_end_to_end(tmp_path):
     assert info["video"] and info["audio"] and abs(info["duration"] - DURATION) < 0.3
     srt = res.subtitles.read_text(encoding="utf-8")
     assert srt.count("-->") == 4 and "रिया" in srt
+    # whole-video brief ran, agrees with the voices -> no disagreement warning
+    tr = [s for s in rep["stages"] if s["name"] == "translate"][0]
+    assert tr["data"]["story_brief"]["address"] == {"SPEAKER_00 -> SPEAKER_01": "tum"}
+    assert not [w for w in rep["content_warnings"] if w.get("type") == "speaker_gender_disagreement"]
     # separation failed -> Hindi-only mix, never English as "background"
     assert rep["separation"]["status"] == "failed"
     mixinfo = [s for s in rep["stages"] if s["name"] == "mix"][0]["data"]["mix"]
@@ -264,3 +273,63 @@ def test_cancel_keeps_partial_assets(tmp_path):
     assert res.status == "cancelled"
     assert (tmp_path / "work" / "original_48k.wav").exists()
     assert json.loads(res.report_json.read_text(encoding="utf-8"))["final_status"] == "cancelled"
+
+
+def test_separation_runs_once_first_and_vocals_drive_speaker_analysis(tmp_path):
+    """Separate-first (as pyVideoTrans/SoniTranslate do): the vocals stem
+    feeds diarization; the background bed is reused by the mix."""
+    calls, holder, seen = {}, {}, {}
+    comps = _components(calls, orch_holder=holder)
+    media = _make_media(tmp_path)
+
+    def separate(orig, work, policy):
+        calls["separate"] = calls.get("separate", 0) + 1
+        voc = work / "vocals_estimate.wav"
+        bed = work / "background_estimate.wav"
+        audio.to_wav(orig, voc, channels=2)
+        audio.run_ffmpeg(["-f", "lavfi", "-i", f"anoisesrc=d={DURATION}:a=0.01",
+                          "-ac", "2", "-ar", "48000", str(bed)])
+        return {"status": "ok", "background": str(bed), "vocals": str(voc), "detail": "fake"}
+
+    def diarize(wav):
+        seen["diarize_input"] = Path(wav).name
+        return _diar()
+
+    comps.separate, comps.diarize = separate, diarize
+    cfg = DialogueConfig(source=str(media), work_dir=tmp_path / "work", output_dir=tmp_path / "out",
+                         tts_providers=["mock"])
+    orch = DialogueOrchestrator(cfg, comps)
+    holder["orch"] = orch
+    res = orch.run()
+    rep = json.loads(res.report_json.read_text(encoding="utf-8"))
+    assert calls["separate"] == 1
+    assert seen["diarize_input"] == "vocals_16k_mono.wav"
+    names = [s["name"] for s in rep["stages"]]
+    assert names.index("separate") < names.index("diarize")
+    mixinfo = [s for s in rep["stages"] if s["name"] == "mix"][0]["data"]["mix"]
+    assert mixinfo["background"] is True and mixinfo["residue_duck"] is True
+    assert res.status in ("completed", "completed_with_warnings"), res.reasons
+
+
+def test_analysis_audio_mix_keeps_diarization_on_original(tmp_path):
+    seen = {}
+    holder = {}
+    comps = _components({}, orch_holder=holder)
+    media = _make_media(tmp_path)
+
+    def separate(orig, work, policy):
+        voc = work / "vocals_estimate.wav"
+        audio.to_wav(orig, voc, channels=2)
+        return {"status": "failed", "background": None, "vocals": str(voc), "detail": "bed failed"}
+
+    def diarize(wav):
+        seen["in"] = Path(wav).name
+        return _diar()
+
+    comps.separate, comps.diarize = separate, diarize
+    cfg = DialogueConfig(source=str(media), work_dir=tmp_path / "work", output_dir=tmp_path / "out",
+                         tts_providers=["mock"], analysis_audio="mix")
+    orch = DialogueOrchestrator(cfg, comps)
+    holder["orch"] = orch
+    orch.run()
+    assert seen["in"] == "original_16k_mono.wav"

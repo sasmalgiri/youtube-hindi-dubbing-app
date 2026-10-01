@@ -73,8 +73,14 @@ GEMINI_LLM_MODEL = "gemini-3.5-flash"
 # ── Subprocess worker for local Whisper transcription ────────────────────────
 # Runs in a child process so that C-level crashes (SIGABRT, CUDA OOM that
 # bypasses Python try/except) only kill the child — the server stays alive.
+# Punctuated example text steers Whisper toward punctuated output (sentence
+# boundaries drive dialogue turn splitting).
+WHISPER_PUNCT_PROMPT = "Hello. Yes, I know! What did you say? Okay, let's go."
+
+
 def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
-                          compute: str, source_lang, result_path: str):
+                          compute: str, source_lang, result_path: str,
+                          decode: str = "fast"):
     """Top-level function for multiprocessing — must be picklable."""
     import json as _json
     try:
@@ -123,6 +129,12 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
             }
             if source_lang:
                 kwargs["language"] = source_lang
+            if decode == "accurate":
+                # Beam search + no conditioning on previous text (the usual
+                # cause of repetition loops/hallucinations), as pyVideoTrans
+                # does; slower but noticeably more accurate.
+                kwargs.update(beam_size=5, best_of=5, condition_on_previous_text=False,
+                              initial_prompt=WHISPER_PUNCT_PROMPT)
 
             seg_iter, _info = _model.transcribe(wav_path_str, **kwargs)
             segments = []
@@ -4963,7 +4975,8 @@ class Pipeline:
 
         return segments
 
-    def _transcribe_local(self, wav_path: Path, model_override: Optional[str] = None) -> List[Dict]:
+    def _transcribe_local(self, wav_path: Path, model_override: Optional[str] = None,
+                          decode: str = "fast") -> List[Dict]:
         """Transcribe speech from audio using local faster-whisper (GPU/CPU).
 
         Runs Whisper in a **child process** so that C-level crashes
@@ -5002,7 +5015,7 @@ class Pipeline:
                              f"Loading Whisper ({model}) on {device.upper()} (isolated process)...")
                 p = mp.Process(
                     target=_whisper_child_worker,
-                    args=(str(wav_path), model, device, compute, source_lang, result_path),
+                    args=(str(wav_path), model, device, compute, source_lang, result_path, decode),
                     daemon=True,
                 )
                 p.start()

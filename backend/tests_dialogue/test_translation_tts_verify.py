@@ -284,3 +284,152 @@ def test_status_derivation_levels():
     r = JobReport(unresolved_failures=["speaker_mixed_providers F: turns ['t2']"])
     assert report.derive_status(r)[0] == STATUS_DRAFT_INCOMPLETE
     assert report.derive_status(JobReport(), aborted="cancelled")[0] == "cancelled"
+
+
+# ── adopted from SoniTranslate / pyVideoTrans review ─────────────────────
+def test_tts_sanitize_strips_directions_and_symbols_keeps_words():
+    from dubbing.dialogue.tts import rate_with_speed, tts_sanitize
+    assert tts_sanitize("[हँसते हुए] अरे... तुम *यहाँ* हो?") == "अरे, तुम यहाँ हो?"
+    assert tts_sanitize("...क्या — सच में?…") == "क्या, सच में?"
+    assert tts_sanitize("मैं ठीक हूँ।") == "मैं ठीक हूँ।"
+    assert rate_with_speed("+0%", 1.1) == "+10%" and rate_with_speed("-5%", 1.1) == "+4%"
+
+
+def test_router_speaks_sanitized_text(tmp_path):
+    prov = MockProvider()
+    router = TTSRouter({"mock": prov}, _reg(), ["mock"], tmp_path)
+    clip = router.synthesize(Turn("t1", "M", 0, 2, hi_fit="(धीरे से) नमस्ते"))
+    assert prov.calls[-1]["text"] == "नमस्ते" and clip.spoken_text == "नमस्ते"
+
+
+def test_retry_backoff_only_for_providers_that_ask_for_it(tmp_path, monkeypatch):
+    import dubbing.dialogue.tts as tts_mod
+    sleeps = []
+    monkeypatch.setattr(tts_mod.time, "sleep", lambda s: sleeps.append(s))
+    n = {"i": 0}
+
+    def fail(text, b):
+        n["i"] += 1
+        return n["i"] < 3
+    prov = MockProvider(fail=fail)
+    TTSRouter({"mock": prov}, _reg(), ["mock"], tmp_path, max_retries=2).synthesize(
+        Turn("t1", "M", 0, 2, hi_fit="ठीक है"))
+    assert sleeps == []
+    n["i"] = 0
+    prov.retry_backoff_s = 2.0
+    TTSRouter({"mock": prov}, _reg(), ["mock"], tmp_path, max_retries=2).synthesize(
+        Turn("t2", "M", 0, 2, hi_fit="ठीक है"))
+    assert len(sleeps) == 2 and 2.0 <= sleeps[0] <= 2.5 and 4.0 <= sleeps[1] <= 4.5
+
+
+def test_previous_overrun_delays_next_clip_instead_of_talking_over_it(tmp_path):
+    router = TTSRouter({"mock": MockProvider(seconds_per_char=0.2)}, _reg(), ["mock"], tmp_path)
+    a = Turn("t1", "M", 0.0, 1.0, hi_fit="यह लंबी पंक्ति है")
+    b = Turn("t2", "F", 1.1, 4.0, hi_fit="हाँ")
+    clips = {x.turn_id: router.synthesize(x) for x in (a, b)}
+    devs = fit.fit_all([a, b], clips, 10.0, lambda tt, r: router.synthesize(tt, r), None, fit.FitConfig())
+    first_end = clips["t1"].scheduled_end
+    assert first_end > 1.1                      # t1 overran into t2's start
+    d2 = [d for d in devs if d["turn_id"] == "t2"][0]
+    assert 0 < d2["delayed_s"] <= 0.4 + 1e-6    # bounded delay, recorded
+    assert clips["t2"].scheduled_start == pytest.approx(min(first_end + 0.05, 1.5), abs=2e-3)
+    assert (b.source_start, b.source_end) == (1.1, 4.0)
+
+
+def test_native_rate_is_used_before_stretching_and_total_speed_is_capped(tmp_path):
+    prov = MockProvider(seconds_per_char=0.1, native_rate=True)
+    router = TTSRouter({"mock": prov}, _reg(), ["mock"], tmp_path)
+    t = Turn("t1", "M", 0.0, 1.0, hi_fit="नमस्ते आप कैसे हैं")
+    nxt = Turn("t2", "F", 1.65, 3.0, hi_fit="हाँ")
+    clips = {x.turn_id: router.synthesize(x) for x in (t, nxt)}
+    natural = clips["t1"].natural_duration
+    assert natural > 1.65
+    devs = fit.fit_all([t, nxt], clips, 5.0, lambda tt, r: router.synthesize(tt, r), None, fit.FitConfig(),
+                       native_rate=lambda tt, sp: router.synthesize(tt, "native", speed=sp))
+    c = clips["t1"]
+    assert c.voice_params["rate"] not in (None, "+0%")
+    d = [x for x in devs if x["turn_id"] == "t1"][0]
+    assert d["native_rate"] > 1.0
+    assert natural / c.final_duration <= 1.15 + 0.03     # native x stretch within the cap
+
+
+def test_last_turn_may_pre_roll_further_so_media_end_does_not_cut_it(tmp_path):
+    router = TTSRouter({"mock": MockProvider(seconds_per_char=0.2)}, _reg(), ["mock"], tmp_path)
+    t = Turn("t1", "M", 8.0, 9.0, hi_fit="यह अंतिम लंबी पंक्ति")
+    clips = {"t1": router.synthesize(t)}
+    fit.fit_all([t], clips, 10.0, lambda tt, r: router.synthesize(tt, r), None, fit.FitConfig())
+    assert clips["t1"].scheduled_start < 8.0 - 0.25
+    assert clips["t1"].scheduled_start >= 8.0 - 1.5 - 1e-6
+
+
+def test_trim_keeps_soft_tail_and_level_gain_evens_voices(tmp_path):
+    import numpy as np
+    from dubbing.dialogue import audio
+    sr = 48000
+    tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)
+    tail = 0.004 * np.sin(2 * np.pi * 200 * np.arange(int(0.08 * sr)) / sr)   # ~ -48 dBFS
+    x = np.concatenate([np.zeros(sr // 2), tone, tail, np.zeros(sr // 2)]).astype(np.float32)
+    src, out = tmp_path / "a.wav", tmp_path / "b.wav"
+    audio.write_wav(src, x, sr)
+    dur = audio.trim_silence(src, out)
+    assert 1.08 <= dur <= 1.0 + 0.08 + 0.04 + 0.12 + 0.02
+    quiet, loud = 0.2 * tone, 1.2 * tone   # about -27 and -12 dBFS RMS
+    gq, gl = audio.speech_level_gain(quiet, sr), audio.speech_level_gain(loud, sr)
+    assert gq > 1 > gl
+    lvl = lambda v: 20 * np.log10(np.sqrt(np.mean(v ** 2)))
+    assert abs(lvl(quiet * gq) - lvl(loud * gl)) < 1.0
+
+
+class _BriefLLM:
+    model_id = "fake:brief"
+
+    def __init__(self, brief):
+        self.brief, self.requests = brief, []
+
+    def complete(self, system, user):
+        req = json.loads(user)
+        self.requests.append(req)
+        if "transcript" in req:
+            return json.dumps(self.brief, ensure_ascii=False)
+        return json.dumps({"translations": [{"id": t["id"], "hi": "ठीक है"} for t in req["turns"]]},
+                          ensure_ascii=False)
+
+
+def test_story_brief_is_built_once_cleaned_and_sent_with_every_batch():
+    llm = _BriefLLM({"speakers": {"A": {"gender": "female", "evidence": "'she said'"},
+                                  "B": {"gender": "robot"}, "ZZ": {"gender": "male"}},
+                     "address": {"A -> B": "aap", "B -> A": "yo"},
+                     "names": {"Riya": "रिया", "Bob": "Bob"}, "summary": "an interview"})
+    tr = DialogueTranslator([llm], batch_size=2, story_brief=True, allow_basic_fallback=False)
+    turns = _turns(5)
+    tr.translate(turns)
+    briefs = [r for r in llm.requests if "transcript" in r]
+    assert len(briefs) == 1 and "[B] Line a here." in briefs[0]["transcript"]
+    assert tr.brief["speakers"] == {"A": {"gender": "female", "evidence": "'she said'"}}
+    assert tr.brief["address"] == {"A -> B": "aap"}
+    assert tr.name_map == {"Riya": "रिया"}          # non-Devanagari spelling rejected
+    batches = [r for r in llm.requests if "turns" in r]
+    assert len(batches) == 3 and all(r["story_brief"] == tr.brief for r in batches)
+
+
+def test_story_brief_failure_is_non_fatal():
+    class Broken(_BriefLLM):
+        def complete(self, system, user):
+            if "transcript" in json.loads(user):
+                raise RuntimeError("boom")
+            return super().complete(system, user)
+    tr = DialogueTranslator([Broken({})], story_brief=True, allow_basic_fallback=False)
+    turns = _turns(3)
+    warnings = tr.translate(turns)
+    assert all(t.hi_raw for t in turns) and tr.brief == {}
+    assert any(w["type"] == "story_brief_failed" for w in warnings)
+
+
+def test_pipe_becomes_danda_and_first_turn_at_zero_is_not_delayed(tmp_path):
+    from dubbing.dialogue.tts import tts_sanitize
+    assert tts_sanitize("मैं आ गया | चलो") == "मैं आ गया। चलो"
+    router = TTSRouter({"mock": MockProvider()}, _reg(), ["mock"], tmp_path)
+    t = Turn("t1", "M", 0.0, 2.0, hi_fit="हाँ")
+    clips = {"t1": router.synthesize(t)}
+    devs = fit.fit_all([t], clips, 5.0, lambda tt, r: router.synthesize(tt, r), None, fit.FitConfig())
+    assert clips["t1"].scheduled_start == 0.0 and not devs

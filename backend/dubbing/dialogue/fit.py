@@ -6,9 +6,15 @@ The video keeps its original speed. For each turn (in time order):
      non-overlapping turn) as slack;
   3. if still too long, ask for a shorter *faithful* rewrite and regenerate
      (bounded);
-  4. then apply a modest pitch-preserving stretch (<= max_stretch);
+  4. then speed up within max_stretch: natively through the TTS engine's
+     speaking rate when it supports one (sounds more natural), and with a
+     pitch-preserving stretch only for what remains;
   5. if it still does not fit, keep the full audio (never truncated), allow a
      small pre-roll into preceding silence, and record the exact overflow.
+
+If the previous Hindi clip overran into this turn's start, this clip starts
+up to ``max_delay_s`` later instead of talking over it (bounded per turn, so
+nothing drifts: each window still ends at the next turn's source start).
 
 Source times on turns are never modified; results go to Clip.scheduled_*.
 """
@@ -30,6 +36,9 @@ class FitConfig:
     max_rewrites: int = 2
     overflow_tolerance_s: float = 0.15
     draft_overflow_s: float = 0.6   # unresolved overflow above this -> draft
+    max_delay_s: float = 0.4        # may start this much later if the previous clip overran
+    final_preroll_s: float = 1.5    # last turn before the media end may start earlier
+    native_rate_min: float = 1.03   # below this, a native-rate re-synthesis is not worth it
 
 
 def compute_windows(turns: Sequence[Turn], media_duration: float, guard_s: float = 0.05
@@ -70,18 +79,29 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
             resynth: Callable[[Turn, str], Clip],
             rewrite: Optional[Callable[[Turn, str, float], Optional[str]]],
             cfg: FitConfig, cancel_check: Callable[[], bool] = lambda: False,
-            on_progress: Callable[[float, str], None] = lambda p, m: None) -> List[Dict]:
-    """Fit every clip in place. Returns timing deviation records."""
+            on_progress: Callable[[float, str], None] = lambda p, m: None,
+            native_rate: Optional[Callable[[Turn, float], Optional[Clip]]] = None) -> List[Dict]:
+    """Fit every clip in place. Returns timing deviation records.
+
+    ``native_rate(turn, speed)`` re-synthesizes the turn at a faster native
+    speaking rate (same voice); it returns None when the turn's provider has
+    no native rate."""
     windows = compute_windows(turns, media_duration, cfg.guard_s)
     deviations: List[Dict] = []
     ordered = sorted([t for t in turns if t.turn_id in clips], key=lambda t: t.source_start)
     last_end = 0.0
+    placed = False          # a previous non-overlap clip exists (delay only behind a real clip)
     for n, t in enumerate(ordered):
         if cancel_check():
             raise RuntimeError("Job cancelled by user")
         clip = clips[t.turn_id]
         start, avail_end = windows.get(t.turn_id, (t.source_start, t.source_end))
-        slack = avail_end - start
+        sched = start
+        delayed = 0.0
+        if not t.overlaps_with and placed and last_end + cfg.guard_s > start + 1e-3:
+            sched = min(last_end + cfg.guard_s, start + cfg.max_delay_s)
+            delayed = sched - start
+        slack = avail_end - sched
         t.budget_s = round(slack, 3)
         speed, overflow = plan_speed(clip.natural_duration, slack, cfg.max_stretch)
         rewrites = 0
@@ -109,6 +129,21 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
             clips[t.turn_id] = clip
             t.add_flag("duration_rewrite")
             speed, overflow = plan_speed(clip.natural_duration, slack, cfg.max_stretch)
+        native = 1.0
+        if native_rate is not None and slack > 0 and speed >= cfg.native_rate_min:
+            want = min(cfg.max_stretch, clip.natural_duration / slack)
+            try:
+                fast = native_rate(t, want)
+            except Exception:
+                fast = None
+            if fast is not None and 0 < fast.natural_duration < clip.natural_duration:
+                native = clip.natural_duration / fast.natural_duration
+                fast.retry_history = clip.retry_history + fast.retry_history
+                clip = fast
+                clips[t.turn_id] = clip
+                # total speed-up (native x stretch) stays within max_stretch
+                speed, overflow = plan_speed(clip.natural_duration, slack,
+                                             max(1.0, cfg.max_stretch / native))
         # stretch
         if abs(speed - 1.0) > 1e-3:
             src = Path(clip.path)
@@ -119,21 +154,31 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
         else:
             clip.final_duration = clip.natural_duration
         clip.stretch = round(speed, 4)
-        sched = start
-        if overflow > cfg.overflow_tolerance_s:
-            # pre-roll into silence left by the previous turn (never before it ends)
-            earliest = max(start - cfg.preroll_s, last_end + cfg.guard_s)
+        if overflow > cfg.overflow_tolerance_s and not delayed:
+            # pre-roll into silence left by the previous turn (never before it
+            # ends); the turn closest to the media end may use more, since
+            # audio past the end of the video would be cut off.
+            pre = cfg.preroll_s
+            if media_duration > 0 and avail_end >= media_duration - cfg.guard_s - 1e-3:
+                pre = max(pre, cfg.final_preroll_s)
+            earliest = max(start - pre, last_end + cfg.guard_s)
             if earliest < start:
                 shift = min(start - earliest, overflow)
                 sched = start - shift
                 overflow -= shift
         clip.scheduled_start = round(sched, 3)
         clip.scheduled_end = round(sched + clip.final_duration, 3)
-        last_end = max(last_end, clip.scheduled_end) if not t.overlaps_with else last_end
+        if not t.overlaps_with:
+            last_end = max(last_end, clip.scheduled_end)
+            placed = True
         rec = {"turn_id": t.turn_id, "speaker_id": t.speaker_id,
                "source_start": t.source_start, "source_end": t.source_end,
                "scheduled_start": clip.scheduled_start, "scheduled_end": clip.scheduled_end,
                "stretch": clip.stretch, "rewrites": rewrites}
+        if native > 1.0 + 1e-3:
+            rec["native_rate"] = round(native, 4)
+        if delayed > 1e-3:
+            rec["delayed_s"] = round(delayed, 3)
         overflow = max(0.0, clip.scheduled_end - avail_end)
         if media_duration > 0 and clip.scheduled_end > media_duration:
             rec["beyond_media_end_s"] = round(clip.scheduled_end - media_duration, 3)
@@ -142,7 +187,7 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
             rec["severity"] = "draft" if overflow > cfg.draft_overflow_s else "warning"
             t.add_flag("timing_overflow")
             deviations.append(rec)
-        elif clip.stretch > 1.0 or sched < start or rewrites:
+        elif clip.stretch > 1.0 or sched != start or rewrites or native > 1.0 + 1e-3:
             rec["severity"] = "info"
             deviations.append(rec)
         on_progress((n + 1) / max(1, len(ordered)), f"Fitted {n + 1}/{len(ordered)} turns")

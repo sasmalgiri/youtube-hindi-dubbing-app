@@ -18,7 +18,7 @@ import json
 import os
 import re
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .contracts import CATEGORY_UNKNOWN, Turn
 from .text_checks import (critical_tokens_hindi, extract_protected_terms,
@@ -36,7 +36,15 @@ Rules:
 6. Grammatical gender: use gender only when the text/context makes it clear. "voice_hint" is a guess from the audio of the speaker's voice, not verified identity; use it only as a weak hint for the speaker's own first-person forms and never for other people. If unclear, prefer a natural gender-neutral construction and set "uncertain": true.
 7. "max_seconds"/"target_words" are soft length targets for lip timing. Prefer concise natural phrasing, but NEVER drop facts, names, numbers or negation to meet them.
 8. Do not invent content. If the source is unintelligible or a fragment, translate what is there and set "uncertain": true with a short note.
-9. Short replies stay short ("Yes." -> "हाँ।"). Keep exclamations/questions as such."""
+9. Short replies stay short ("Yes." -> "हाँ।"). Keep exclamations/questions as such.
+10. "story_brief", when present, is read-only knowledge of the WHOLE video: use its speaker genders (they come from textual evidence and outrank voice_hint) for each speaker's own gendered forms, its "address" register to keep aap/tum/tu consistent between the same two speakers, and its name spellings."""
+
+BRIEF_PROMPT = """You are preparing a Hindi dub of a video. Read the whole English transcript (one line per turn: "[SPEAKER_ID] text") and return ONE JSON object:
+{"speakers":{"<SPEAKER_ID>":{"gender":"male|female|unknown","evidence":"<short quote or reason from the text>"}},
+ "address":{"<SPEAKER_A> -> <SPEAKER_B>":"aap|tum|tu"},
+ "names":{"<English name>":"<Devanagari spelling>"},
+ "summary":"<at most 60 words: setting, relationships, tone>"}
+Give a gender only with textual evidence (pronouns used about the speaker, their name, forms of address such as "sir", "ma'am", "Mom", self-reference); otherwise "unknown". Never guess from stereotypes. Choose the address register Hindi speakers would use given the relationship (stranger/elder/boss -> aap, friends/partners -> tum, very close or rude -> tu)."""
 
 REWRITE_PROMPT = """Shorten this Hindi dubbing line so it can be spoken faster, keeping the meaning of the English source.
 Keep EVERY name, number (as digits), negation and key fact. Remove only filler/redundancy; prefer shorter synonyms.
@@ -64,14 +72,17 @@ class OpenAICompatClient:
                    "", "OLLAMA_MODEL", ""),
     }
 
-    def __init__(self, name: str, timeout: float = 120.0):
+    def __init__(self, name: str, timeout: float = 120.0, model: Optional[str] = None):
         if name not in self.ENDPOINTS:
             raise ValueError(f"Unknown engine {name}")
         url, key_env, model_env, default_model = self.ENDPOINTS[name]
         self.name = name
+        if name == "ollama":
+            host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+            url = (host if host.startswith("http") else "http://" + host) + "/v1/chat/completions"
         self.url = url
         self.key = os.environ.get(key_env, "").strip() if key_env else ""
-        self.model = os.environ.get(model_env, "").strip() or default_model
+        self.model = (model or "").strip() or os.environ.get(model_env, "").strip() or default_model
         self.timeout = timeout
 
     @property
@@ -113,14 +124,20 @@ class OpenAICompatClient:
         raise TranslationEngineError(f"{self.name} failed after retries ({last})")
 
 
-def default_llm_clients(order: Sequence[str]) -> List[OpenAICompatClient]:
+def default_llm_clients(order: Sequence[str], ollama_model: str = "") -> List[OpenAICompatClient]:
     out = []
     for name in order:
         if name in OpenAICompatClient.ENDPOINTS:
-            c = OpenAICompatClient(name)
+            c = OpenAICompatClient(name, model=ollama_model if name == "ollama" else None)
             if c.available:
                 out.append(c)
     return out
+
+
+def build_mt_engines(names: Sequence[str]) -> List[Any]:
+    """Sentence-level MT engines in priority order (see mt_engines.py)."""
+    from .mt_engines import make_mt_engine
+    return [make_mt_engine(n) for n in names]
 
 
 def google_basic_translate(text: str) -> str:
@@ -131,6 +148,7 @@ def google_basic_translate(text: str) -> str:
 # ── validation ─────────────────────────────────────────────────────────────
 def parse_json_object(raw: str) -> Dict:
     s = (raw or "").strip()
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL).strip()   # reasoning models
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
     try:
         return json.loads(s)
@@ -189,7 +207,8 @@ class DialogueTranslator:
                  max_attempts: int = 3, allow_basic_fallback: bool = True,
                  basic_fallback: Optional[Callable[[str], str]] = None,
                  on_progress: Optional[Callable[[float, str], None]] = None,
-                 cancel_check: Optional[Callable[[], bool]] = None):
+                 cancel_check: Optional[Callable[[], bool]] = None,
+                 mt_engines: Optional[Sequence[Any]] = None, story_brief: bool = False):
         self.clients = list(clients)
         self.glossary = glossary or {}
         self.batch_size = batch_size
@@ -198,9 +217,17 @@ class DialogueTranslator:
         self.max_attempts = max_attempts
         self.allow_basic_fallback = allow_basic_fallback
         self.basic_fallback = basic_fallback or google_basic_translate
+        # Sentence-level MT fallbacks tried in order after the LLMs. None keeps
+        # the original behaviour: Google basic when allow_basic_fallback.
+        if mt_engines is None:
+            from .mt_engines import GoogleBasicMT
+            mt_engines = [GoogleBasicMT(self.basic_fallback)] if allow_basic_fallback else []
+        self.mt_engines = list(mt_engines)
         self.on_progress = on_progress or (lambda p, m: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.name_map: Dict[str, str] = {}
+        self.story_brief = story_brief
+        self.brief: Dict[str, Any] = {}
         self.warnings: List[Dict] = []
         self.engines_used: set = set()
 
@@ -231,6 +258,8 @@ class DialogueTranslator:
             "context_after": [{"id": t.turn_id, "speaker": t.speaker_id, "text": t.source_text}
                               for t in after],
         }
+        if self.brief:
+            user = {"story_brief": self.brief, **user}
         if note:
             user["reviewer_note"] = note
         raw = client.complete(SYSTEM_PROMPT, json.dumps(user, ensure_ascii=False))
@@ -250,6 +279,8 @@ class DialogueTranslator:
         for t in todo:
             t.protected_terms = extract_protected_terms(t.source_text, self.glossary)
         order = {t.turn_id: i for i, t in enumerate(turns)}
+        if self.story_brief and self.clients and len(todo) >= 2 and not self.brief:
+            self.build_brief(turns)
         done = 0
         for b0 in range(0, len(todo), self.batch_size):
             if self.cancel_check():
@@ -296,19 +327,29 @@ class DialogueTranslator:
                                 t.translation_attempts[-1]["note"] = str(it["note"])[:200]
                         self.engines_used.add(client.model_id)
                 pending = [t for t in pending if not t.hi_raw]
-        if pending and self.allow_basic_fallback:
-            for t in pending:
-                try:
-                    t.hi_raw = (self.basic_fallback(t.source_text) or "").strip()
-                except Exception as e:
-                    t.translation_attempts.append({"engine": "google_basic", "ok": False,
+        for engine in self.mt_engines:
+            if not pending:
+                break
+            try:
+                outs = engine.translate_batch([t.source_text for t in pending])
+            except Exception as e:
+                for t in pending:
+                    t.translation_attempts.append({"engine": engine.name, "ok": False,
                                                    "error": str(e)[:200]})
+                self.warnings.append({"type": "engine_error", "engine": engine.name,
+                                      "detail": str(e)[:200]})
+                continue
+            for t, out in zip(pending, outs):
+                out = (out or "").strip()
+                if not out:
                     continue
-                if t.hi_raw:
-                    t.add_flag("non_contextual_translation")
-                    t.translation_attempts.append({"engine": "google_basic", "ok": True})
-                    self.engines_used.add("google_basic")
-                    self.warnings.append({"type": "non_contextual_translation", "id": t.turn_id})
+                t.hi_raw = out
+                t.add_flag(engine.flag)
+                t.translation_attempts.append({"engine": engine.name, "ok": True})
+                self.engines_used.add(engine.name)
+                if engine.warn_per_turn:
+                    self.warnings.append({"type": engine.flag, "id": t.turn_id})
+            pending = [t for t in pending if not t.hi_raw]
         for t in batch:
             if not t.hi_raw:
                 t.add_flag("translation_failed")
@@ -352,6 +393,41 @@ class DialogueTranslator:
                 t.add_flag("critical_token_warning")
                 self.warnings.append({"type": "critical_tokens", "id": t.turn_id, "issues": issues})
 
+    # ── whole-video brief ─────────────────────────────────────────────
+    def build_brief(self, turns: List[Turn], max_chars: int = 40000) -> Dict[str, Any]:
+        """One LLM call over the whole transcript (pyVideoTrans passes the full
+        text as global context to every batch; a compact brief gives Hindi the
+        part that matters -- speaker gender, aap/tum register, names -- at a
+        fraction of the tokens). Failure is non-fatal: batches then rely on
+        local context as before."""
+        lines, size = [], 0
+        for t in turns:
+            if not t.source_text.strip():
+                continue
+            line = f"[{t.speaker_id}] {t.source_text.strip()}"
+            size += len(line) + 1
+            if size > max_chars:
+                break
+            lines.append(line)
+        speakers = sorted({t.speaker_id for t in turns})
+        user = json.dumps({"transcript": "\n".join(lines), "speaker_ids": speakers}, ensure_ascii=False)
+        for client in self.clients:
+            try:
+                data = parse_json_object(client.complete(BRIEF_PROMPT, user))
+            except Exception as e:
+                self.warnings.append({"type": "story_brief_failed", "engine": client.model_id,
+                                      "detail": str(e)[:160]})
+                continue
+            brief = _clean_brief(data, speakers)
+            if not brief:
+                continue
+            for k, v in brief.get("names", {}).items():
+                self.name_map.setdefault(k, v)
+            brief["engine"] = client.model_id
+            self.brief = {k: v for k, v in brief.items() if k != "engine"}
+            return brief
+        return {}
+
     # ── faithful shortening ───────────────────────────────────────────
     def rewrite_shorter(self, t: Turn, current_hi: str, target_ratio: float) -> Optional[str]:
         """Ask for a shorter faithful Hindi line. Returns None if rejected."""
@@ -381,6 +457,37 @@ class DialogueTranslator:
                                            "reason": "duration_rewrite"})
             return cand
         return None
+
+
+def _clean_brief(data: Any, speaker_ids: Sequence[str]) -> Dict[str, Any]:
+    """Keep only well-formed fields of a story brief (it is model output)."""
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    spk = data.get("speakers")
+    if isinstance(spk, dict):
+        clean = {}
+        for sid, v in spk.items():
+            if sid in speaker_ids and isinstance(v, dict) and \
+                    v.get("gender") in ("male", "female", "unknown"):
+                clean[sid] = {"gender": v["gender"], "evidence": str(v.get("evidence", ""))[:160]}
+        if clean:
+            out["speakers"] = clean
+    addr = data.get("address")
+    if isinstance(addr, dict):
+        clean = {str(k)[:60]: v for k, v in addr.items() if v in ("aap", "tum", "tu")}
+        if clean:
+            out["address"] = clean
+    names = data.get("names")
+    if isinstance(names, dict):
+        clean = {k: v for k, v in names.items()
+                 if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+                 and re.search(r"[\u0900-\u097F]", v)}
+        if clean:
+            out["names"] = clean
+    if isinstance(data.get("summary"), str) and data["summary"].strip():
+        out["summary"] = data["summary"].strip()[:500]
+    return out
 
 
 def load_glossary(path) -> Dict[str, str]:

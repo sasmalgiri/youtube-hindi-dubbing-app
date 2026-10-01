@@ -109,6 +109,8 @@ export interface JobCreateRequest {
     dialogue_num_speakers?: number;         // 0 = detect
     dialogue_background?: 'auto' | 'demucs' | 'none';
     dialogue_verify?: 'auto' | 'on' | 'off';
+    dialogue_preset?: string;               // module preset id (e.g. 'free-online')
+    dialogue_modules_json?: string;         // JSON overrides {"<stage>": [...], "params": {...}}
 }
 
 export interface JobConfig {
@@ -400,6 +402,57 @@ export function originalVideoUrl(id: string): string {
 
 export function resultSrtUrl(id: string): string {
     return `${API_BASE}/api/jobs/${id}/srt`;
+}
+
+// ── Hindi dialogue module matrix ─────────────────────────────────────────
+export interface DialogueChoice {
+    id: string; label: string; description: string;
+    cost: 'free' | 'free_tier' | 'paid'; cloud: boolean; tags: string[];
+    available: boolean; missing: { name: string; fix: string }[]; notes: string[];
+}
+export interface DialogueStage {
+    id: string; label: string; description: string; multi: boolean; required: boolean;
+    default: string[]; choices: DialogueChoice[];
+}
+export interface DialoguePreset {
+    id: string; name: string; description: string;
+    selections?: Record<string, string[]>; params?: Record<string, unknown>;
+}
+export interface DialogueMatrix {
+    stages: DialogueStage[];
+    params: Record<string, { label: string; type: string; default: unknown; help?: string; min?: number; max?: number }>;
+    presets: DialoguePreset[];
+    default_preset: string;
+    environment: { gpu: boolean | null; ollama: boolean | null; ollama_models: string[] };
+}
+export interface DialogueResolution {
+    preset: string; selections: Record<string, string[]>; params: Record<string, unknown>;
+    changes: { stage: string; action: string; choice: string; reason: string; fix: string }[];
+    warnings: string[]; blocking: string[]; ok: boolean;
+}
+export type DialogueOverrides = Record<string, string[] | Record<string, unknown>>;
+
+export async function fetchDialogueModules(sourceKind: 'url' | 'file' = 'url'): Promise<DialogueMatrix> {
+    const res = await fetch(`${API_BASE}/api/dialogue/modules?source_kind=${sourceKind}`, { headers: { ...EXTRA_HEADERS } });
+    if (!res.ok) throw new Error('Failed to load dialogue modules');
+    return res.json();
+}
+
+export async function fetchDialoguePresets(): Promise<DialoguePreset[]> {
+    const res = await fetch(`${API_BASE}/api/dialogue/presets`, { headers: { ...EXTRA_HEADERS } });
+    if (!res.ok) throw new Error('Failed to load dialogue presets');
+    return (await res.json()).presets;
+}
+
+export async function resolveDialogue(preset: string, overrides: DialogueOverrides,
+    sourceKind: 'url' | 'file', files: Record<string, boolean> = {}): Promise<DialogueResolution> {
+    const res = await fetch(`${API_BASE}/api/dialogue/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ preset, overrides, source_kind: sourceKind, files }),
+    });
+    if (!res.ok) throw new Error('Failed to resolve dialogue modules');
+    return res.json();
 }
 
 export function dialogueReportUrl(id: string, fmt: 'md' | 'json' = 'md'): string {

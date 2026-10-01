@@ -7,6 +7,7 @@ import LanguageSelector, { LANGUAGES } from '@/components/LanguageSelector';
 import SettingsPanel, { type DubbingSettings } from '@/components/SettingsPanel';
 import WordTimingPanel from '@/components/WordTimingPanel';
 import PresetTabs from '@/components/PresetTabs';
+import DialogueModulesPanel from '@/components/DialogueModulesPanel';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
 import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
@@ -130,6 +131,17 @@ export default function HomePage() {
     const stripModeBloat = useCallback((s: typeof settings) => {
         const cleaned: any = { ...s };
         if (cleaned.pipeline_mode !== 'srtdub') delete cleaned.sd_srt_content;
+        // Hindi Dialogue module matrix travels as a JSON string (works for
+        // JSON and multipart upload requests alike).
+        if (cleaned.pipeline_mode === 'hindi_dialogue') {
+            cleaned.dialogue_preset = cleaned.dialogue_preset || 'free-online';
+            if (cleaned.dialogue_modules && Object.keys(cleaned.dialogue_modules).length > 0) {
+                cleaned.dialogue_modules_json = JSON.stringify(cleaned.dialogue_modules);
+            }
+        } else {
+            delete cleaned.dialogue_preset;
+        }
+        delete cleaned.dialogue_modules;
         return cleaned;
     }, []);
 
@@ -318,6 +330,16 @@ export default function HomePage() {
                             }) as Record<string, string>)[settings.pipeline_mode || 'classic']}
                         </span>
                     </div>
+                )}
+
+                {/* Hindi Dialogue: module matrix (presets + auto on/off per this PC) */}
+                {settings.pipeline_mode === 'hindi_dialogue' && settings._input_mode !== 'srt' && (
+                    <DialogueModulesPanel
+                        preset={(settings as any).dialogue_preset || ''}
+                        overrides={(settings as any).dialogue_modules || {}}
+                        sourceKind={settings._input_mode === 'upload' ? 'file' : 'url'}
+                        onChange={(preset, overrides) => setSettings(s => ({ ...s, dialogue_preset: preset, dialogue_modules: overrides } as any))}
+                    />
                 )}
 
                 {/* Voice Clone Preset */}

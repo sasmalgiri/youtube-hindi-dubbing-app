@@ -19,16 +19,21 @@ from .contracts import Clip, Turn
 
 
 def render_dialogue(clips: Sequence[Clip], duration: float, out_dir: Path,
-                    sr: int = audio.SR) -> Dict:
+                    sr: int = audio.SR, level_dbfs: Optional[float] = -20.0) -> Dict:
     """Place every accepted clip at its scheduled time. Writes one stem per
     track plus the summed dialogue bus. Nothing is cut: if clips extend past
-    `duration`, the bus is extended and the excess is reported."""
+    `duration`, the bus is extended and the excess is reported.
+
+    With ``level_dbfs`` each clip's active-speech level is brought toward
+    that value (bounded) so speakers/voices sit at an even loudness before
+    the final mix normalisation."""
     import numpy as np
     accepted = [c for c in clips if c.accepted]
     end = max([duration] + [c.scheduled_end for c in accepted])
     n = int(round(end * sr)) + 1
     n_tracks = max([c.track for c in accepted], default=-1) + 1
     tracks = [np.zeros(n, dtype=np.float32) for _ in range(max(1, n_tracks))]
+    gains: List[float] = []
     for c in accepted:
         data, csr = audio.read_wav(Path(c.path))
         if csr != sr:
@@ -36,6 +41,11 @@ def render_dialogue(clips: Sequence[Clip], duration: float, out_dir: Path,
             audio.to_wav(Path(c.path), tmp, sr=sr)
             data, csr = audio.read_wav(tmp)
         mono = data.mean(axis=1)
+        if level_dbfs is not None:
+            g = audio.speech_level_gain(mono, sr, target_dbfs=level_dbfs)
+            mono = mono * g
+            c.voice_params["level_gain_db"] = round(20 * float(np.log10(max(g, 1e-6))), 2)
+            gains.append(c.voice_params["level_gain_db"])
         s = int(round(c.scheduled_start * sr))
         e = min(n, s + len(mono))
         tracks[c.track][s:e] += mono[:e - s]
@@ -54,34 +64,116 @@ def render_dialogue(clips: Sequence[Clip], duration: float, out_dir: Path,
     return {"bus": str(bus_path), "stems": stems, "tracks": len(tracks),
             "rendered_duration": round(n / sr, 3),
             "beyond_media_end_s": round(max(0.0, end - duration), 3),
-            "pre_normalise_peak": round(peak, 4)}
+            "pre_normalise_peak": round(peak, 4),
+            "clip_level_gain_db": ({"min": min(gains), "max": max(gains)} if gains else None)}
+
+
+SEPARATOR_MODELS = (
+    # audio-separator (MIT; wraps UVR MDX / Roformer models, downloads weights
+    # on first use). BS-Roformer first, then UVR MDX-Net Inst HQ 4 (the model
+    # SoniTranslate uses for its voiceless background), then Demucs.
+    "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+    "UVR-MDX-NET-Inst_HQ_4.onnx",
+)
 
 
 def separate_background(original: Path, work: Path, policy: str = "auto") -> Dict:
-    """Return {"status": ..., "background": path|None, "detail": ...}."""
+    """Split the original audio into a background bed and a vocals stem.
+
+    Returns {"status", "background": path|None, "vocals": path|None,
+    "detail"}. The vocals stem is used for speaker detection / voice
+    analysis (music and effects otherwise create false speakers); the
+    background is mixed under the Hindi dialogue. Separation is an estimate.
+    """
     if policy == "none":
-        return {"status": "disabled", "background": None, "detail": "policy=none"}
-    out = work / "background_estimate.wav"
+        return {"status": "disabled", "background": None, "vocals": None, "detail": "policy=none"}
+    errors = []
+    try:
+        import audio_separator  # noqa: F401
+        has_as = True
+    except ImportError:
+        has_as = False
+    if has_as:
+        import os
+        models = [m for m in [os.environ.get("DIALOGUE_SEPARATOR_MODEL", "").strip()] if m] \
+            + list(SEPARATOR_MODELS)
+        for model in models:
+            try:
+                return _audio_separator(original, work, model)
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:120]}")
     try:
         import demucs  # noqa: F401
     except ImportError:
-        return {"status": "unavailable", "background": None,
-                "detail": "demucs not installed; output is Hindi dialogue only"}
+        detail = ("no separator installed (pip install \"audio-separator[gpu]\" or demucs); "
+                  "output is Hindi dialogue only")
+        if errors:
+            detail = "audio-separator failed (" + "; ".join(errors) + "); demucs not installed"
+        return {"status": "unavailable" if not errors else "failed", "background": None,
+                "vocals": None, "detail": detail}
+    out = work / "background_estimate.wav"
     try:
-        return _demucs_api(original, out)
+        res = _demucs_api(original, out, work)
     except Exception as api_err:
         try:
-            return _demucs_cli(original, out, work)
+            res = _demucs_cli(original, out, work)
         except Exception as cli_err:
-            return {"status": "failed", "background": None,
+            return {"status": "failed", "background": None, "vocals": None,
                     "detail": f"demucs failed ({str(api_err)[:120]} / {str(cli_err)[:120]}); "
                               f"output is Hindi dialogue only"}
+    if errors:
+        res["detail"] += " (audio-separator failed: " + "; ".join(errors) + ")"
+    return res
 
 
-def _demucs_api(original: Path, out: Path) -> Dict:
+def _audio_separator(original: Path, work: Path, model: str) -> Dict:
+    from audio_separator.separator import Separator
+    backend_dir = Path(__file__).resolve().parents[2]
+    out_dir = work / "separation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sep = Separator(output_dir=str(out_dir), output_format="WAV",
+                    model_file_dir=str(backend_dir / "models" / "separation"))
+    try:
+        sep.load_model(model_filename=model)
+        names = sep.separate(str(original))
+    finally:
+        # Separation now runs first: release the model so its VRAM is free
+        # for Whisper, pyannote and the local TTS/MT workers.
+        del sep
+        _free_gpu()
+    files = [Path(f) if Path(f).is_absolute() else out_dir / f for f in names]
+    voc = next((f for f in files if "(vocals)" in f.name.lower()), None)
+    bed = next((f for f in files if "(instrumental)" in f.name.lower()
+                or "(no_vocals)" in f.name.lower() or "(no vocals)" in f.name.lower()), None)
+    if bed is None or not bed.exists():
+        raise RuntimeError(f"no instrumental stem in {[f.name for f in files]}")
+    background = work / "background_estimate.wav"
+    audio.to_wav(bed, background, channels=2)
+    vocals = None
+    if voc is not None and voc.exists():
+        vocals = work / "vocals_estimate.wav"
+        audio.to_wav(voc, vocals, channels=2)
+    return {"status": "ok", "background": str(background),
+            "vocals": str(vocals) if vocals else None,
+            "detail": f"audio-separator {model}"}
+
+
+def _free_gpu():
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _demucs_api(original: Path, out: Path, work: Path) -> Dict:
+    import os
     import demucs.api
-    import torch
-    sep = demucs.api.Separator(model="htdemucs", overlap=0.25, segment=7, shifts=0,
+    model = os.environ.get("DIALOGUE_DEMUCS_MODEL", "htdemucs")
+    sep = demucs.api.Separator(model=model, overlap=0.25, segment=7, shifts=0,
                                progress=False)
     _, stems = sep.separate_audio_file(str(original))
     bed = None
@@ -92,11 +184,14 @@ def _demucs_api(original: Path, out: Path) -> Dict:
     if bed is None:
         raise RuntimeError("no non-vocal stems")
     demucs.api.save_audio(bed, str(out), samplerate=sep.samplerate)
+    vocals = None
+    if "vocals" in stems:
+        vocals = work / "vocals_estimate.wav"
+        demucs.api.save_audio(stems["vocals"], str(vocals), samplerate=sep.samplerate)
     del sep
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return {"status": "ok", "background": str(out),
-            "detail": "demucs.api htdemucs (overlap 0.25, segment 7s); sum of non-vocal stems"}
+    _free_gpu()
+    return {"status": "ok", "background": str(out), "vocals": str(vocals) if vocals else None,
+            "detail": f"demucs.api {model} (overlap 0.25, segment 7s); sum of non-vocal stems"}
 
 
 def _demucs_cli(original: Path, out: Path, work: Path) -> Dict:
@@ -108,24 +203,44 @@ def _demucs_cli(original: Path, out: Path, work: Path) -> Dict:
     if not nv.exists():
         raise RuntimeError("no_vocals.wav not produced")
     audio.to_wav(nv, out, channels=2)
+    vocals = None
+    vv = dst / "htdemucs" / original.stem / "vocals.wav"
+    if vv.exists():
+        vocals = work / "vocals_estimate.wav"
+        audio.to_wav(vv, vocals, channels=2)
     shutil.rmtree(dst, ignore_errors=True)
-    return {"status": "ok", "background": str(out),
+    return {"status": "ok", "background": str(out), "vocals": str(vocals) if vocals else None,
             "detail": "demucs CLI --two-stems vocals (htdemucs, overlap 0.25)"}
 
 
 def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
-              duration: float, bg_gain: float = 0.8, target_lufs: float = -17.0) -> Dict:
-    """Duck background under dialogue, normalise loudness, limit peaks."""
+              duration: float, bg_gain: float = 0.8, target_lufs: float = -17.0,
+              vocals_key: Optional[Path] = None) -> Dict:
+    """Duck background under dialogue, normalise loudness, limit peaks.
+
+    With ``vocals_key`` (the separated English vocals stem) the background
+    gets a second, gentle duck wherever the original speech was: separation
+    leaves faint English residue in the bed, which is otherwise exposed
+    where the Hindi line is shorter than the English one.
+    """
     pre = out.with_name("mix_pre_norm.wav")
     dur = f"{duration:.3f}"
+    duck_residue = False
     if background:
+        inputs = ["-i", str(dialogue_bus), "-i", str(background)]
+        bg = "bg"
+        duck_residue = bool(vocals_key and Path(vocals_key).exists())
         flt = (f"[0:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},asplit=2[dlg][sc];"
-               f"[1:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},volume={bg_gain}[bg];"
-               f"[bg][sc]sidechaincompress=threshold=0.05:ratio=6:attack=20:release=350[duck];"
-               f"[dlg][duck]amix=inputs=2:duration=first:normalize=0[m]")
-        audio.run_ffmpeg(["-i", str(dialogue_bus), "-i", str(background),
-                          "-filter_complex", flt, "-map", "[m]", "-ar", str(audio.SR),
-                          "-ac", "2", "-acodec", "pcm_s16le", str(pre)])
+               f"[1:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},volume={bg_gain}[bg];")
+        if duck_residue:
+            inputs += ["-i", str(vocals_key)]
+            flt += (f"[2:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur}[vk];"
+                    f"[bg][vk]sidechaincompress=threshold=0.03:ratio=2.5:attack=10:release=250[bgv];")
+            bg = "bgv"
+        flt += (f"[{bg}][sc]sidechaincompress=threshold=0.05:ratio=6:attack=20:release=350[duck];"
+                f"[dlg][duck]amix=inputs=2:duration=first:normalize=0[m]")
+        audio.run_ffmpeg(inputs + ["-filter_complex", flt, "-map", "[m]", "-ar", str(audio.SR),
+                                   "-ac", "2", "-acodec", "pcm_s16le", str(pre)])
     else:
         audio.run_ffmpeg(["-i", str(dialogue_bus), "-af",
                           f"aformat=channel_layouts=stereo,apad,atrim=0:{dur}",
@@ -135,7 +250,8 @@ def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
     st = audio.audio_stats(out)
     info.update({"duration": round(st["duration"], 3), "peak": round(st["peak"], 4),
                  "clip_fraction": st["clip_fraction"], "channels": st["channels"],
-                 "sample_rate": st["sample_rate"], "background": bool(background)})
+                 "sample_rate": st["sample_rate"], "background": bool(background),
+                 "residue_duck": duck_residue})
     return info
 
 
