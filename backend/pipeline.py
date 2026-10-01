@@ -1909,8 +1909,11 @@ class Pipeline:
         Speakers with under MIN_SPEAKER_SEC of speech (pyannote's spurious
         clusters from laughter / music / crosstalk) are folded into the most
         similar real speaker, so a stray 2-second "speaker" never gets its
-        own random voice."""
+        own random voice — UNLESS the small speaker clearly sounds like nobody
+        else (fingerprint >= TINY_KEEP_DIST from every real speaker) and its
+        gender is known: that is a one-line story character, not noise."""
         MIN_SPEAKER_SEC = 3.0
+        TINY_KEEP_DIST = 0.5   # one person's own lines sit within ~0.25
         res = self._run_speaker_worker(wav_path, seg_bounds=seg_bounds)
         if not res:
             return {}, {}
@@ -1936,17 +1939,22 @@ class Pipeline:
                 a, b = _np.asarray(a), _np.asarray(b)
                 return float(a @ b / (_np.linalg.norm(a) * _np.linalg.norm(b) + 1e-9))
 
+            merged = 0
             for s in small:
                 if s in embs and all(b in embs for b in big):
                     target = max(big, key=lambda b: _cos(embs[s], embs[b]))
+                    if s in genders and 1.0 - _cos(embs[s], embs[target]) >= TINY_KEEP_DIST:
+                        continue   # distinct voice: a minor character, keep it
                 else:
                     target = max(big, key=lambda b: speech[b])
                 ranges[target] = sorted(ranges[target] + ranges.pop(s))
                 speech[target] += speech.pop(s)
                 genders.pop(s, None)
-            self._report("transcribe", 0.97,
-                         f"Merged {len(small)} tiny speaker cluster(s) (<{MIN_SPEAKER_SEC:.0f}s) "
-                         f"into the closest real speaker")
+                merged += 1
+            if merged:
+                self._report("transcribe", 0.97,
+                             f"Merged {merged} tiny speaker cluster(s) (<{MIN_SPEAKER_SEC:.0f}s) "
+                             f"into the closest real speaker")
         for s in ranges:
             genders.setdefault(s, self._default_voice_gender())
 
