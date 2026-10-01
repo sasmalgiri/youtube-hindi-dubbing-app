@@ -197,6 +197,29 @@ def test_provider_fallback_preserves_speaker_and_reroutes_whole_speaker(tmp_path
     assert clips["t3"].provider == "mock"          # other speakers untouched
 
 
+def test_speaker_voiced_only_by_fallback_is_pinned_to_the_working_provider(tmp_path):
+    # e.g. every Indic Parler line failed and Edge voiced it: regenerations
+    # (fit / verification) must go to the fallback, not retry the primary.
+    primary = MockProvider(name="mock", fail=lambda text, b: b["voice"].startswith("mock-female"))
+    backup = MockProvider(name="mock2", native_rate=True)
+    reg = _reg()
+    reg.pools["mock2"] = {"model": "m2", "supports_pitch": False,
+                          CATEGORY_MALE: ["b-male"], CATEGORY_FEMALE: ["b-female"]}
+    router = TTSRouter({"mock": primary, "mock2": backup}, reg, ["mock", "mock2"], tmp_path, max_retries=1)
+    turns = {"t1": Turn("t1", "F", 0, 1, hi_fit="पहली बात"),
+             "t2": Turn("t2", "F", 2, 3, hi_fit="दूसरी बात"),
+             "t3": Turn("t3", "M", 4, 5, hi_fit="ठीक है")}
+    clips = {tid: router.synthesize(t) for tid, t in turns.items()}
+    assert router.reroute_mixed_speakers(turns, clips) == []
+    assert router.speaker_provider == {"F": "mock2"}             # M stays on the primary
+    assert router.supports_native_rate("F") and not router.supports_native_rate("M")
+    tried = len(primary.calls)
+    again = router.synthesize(turns["t1"], reason="content_mismatch",
+                              only_provider=router.providers_for("F")[0])
+    assert again.provider == "mock2" and again.voice == "b-female" and again.degraded
+    assert len(primary.calls) == tried                           # broken primary not retried
+
+
 def test_long_text_split_never_loses_text():
     text = "यह पहला वाक्य है। " * 200
     parts = split_for_limit(text.strip(), 500)
