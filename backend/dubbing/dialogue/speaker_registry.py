@@ -18,11 +18,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..hindi_voices import FEMALE_SLOTS, MALE_SLOTS, split_slot
 from .contracts import (CATEGORY_CHILD, CATEGORY_FEMALE, CATEGORY_MALE,
                         CATEGORY_UNKNOWN, UNKNOWN_SPEAKER, SpeakerRecord)
 
 # Pitch variants used (in order) when several speakers share a base voice.
-EDGE_PITCH_VARIANTS = ["+0Hz", "-10Hz", "+8Hz", "-18Hz", "+15Hz", "-25Hz"]
 
 
 def _env_list(name: str) -> List[str]:
@@ -62,15 +62,15 @@ def curated_pools() -> Dict[str, Dict[str, Any]]:
         "edge": {
             "model": "edge-neural",
             "supports_pitch": True,
-            # Only two native hi-IN voices exist; extra same-gender speakers get
-            # Multilingual voices, which read Devanagari as intelligibly (Whisper
-            # word-match 85-88% vs Madhur 85% / Swara 79%, measured 2026-09-30).
-            CATEGORY_MALE: ["hi-IN-MadhurNeural", "en-US-BrianMultilingualNeural",
-                            "en-AU-WilliamMultilingualNeural", "de-DE-FlorianMultilingualNeural"],
-            CATEGORY_FEMALE: ["hi-IN-SwaraNeural", "en-US-EmmaMultilingualNeural",
-                              "de-DE-SeraphinaMultilingualNeural", "fr-FR-VivienneMultilingualNeural"],
-            # No child voice exists; a raised-pitch female voice is used and flagged.
-            CATEGORY_CHILD: ["hi-IN-SwaraNeural"],
+            # One slot per character, most distinct first, shared with the
+            # classic pipeline (dubbing/hindi_voices.py): native + Multilingual
+            # voices, then +/-20 Hz variants ("voice|pitch").
+            CATEGORY_MALE: list(MALE_SLOTS),
+            CATEGORY_FEMALE: list(FEMALE_SLOTS),
+            # Raised-pitch voices no adult slot uses, so a child never sounds
+            # exactly like the lead woman.
+            CATEGORY_CHILD: ["hi-IN-SwaraNeural|+25Hz", "pt-BR-ThalitaMultilingualNeural|+25Hz",
+                             "en-US-EmmaMultilingualNeural|+25Hz"],
         },
         "sarvam": {
             "model": "bulbul:v2",
@@ -82,8 +82,10 @@ def curated_pools() -> Dict[str, Dict[str, Any]]:
         "google": {
             "model": "wavenet",
             "supports_pitch": True,
-            CATEGORY_MALE: ["hi-IN-Wavenet-B", "hi-IN-Wavenet-C"],
-            CATEGORY_FEMALE: ["hi-IN-Wavenet-A", "hi-IN-Wavenet-D"],
+            CATEGORY_MALE: ["hi-IN-Wavenet-B", "hi-IN-Wavenet-C", "hi-IN-Wavenet-B|+20Hz",
+                            "hi-IN-Wavenet-C|-20Hz", "hi-IN-Wavenet-B|-20Hz", "hi-IN-Wavenet-C|+20Hz"],
+            CATEGORY_FEMALE: ["hi-IN-Wavenet-A", "hi-IN-Wavenet-D", "hi-IN-Wavenet-A|+20Hz",
+                              "hi-IN-Wavenet-D|-20Hz", "hi-IN-Wavenet-A|-20Hz", "hi-IN-Wavenet-D|+20Hz"],
             CATEGORY_CHILD: [],
         },
         "elevenlabs": {
@@ -167,25 +169,26 @@ class SpeakerRegistry:
                 continue
             n = usage.get(cat, 0)
             usage[cat] = n + 1
-            voice = voices[n % len(voices)]
+            slot = voices[n % len(voices)]
             round_idx = n // len(voices)
+            voice, slot_pitch = split_slot(slot)
             binding: Dict[str, Any] = {
                 "provider": provider,
                 "voice": voice,
                 "model": pool.get("model", ""),
                 "category_used": cat,
-                "pitch": None,
+                "pitch": slot_pitch,
                 "variant": round_idx,
             }
             if pool.get("refs"):  # reference-based providers (IndicF5)
                 binding.update(pool["refs"][voice])
                 binding["reference_version"] = voice
-            if pool.get("supports_pitch"):
-                if rec.voice_category == CATEGORY_CHILD and cat == CATEGORY_FEMALE:
-                    binding["pitch"] = "+25Hz"
-                elif round_idx > 0:
-                    binding["pitch"] = EDGE_PITCH_VARIANTS[round_idx % len(EDGE_PITCH_VARIANTS)]
-            elif round_idx > 0:
+            if pool.get("supports_pitch") and rec.voice_category == CATEGORY_CHILD \
+                    and cat == CATEGORY_FEMALE:
+                binding["pitch"] = "+25Hz"
+            if round_idx > 0:
+                # More characters than distinct slots: this exact voice is
+                # already used by another character (reported).
                 binding["indistinguishable_reuse"] = True
             rec.provider_voices[provider] = binding
             if not rec.mapping_origin:

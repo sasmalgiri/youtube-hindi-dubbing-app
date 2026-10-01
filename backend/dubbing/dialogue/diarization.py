@@ -109,7 +109,8 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
                  min_speakers: Optional[int] = None,
                  max_speakers: Optional[int] = None,
                  heartbeat: Optional[Callable[[float], None]] = None,
-                 timeout: float = 3600.0) -> DiarizationResult:
+                 timeout: float = 3600.0,
+                 seg_bounds: Optional[Sequence[Tuple[float, float]]] = None) -> DiarizationResult:
     """Run pyannote with the requested model, falling back to the other one.
 
     Each attempt runs in a spawned CHILD process (_pyannote_child): a native
@@ -149,7 +150,7 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
             errors.append(f"{model_id} needs pyannote.audio>=4 (installed {version})")
             continue
         try:
-            data = _run_child(wav_path, hf_token, key, kwargs, heartbeat, timeout)
+            data = _run_child(wav_path, hf_token, key, kwargs, heartbeat, timeout, seg_bounds)
             return DiarizationResult(
                 [tuple(x) for x in data["regular"]], [tuple(x) for x in data["exclusive"]],
                 data.get("embeddings") or {}, backend=f"pyannote-{key}",
@@ -162,7 +163,8 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
 
 
 def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
-               heartbeat: Optional[Callable[[float], None]], timeout: float) -> Dict:
+               heartbeat: Optional[Callable[[float], None]], timeout: float,
+               seg_bounds=None) -> Dict:
     """Spawn _pyannote_child; heartbeat every 10 s; returns its JSON result."""
     import json
     import multiprocessing as mp
@@ -172,7 +174,9 @@ def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
     os.close(fd)
     try:
         p = mp.get_context("spawn").Process(
-            target=_pyannote_child, args=(str(wav_path), hf_token, key, kwargs, result_path),
+            target=_pyannote_child,
+            args=(str(wav_path), hf_token, key, kwargs, result_path,
+                  [list(b) for b in seg_bounds] if seg_bounds else None),
             daemon=True)
         p.start()
         t0 = time.time()
@@ -209,7 +213,7 @@ def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
 
 
 def _pyannote_child(wav_path: str, hf_token: str, key: str, kwargs: Dict,
-                    result_path: str) -> None:
+                    result_path: str, seg_bounds=None) -> None:
     """Child-process body of run_pyannote (top level so spawn can pickle it)."""
     import json
     import sys
@@ -262,6 +266,35 @@ def _pyannote_child(wav_path: str, hf_token: str, key: str, kwargs: Dict,
             output = pipe(audio_input, **kwargs)
             note = "; CUDA OOM -> reran on CPU"
         res = _convert_output(output, key)
+        # Turn-level refinement (shared with the classic pipeline): recover
+        # minor characters pyannote folded into a bigger cluster, using the
+        # transcript's line boundaries so each line is embedded on its own.
+        emb_fn = getattr(pipe, "_embedding", None)
+        if emb_fn is not None and isinstance(audio_input, dict):
+            from dubbing.speaker_refine import (cut_at_bounds, refine_speakers_by_turns,
+                                                turn_embeddings)
+            ranges: Dict[str, List[Tuple[float, float]]] = {}
+            for a, b, spk in res.exclusive:
+                ranges.setdefault(spk, []).append((a, b))
+            ranges = cut_at_bounds(ranges, seg_bounds)
+            temb = turn_embeddings(ranges, audio_input["waveform"], audio_input["sample_rate"], emb_fn)
+            new_ranges, cents, n_ref = refine_speakers_by_turns(ranges, temb)
+            if n_ref:
+                excl = sorted((a, b, spk) for spk, rs in new_ranges.items() for a, b in rs)
+
+                def _relabel(a, b, spk):
+                    ov = {}
+                    for x, y, lab in excl:
+                        o = min(b, y) - max(a, x)
+                        if o > 0:
+                            ov[lab] = ov.get(lab, 0.0) + o
+                    return max(ov, key=ov.get) if ov else spk
+
+                regular = sorted((a, b, _relabel(a, b, spk)) for a, b, spk in res.regular)
+                emb = dict(res.embeddings)
+                emb.update({k: [float(x) for x in c] for k, c in cents.items()})
+                res = DiarizationResult(regular, excl, emb, backend=res.backend,
+                                        detail=res.detail + f"; refined {n_ref} line group(s)")
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump({"regular": res.regular, "exclusive": res.exclusive,
                        "embeddings": res.embeddings, "detail": res.detail + note,
