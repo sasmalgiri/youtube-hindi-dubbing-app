@@ -279,7 +279,48 @@ class IndicF5Provider(BaseProvider):
         return p
 
 
-PROVIDER_CLASSES = {"edge": EdgeProvider, "sarvam": SarvamProvider,
+class IndicParlerProvider(BaseProvider):
+    """AI4Bharat Indic Parler-TTS (Apache-2.0, gated: HF_TOKEN), free and local.
+
+    Runs in a persistent worker (workers/parler_worker.py), optionally under
+    its own Python (INDIC_PARLER_PYTHON) because parler-tts pins
+    transformers==4.46.1. The speaker is chosen by naming it in a voice
+    description; the binding's "pitch" field carries a style word
+    (low / high) that changes the description. The model card advises
+    ~10-12 s per generation, so text is sent in sentence-sized chunks.
+    """
+    name = "indic_parler"
+    max_chars = 160
+    STYLE = {None: "a natural, clear tone", "low": "a deep, low-pitched tone",
+             "high": "a slightly high-pitched tone"}
+
+    def __init__(self):
+        from .local_workers import PersistentWorker
+        self.worker = PersistentWorker("parler", init={"model": "ai4bharat/indic-parler-tts"},
+                                       timeout=900)
+
+    def description(self, binding: Dict) -> str:
+        style = self.STYLE.get(binding.get("pitch"), self.STYLE[None])
+        return (f"{binding['voice']}'s voice is expressive and conversational, with {style}, "
+                f"speaking at a moderate pace in a close recording with very clear audio.")
+
+    def synthesize_part(self, text, binding, out):
+        p = out.with_suffix(".wav")
+        seed = sum(map(ord, binding["voice"] + str(binding.get("pitch")))) % 100000
+        try:
+            self.worker.request({"op": "tts", "text": text, "description": self.description(binding),
+                                 "out": str(p), "seed": seed})
+        except Exception as e:
+            raise TTSProviderError(f"indic_parler: {str(e)[:200]}") from e
+        if not p.exists() or p.stat().st_size < 500:
+            raise TTSProviderError("indic_parler: empty audio")
+        return p
+
+    def close(self):
+        self.worker.close()
+
+
+PROVIDER_CLASSES = {"edge": EdgeProvider, "indic_parler": IndicParlerProvider, "sarvam": SarvamProvider,
                     "elevenlabs": ElevenLabsProvider, "google": GoogleProvider,
                     "indicf5": IndicF5Provider, "mock": MockProvider}
 

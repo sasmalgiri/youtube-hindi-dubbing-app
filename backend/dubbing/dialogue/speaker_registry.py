@@ -96,6 +96,18 @@ def curated_pools() -> Dict[str, Dict[str, Any]]:
             CATEGORY_CHILD: _env_list("ELEVENLABS_VOICES_CHILD"),
         },
         "indicf5": indicf5_pool(),
+        # Indic Parler-TTS Hindi speakers from the model card (Rohit, Divya
+        # recommended; Aman, Rani available). Only Rohit's gender is stated by
+        # AI4Bharat; Divya/Rani (female) and Aman (male) are inferred from the
+        # names. "|low"/"|high" change the voice description (style variants of
+        # the same speaker, reported as reuse).
+        "indic_parler": {
+            "model": "ai4bharat/indic-parler-tts",
+            "supports_pitch": False,
+            CATEGORY_MALE: ["Rohit", "Aman", "Rohit|low", "Aman|low", "Rohit|high", "Aman|high"],
+            CATEGORY_FEMALE: ["Divya", "Rani", "Divya|high", "Rani|high", "Divya|low", "Rani|low"],
+            CATEGORY_CHILD: ["Divya|high"],
+        },
         "mock": {
             "model": "mock",
             "supports_pitch": True,

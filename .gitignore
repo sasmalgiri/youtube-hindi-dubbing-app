@@ -97,3 +97,6 @@ backend/creds/
 backend/credentials/
 *-service-account*.json
 *-gcp-key*.json
+
+# Optional local-AI model environments (setup_local_ai.bat)
+backend/.venvs/

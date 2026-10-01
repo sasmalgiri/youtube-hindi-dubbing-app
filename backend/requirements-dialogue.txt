@@ -26,3 +26,10 @@ deep-translator>=1.11
 
 # EXPERIMENTAL IndicF5 provider (gated model; curated authorised references only)
 # transformers>=4.44
+
+# Local AI preset ("Free - Local AI"), see docs/dialogue/modules.md:
+#   Indic Parler-TTS voices: install in a SEPARATE venv (pins transformers==4.46.1)
+#     -> setup_local_ai.bat, which sets INDIC_PARLER_PYTHON in backend/.env
+#   IndicTrans2 translation: separate venv with "transformers>=4.51,<5" indictranstoolkit
+#     (no Windows wheels: use WSL), then set INDICTRANS2_PYTHON
+#   Ollama translation: install Ollama, `ollama pull gemma3:12b`, set OLLAMA_MODEL
