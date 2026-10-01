@@ -14,8 +14,9 @@ import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRe
 
 // The "My Hindi SRT" dialogue preset (text_source = hindi_srt) voices a Hindi
 // SRT. A link or an uploaded video gives it none — the preset panel shows it
-// disabled — so a saved setting that still selects it is stopped here instead
-// of starting a job that has no Hindi text to voice.
+// disabled — so a saved setting that still selects it is stopped here (link,
+// upload, batch and a saved link's Start) instead of starting a job that has
+// no Hindi text to voice.
 function srtOnlyPresetError(s: DubbingSettings): string | null {
     return s.pipeline_mode === 'hindi_dialogue' && (s as any).dialogue_preset === 'hindi-srt-revoice'
         ? 'The "My Hindi SRT" preset needs a Hindi SRT: upload it in the SRT Dub tab, or pick another Hindi Dialogue preset.'
@@ -295,7 +296,16 @@ export default function HomePage() {
 
                     {/* Saved Links */}
                     <div className="mt-4">
-                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) })} />
+                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => {
+                            // A saved link's "Start" submits these settings: same guard
+                            // as the submits above (SavedLinks catches the throw, so no job).
+                            const presetError = srtOnlyPresetError(settings);
+                            if (presetError) {
+                                setError(presetError);
+                                throw new Error(presetError);
+                            }
+                            return { source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) };
+                        }} />
                     </div>
 
                     {error && (

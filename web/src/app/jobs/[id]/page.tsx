@@ -51,16 +51,32 @@ export default function JobPage() {
     const [continuing, setContinuing] = useState(false);
 
     // The Subtitles button is shown only when the backend has a subtitle file
-    // for this job (the old always-on button 404ed). Split classic jobs move
-    // their subtitles into the saved folder just after the final "done" event,
-    // so the hook's last status read can miss subtitles_path: read once more.
+    // for this job (the old always-on button 404ed). A one-part split job (the
+    // default for videos up to 30 min) sends its final "done" event first and
+    // only then moves the video and subtitles into the saved folder -- here a
+    // copy from C: to D:, longer the bigger the video -- so the hook's last read
+    // can miss subtitles_path. Read again every 3 s until that save is over
+    // (saved_folder is set), for at most 2 minutes.
     const [lateStatus, setLateStatus] = useState<JobStatus | null>(null);
     useEffect(() => {
-        if (!isComplete || !status || status.subtitles_path) return;
-        const t = setTimeout(() => { getJob(jobId).then(setLateStatus).catch(() => { }); }, 3000);
-        return () => clearTimeout(t);
+        if (!isComplete || !status || status.subtitles_path || status.saved_folder) return;
+        let alive = true;
+        let tries = 0;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const readLater = () => {
+            timer = setTimeout(() => {
+                getJob(jobId).then((j) => {
+                    if (!alive) return;
+                    setLateStatus(j);
+                    if (!j.subtitles_path && !j.saved_folder && ++tries < 40) readLater();
+                }).catch(() => { if (alive && ++tries < 40) readLater(); });
+            }, 3000);
+        };
+        readLater();
+        return () => { alive = false; if (timer) clearTimeout(timer); };
     }, [isComplete, status, jobId]);
-    const hasSubtitles = Boolean(status?.subtitles_path || lateStatus?.subtitles_path);
+    const hasSubtitles = Boolean(status?.subtitles_path
+        || (lateStatus?.id === jobId && lateStatus.subtitles_path));
 
     const handleSrtUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];

@@ -94,6 +94,23 @@ def test_only_our_backend_is_recognised(desktop, serve):
     assert not desktop.is_voicedub_backend(bare)
 
 
+def test_jobs_still_in_the_old_backend_are_found(desktop, serve, monkeypatch):
+    jobs = [{"id": "a1", "state": "running", "video_title": "Talk"},
+            {"id": "b2", "state": "review_translation", "video_title": ""},
+            {"id": "c3", "state": "queued", "video_title": "Next"},
+            {"id": "d4", "state": "done", "video_title": "Old"},
+            {"id": "e5", "state": "waiting_for_srt", "video_title": "Kept in jobs.db"}]
+    port = serve({"/api/jobs": json.dumps(jobs)})
+    assert desktop._active_jobs(port) == ["Talk", "b2", "Next"]
+    assert desktop._active_jobs(serve({})) == []          # no job list: nothing to ask about
+
+    def no_answer(prompt=""):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", no_answer)
+    assert desktop.confirm_stop_backend(port) is False    # unanswered: old backend kept
+    assert desktop.confirm_stop_backend(serve({"/api/jobs": "[]"})) is True
+
+
 def test_identity_strings_match_the_app(desktop):
     app = (ROOT / "backend" / "app.py").read_text(encoding="utf-8")
     layout = (ROOT / "web" / "src" / "app" / "layout.tsx").read_text(encoding="utf-8")

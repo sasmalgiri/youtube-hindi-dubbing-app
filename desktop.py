@@ -20,7 +20,6 @@ import time
 import shutil
 import signal
 import subprocess
-import threading
 import urllib.error
 import urllib.request
 import importlib
@@ -188,12 +187,18 @@ def inspect_port(port, what, is_ours):
     return None
 
 
+# Jobs that live only in the backend process: a job paused for review
+# (step-by-step) waits there on its pipeline thread, and a restarted backend
+# turns it into an error. ("waiting_for_srt" survives a restart in jobs.db.)
+ACTIVE_JOB_STATES = ("running", "queued", "review_transcription", "review_translation")
+
+
 def _active_jobs(port):
     """Titles of the jobs the backend on `port` is still working on."""
     jobs = _http_get(f"http://{BACKEND_HOST}:{port}/api/jobs", 15)
     try:
         return [j.get("video_title") or j.get("id", "?") for j in json.loads(jobs[1])
-                if j.get("state") in ("running", "queued")]
+                if j.get("state") in ACTIVE_JOB_STATES]
     except (TypeError, ValueError, AttributeError):
         return []
 
@@ -575,7 +580,7 @@ def main():
 
     print()
     print("  " + "=" * 48)
-    print(f"   VoiceDub is ready!")
+    print("   VoiceDub is ready!")
     print(f"   http://localhost:{FRONTEND_PORT}")
     print("  " + "=" * 48)
     print()
@@ -591,7 +596,7 @@ def main():
         except Exception:
             pass
 
-        window = webview.create_window(
+        webview.create_window(
             title="VoiceDub",
             url=f"http://localhost:{FRONTEND_PORT}",
             width=1300,
