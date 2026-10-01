@@ -256,6 +256,85 @@ def test_engine_down_is_skipped_everywhere_reported_and_retried_later():
     assert [w for w in tr.warnings if w["type"] == "engine_marked_down"][-1]["failures"] == 2
 
 
+class FlakyLLM(GoodLLM):
+    """Fails whole retry cycles (a network drop) for its first `fail_calls` calls."""
+
+    def __init__(self, model_id, fail_calls):
+        super().__init__()
+        self.model_id, self.fail_calls, self.calls = model_id, fail_calls, 0
+
+    def complete(self, system, user):
+        self.calls += 1
+        if self.calls <= self.fail_calls:
+            raise EngineUnavailableError("failed after retries (network: ConnectionError)")
+        return super().complete(system, user)
+
+
+def test_lone_engine_down_after_the_brief_still_translates_every_batch():
+    groq = FlakyLLM("fake:groq", fail_calls=1)       # the (optional) brief hit the drop
+    tr = DialogueTranslator([groq], batch_size=2, story_brief=True, allow_basic_fallback=False)
+    turns = _turns(5)
+    turns[3].source_text = "I need 3 tickets."
+    tr.translate(turns)
+    assert all(t.hi_raw for t in turns) and not any("translation_failed" in t.flags for t in turns)
+    # answering again made it healthy: the critical-token retry used it as well
+    assert "3" in turns[3].hi_raw and any("reviewer_note" in r for r in groq.requests)
+    assert [w["type"] for w in tr.warnings].count("engine_marked_down") == 1
+
+
+def test_short_outage_of_every_engine_does_not_fail_the_remaining_lines():
+    a, b = FlakyLLM("fake:a", fail_calls=1), FlakyLLM("fake:b", fail_calls=1)
+    progress = []
+    tr = DialogueTranslator([a, b], batch_size=2, story_brief=True, allow_basic_fallback=False,
+                            on_progress=lambda p, m: progress.append(m))
+    turns = _turns(4)
+    tr.translate(turns)
+    assert all(t.hi_raw for t in turns)
+    assert (a.calls, b.calls) == (3, 1)      # both down after the brief; a answered batch 1 and 2
+    assert "Every translation engine is marked down; trying them again for this batch" in progress
+
+
+def test_ollama_down_is_not_retried_per_batch():
+    class DownOllama(DownLLM):          # not running / slower than its timeout: does not pass
+        model_id, name = "ollama:m", "ollama"
+
+    ollama = DownOllama()
+    turns = _turns(3)
+    DialogueTranslator([ollama], story_brief=True, basic_fallback=lambda s: "अनुवाद").translate(turns)
+    assert ollama.calls == 1
+    assert all("non_contextual_translation" in t.flags for t in turns)
+
+
+def test_story_brief_transcript_fits_ollamas_context(http, keys, monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    keys("GROQ_API_KEY", "k1")
+    turns = [Turn(f"t{i:04d}", "A", i * 2.0, i * 2.0 + 1.5, source_text="word " * 19)
+             for i in range(1, 601)]                 # ~59k chars of transcript
+    brief = json.dumps({"summary": "a long talk"})
+    ollama = OpenAICompatClient("ollama", model="m")
+    http["script"] = [FakeResponse(200, {"message": {"content": brief}, "done": True,
+                                         "done_reason": "stop"}), _ok(brief)]
+    DialogueTranslator([ollama]).build_brief(turns)
+    DialogueTranslator([OpenAICompatClient("groq")]).build_brief(turns)
+    sent = [len(json.loads(c["json"]["messages"][1]["content"])["transcript"]) for c in http["calls"]]
+    assert 0 < sent[0] <= ollama.max_prompt_chars < sent[1] <= 40000
+
+
+def test_unusable_brief_is_recorded_as_a_warning():
+    class NoBrief(GoodLLM):
+        def complete(self, system, user):
+            if "transcript" in json.loads(user):
+                return json.dumps({"speakers": {"NOBODY": {"gender": "male"}}})
+            return super().complete(system, user)
+
+    progress = []
+    tr = DialogueTranslator([NoBrief()], story_brief=True, allow_basic_fallback=False,
+                            on_progress=lambda p, m: progress.append(m))
+    tr.translate(_turns(2))
+    assert any(w["type"] == "story_brief_failed" and "no usable" in w["detail"] for w in tr.warnings)
+    assert "No story brief (see translation warnings); using local context only" in progress
+
+
 def test_translator_reports_client_waits_and_rejected_keys(http, keys):
     keys("GROQ_API_KEY", "k1", "k2")
     reply = json.dumps({"translations": [{"id": "t0001", "hi": "हाँ।"}]}, ensure_ascii=False)

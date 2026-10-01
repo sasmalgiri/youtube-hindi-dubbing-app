@@ -13,7 +13,8 @@
   only if no LLM engine works, and every such turn is flagged.
 * An engine that fails a whole retry cycle (5xx, 429 on every key, network)
   is marked down for ENGINE_DOWN_S and skipped by batches, retries, rewrites
-  and the brief; both are recorded in the warnings.
+  and the brief; both are recorded in the warnings. While every engine is
+  down, each batch still retries the cloud ones; one that answers is up again.
 """
 from __future__ import annotations
 
@@ -153,6 +154,10 @@ class OpenAICompatClient:
         self.model = (model or "").strip() or os.environ.get(model_env, "").strip() or default_model
         # A local model on a 12 GB GPU can need minutes for a 20-turn batch.
         self.timeout = timeout if timeout is not None else (600.0 if name == "ollama" else 120.0)
+        # Longest whole-video transcript (chars) for the story brief, 0 = no cap:
+        # Ollama keeps num_ctx tokens; ~3 chars/token, 2048 left for the
+        # instructions and the reply. (40000 chars, the default, is ~10k tokens.)
+        self.max_prompt_chars = (self.OLLAMA_NUM_CTX - 2048) * 3 if name == "ollama" else 0
         # Set by DialogueTranslator: waits / rejected keys become progress lines
         # and warnings, and a cancelled job stops backing off at once.
         self.on_event: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -398,10 +403,12 @@ class DialogueTranslator:
     # ── engine health ─────────────────────────────────────────────────
     def _call(self, client, system: str, user: str) -> str:
         try:
-            return client.complete(system, user)
+            out = client.complete(system, user)
         except EngineUnavailableError as e:
             self._mark_down(client, str(e))
             raise
+        self._down.pop(id(client), None)    # it answered (e.g. the all-down batch retry): up again
+        return out
 
     def _mark_down(self, client, reason: str):
         k = id(client)
@@ -413,11 +420,15 @@ class DialogueTranslator:
         self._note(f"{client.model_id} unavailable ({reason[:80]}); "
                    f"skipping it for {int(ENGINE_DOWN_S // 60)} min")
 
+    def _is_down(self, client) -> bool:
+        down = self._down.get(id(client))
+        return bool(down) and down[0] > self._clock()
+
     def _skip_if_down(self, client, where: str) -> bool:
         """True (and counted in one warning per engine) while marked down."""
-        down = self._down.get(id(client))
-        if not down or down[0] <= self._clock():
+        if not self._is_down(client):
             return False
+        down = self._down[id(client)]
         w = self._skipped.get(id(client))
         if w is None:
             w = self._skipped[id(client)] = {"type": "engine_skipped", "engine": client.model_id,
@@ -538,10 +549,21 @@ class DialogueTranslator:
 
     def _translate_batch(self, batch, before, after, speaker_hints):
         pending = list(batch)
+        # Every engine marked down: the cloud ones get one more retry cycle for
+        # this batch. Skipping them all would fail every later line for
+        # ENGINE_DOWN_S after a short network drop, or after one failed brief
+        # with a single engine (a lost batch, unlike the brief, a critical retry
+        # or a shortening, has no LLM-free substitute). Ollama stays skipped:
+        # not running / slower than its timeout does not pass in seconds.
+        retry = set()
+        if self.clients and all(self._is_down(c) for c in self.clients):
+            retry = {id(c) for c in self.clients if getattr(c, "name", "") != "ollama"}
+            if retry:
+                self._note("Every translation engine is marked down; trying them again for this batch")
         for client in self.clients:
             if not pending:
                 return
-            if self._skip_if_down(client, "translation"):
+            if id(client) not in retry and self._skip_if_down(client, "translation"):
                 continue
             for attempt in range(self.max_attempts):
                 if not pending:
@@ -656,20 +678,16 @@ class DialogueTranslator:
         part that matters -- speaker gender, aap/tum register, names -- at a
         fraction of the tokens). Failure is non-fatal: batches then rely on
         local context as before."""
-        lines, size = [], 0
-        for t in turns:
-            if not t.source_text.strip():
-                continue
-            line = f"[{t.speaker_id}] {t.source_text.strip()}"
-            size += len(line) + 1
-            if size > max_chars:
-                break
-            lines.append(line)
+        lines = [f"[{t.speaker_id}] {t.source_text.strip()}" for t in turns if t.source_text.strip()]
         speakers = sorted({t.speaker_id for t in turns})
-        user = json.dumps({"transcript": "\n".join(lines), "speaker_ids": speakers}, ensure_ascii=False)
         for client in self.clients:
             if self._skip_if_down(client, "story brief"):
                 continue
+            # Ollama silently cuts the START of a prompt longer than its context
+            # (the instructions with it): it gets only the lines that fit
+            cap = min(max_chars, getattr(client, "max_prompt_chars", 0) or max_chars)
+            user = json.dumps({"transcript": _head_lines(lines, cap), "speaker_ids": speakers},
+                              ensure_ascii=False)
             try:
                 data = parse_json_object(self._call(client, BRIEF_PROMPT, user))
             except Exception as e:
@@ -678,6 +696,9 @@ class DialogueTranslator:
                 continue
             brief = _clean_brief(data, speakers)
             if not brief:
+                # recorded, so "No story brief (see translation warnings)" has a reason
+                self.warnings.append({"type": "story_brief_failed", "engine": client.model_id,
+                                      "detail": "reply had no usable speakers/address/names/summary"})
                 continue
             for k, v in brief.get("names", {}).items():
                 self.name_map.setdefault(k, v)
@@ -721,6 +742,17 @@ class DialogueTranslator:
                                            "reason": "duration_rewrite"})
             return cand
         return None
+
+
+def _head_lines(lines: Sequence[str], max_chars: int) -> str:
+    """The leading whole lines that fit in max_chars (newlines counted)."""
+    out, size = [], 0
+    for line in lines:
+        size += len(line) + 1
+        if size > max_chars:
+            break
+        out.append(line)
+    return "\n".join(out)
 
 
 def _clean_brief(data: Any, speaker_ids: Sequence[str]) -> Dict[str, Any]:
