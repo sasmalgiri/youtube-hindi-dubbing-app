@@ -21,8 +21,10 @@ export default function HomePage() {
         voice: 'hi-IN-MadhurNeural',         // Default: Hindi male voice
         // ── Stage 1: Download (aria2c 16x) ──
         asr_model: 'groq-whisper',           // Stage 3: Groq Whisper cloud → fallback local large-v3
-        // ── Stage 5: Translation — Google (parallel x20, FASTEST free) ──
-        translation_engine: 'google',
+        // ── Stage 5: Translation — Groq (openai/gpt-oss-120b). Google free
+        // translate is IP-blocked (HTTP 429) on this PC since 2026-09-30, so a
+        // Google default failed every job; it stays selectable in Settings.
+        translation_engine: 'groq',
         tts_rate: '+0%',
         mix_original: true,   // keep original background music/SFX (Demucs) under the Hindi voice
         video_slow_to_match: true,

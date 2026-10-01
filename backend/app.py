@@ -272,7 +272,7 @@ class JobCreateRequest(BaseModel):
     target_language: str = "hi"
     voice: str = "hi-IN-SwaraNeural"
     asr_model: str = "groq-whisper"
-    translation_engine: str = "google"
+    translation_engine: str = "groq"   # Google free translate is IP-blocked (429) here
     tts_rate: str = "+0%"
     mix_original: bool = False
     original_volume: float = 0.10
@@ -2578,7 +2578,7 @@ async def create_job_upload(
     source_language: str = Form("en"),
     target_language: str = Form("hi"),
     asr_model: str = Form("groq-whisper"),
-    translation_engine: str = Form("google"),
+    translation_engine: str = Form("groq"),
     tts_rate: str = Form("+0%"),
     mix_original: str = Form("false"),
     original_volume: float = Form(0.10),
@@ -2940,7 +2940,7 @@ async def create_job_with_srt(
     source_language: str = Form("en"),
     target_language: str = Form("hi"),
     asr_model: str = Form("groq-whisper"),
-    translation_engine: str = Form("google"),
+    translation_engine: str = Form("groq"),
     tts_rate: str = Form("+0%"),
     mix_original: str = Form("false"),
     original_volume: float = Form(0.10),
