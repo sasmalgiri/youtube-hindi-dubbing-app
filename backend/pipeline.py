@@ -611,7 +611,8 @@ def _get_meaning_model():
         # Try IndicTrans2 first
         try:
             from IndicTransToolkit.processor import IndicProcessor
-            model_name = "ai4bharat/indictrans2-en-indic-1B"
+            # Same model id as the dialogue path (the 200M repo is gated for this account).
+            model_name = os.environ.get("INDICTRANS2_MODEL", "ai4bharat/indictrans2-en-indic-1B")
             print(f"[MeaningModel] Loading {model_name}...", flush=True)
             _meaning_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             _meaning_model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -1383,6 +1384,60 @@ def _get_spacy_nlp():
         return None
 
 
+# ── Numbered LLM replies ──────────────────────────────────────────────────────
+# Batch translators send "1. line", "2. line", ... and must read the reply back
+# BY NUMBER: an LLM that merges, splits or skips one line otherwise shifts every
+# later translation onto the wrong segment (wrong timing, wrong speaker) and
+# leaves the last line(s) of the batch in English.
+_NUMBERED_LINE = re.compile(r"\s*(\d+)[\.:\)\-]\s*(?:\[[^\]]*\]\s*)?(.*)")
+
+
+class NumberedReplyMismatch(ValueError):
+    """A numbered LLM reply that does not number exactly 1..N."""
+
+    def __init__(self, problem: str, lines: List[str], trusted: bool):
+        super().__init__(f"reply does not match the batch ({problem})")
+        self.lines = lines        # by-number lines it did return ('' elsewhere)
+        self.trusted = trusted    # False: repeated/extra numbers, alignment unknown
+
+
+def _check_numbered_reply(text: str, expected_count: int,
+                          sources: Optional[List[str]] = None):
+    """Read a numbered LLM reply back by number -> (lines, problem, trusted).
+
+    lines[i] is the text numbered i+1 ('' when the reply lacks it); numbers
+    outside 1..N are ignored and the first of a repeated number wins.
+    problem is '' when the reply numbers exactly 1..N, once each, all with
+    text, else what is wrong ("missing 7, 12"). A line whose source (when
+    given) has no letters ("♪", "...") may come back empty. trusted is False
+    when a number repeats or falls outside 1..N: a split line usually
+    renumbers everything after it, so no line of that reply can be placed.
+    """
+    from collections import Counter
+    found = []
+    for raw in (text or "").strip().split("\n"):
+        m = _NUMBERED_LINE.match(raw.strip())
+        if m:
+            found.append((int(m.group(1)), m.group(2).strip()))
+    by_num: Dict[int, str] = {}
+    for n, line in found:
+        if 1 <= n <= expected_count:
+            by_num.setdefault(n, line)
+    lines = [by_num.get(i, "") for i in range(1, expected_count + 1)]
+    counts = Counter(n for n, _ in found)
+    missing = [i + 1 for i, line in enumerate(lines)
+               if not line and (sources is None or any(c.isalpha() for c in sources[i] or ""))]
+    repeated = sorted(n for n, k in counts.items() if k > 1 and 1 <= n <= expected_count)
+    extra = sorted(n for n in counts if not 1 <= n <= expected_count)
+
+    def _nums(ns: List[int]) -> str:
+        return ", ".join(map(str, ns[:8])) + (" ..." if len(ns) > 8 else "")
+
+    problem = "; ".join(f"{label} {_nums(ns)}" for label, ns in
+                        (("missing", missing), ("repeated", repeated), ("unexpected", extra)) if ns)
+    return lines, problem, not (repeated or extra)
+
+
 class Pipeline:
     """Dubbing pipeline with translation and callback-based progress."""
 
@@ -1419,6 +1474,8 @@ class Pipeline:
         #   missing segment audio, shortened retry text, failed separation, ...
         self.result_warnings: List[str] = []
         self.result_status: str = "completed"
+        # Segments a batch translator left in English (see _fill_numbered_batch)
+        self._english_left: List[Dict] = []
         self._whisper_audio = None  # Lightweight 16kHz mono audio for transcription
         self._has_nvenc: Optional[bool] = None  # Cached NVENC availability
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
@@ -5783,8 +5840,11 @@ class Pipeline:
                     response = result_holder[0]
                     result_text = (response.text or "").strip()
 
-                    # Parse numbered results
-                    simplified = self._parse_numbered_translations(result_text, len(batch))
+                    # Parse numbered results. A reply that skips, merges or
+                    # splits a line raises (retry): its lines could replace the
+                    # wrong segment's English. After 3 tries the batch keeps
+                    # its original (correct) English.
+                    simplified = self._parse_numbered_strict(result_text, batch)
                     for i, seg in enumerate(batch):
                         if simplified[i] and simplified[i].strip():
                             seg["text_original_complex"] = seg.get("text", "")
@@ -6163,6 +6223,7 @@ class Pipeline:
                       flush=True)
                 masked_count = 0
 
+        self._english_left = []
         try:
             self._dispatch_translation_engine(segments)
         finally:
@@ -6173,6 +6234,19 @@ class Pipeline:
                     print(f"[KEEP-SUBJ] restore pass failed: {e} — translated text "
                           f"may contain placeholder tokens like __KEEP_SUBJ_0__",
                           flush=True)
+
+        # Same rule as the Google engine: a few lines left in English are
+        # reported (result_warnings); this many means the engine and the
+        # one-line fallback are both down. Stop before TTS voices English with
+        # the Hindi voice for hours and the job calls it a dub.
+        left = len(self._english_left)
+        if left > max(2, 0.05 * len(segments)):
+            raise RuntimeError(
+                f"Translation failed for {left}/{len(segments)} lines: the "
+                f"'{self.cfg.translation_engine}' engine did not return them and the one-line "
+                f"fallback (Ollama, then Google) could not translate them either. Check the "
+                f"engine's API key/quota or start Ollama, or pick another engine in "
+                f"Advanced Settings -> Translation.")
 
         # Hindi verbs agree with the speaker's gender; MT defaults to masculine.
         self._apply_speaker_gender_grammar(segments)
@@ -6352,27 +6426,24 @@ class Pipeline:
             )
 
             retries = 3
-            success = False
+            best = None   # by-number lines; a reply that skips a line is re-requested
             for attempt in range(retries):
                 try:
                     response = client.models.generate_content(
                         model=GEMINI_LLM_MODEL, contents=prompt)
-                    translations = self._parse_numbered_translations(response.text, len(batch))
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
-                    success = True
+                    best = self._parse_numbered_strict(response.text, batch)
                     break
                 except Exception as e:
+                    best = self._better_partial(best, e)
                     if attempt < retries - 1:
                         wait = 2 * (attempt + 1)
                         self._report("translate", 0.1 + 0.8 * (batch_idx / total_batches),
-                                     f"Rate limited, retrying in {wait}s...")
+                                     f"Gemini batch {batch_idx + 1}: {str(e)[:80] or type(e).__name__}"
+                                     f" — retrying in {wait}s...")
                         time.sleep(wait)
-
-            if not success:
-                self._report("translate", 0.1, "Gemini failed, using Google Translate for batch...")
-                for seg in batch:
-                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
+            # Lines no reply gave are translated one by one (and reported).
+            self._fill_numbered_batch(batch, best, "Gemini",
+                                      0.1 + 0.9 * (batch_idx / total_batches))
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches}")
@@ -6430,6 +6501,8 @@ class Pipeline:
             worker_client = genai.Client(api_key=worker_key)
             prompt = _build_prompt(batch)
 
+            best = None   # by-number lines; a reply that skips a line is re-requested
+            ok = False
             for attempt in range(3):
                 try:
                     import threading as _th
@@ -6449,42 +6522,38 @@ class Pipeline:
                     if _error[0]:
                         raise _error[0]
 
-                    translations = self._parse_numbered_translations(_result[0].text, len(batch))
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
-                    return ("gemma4", True)
-                except Exception:
+                    best = self._parse_numbered_strict(_result[0].text, batch)
+                    ok = True
+                    break
+                except Exception as e:
+                    best = self._better_partial(best, e)
                     _gemini_keys.report_rate_limit(worker_key)
                     if attempt < 2:
                         worker_key = get_gemini_key() or api_key
                         worker_client = genai.Client(api_key=worker_key)
                         time.sleep(2)
-            # Final fallback: Google Translate
-            for seg in batch:
-                seg["text_translated"] = self._translate_single_fallback(seg["text"])
-            return ("fallback", False)
+            # Lines no reply gave: one by one (Ollama/Google), reported.
+            self._fill_numbered_batch(batch, best, "Gemma 4",
+                                      0.1 + 0.9 * (completed[0] / total_batches))
+            return ("gemma4", True) if ok else ("fallback", False)
 
         # Groq worker
         def translate_groq(batch_idx, batch):
             groq_key = get_groq_key()
             if not groq_key:
-                for seg in batch:
-                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
+                self._fill_numbered_batch(batch, None, "Groq (no key)",
+                                          0.1 + 0.9 * (completed[0] / total_batches))
                 return ("fallback", False)
 
-            prompt = _build_prompt(batch)
+            translations = None
             try:
                 translations = self._translate_batch_openai_compat(
                     batch, *self.TURBO_ENGINE_CONFIG.get("Groq", ("", "")), groq_key, "Groq")
-                if translations:
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
-                    return ("groq", True)
             except Exception:
                 pass
-            for seg in batch:
-                seg["text_translated"] = self._translate_single_fallback(seg["text"])
-            return ("fallback", False)
+            self._fill_numbered_batch(batch, translations, "Groq",
+                                      0.1 + 0.9 * (completed[0] / total_batches))
+            return ("groq", True) if translations else ("fallback", False)
 
         # Split batches: 70% Gemma 4, 30% Groq
         gemma_count = int(total_batches * 0.70) if num_groq > 0 else total_batches
@@ -6528,7 +6597,7 @@ class Pipeline:
             user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
 
             retries = 3
-            success = False
+            best = None   # by-number lines; a reply that skips a line is re-requested
             for attempt in range(retries):
                 try:
                     response = client.chat.completions.create(
@@ -6541,33 +6610,36 @@ class Pipeline:
                         max_tokens=8192,
                     )
                     result_text = response.choices[0].message.content
-                    translations = self._parse_numbered_translations(result_text, len(batch))
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
-                    success = True
+                    best = self._parse_numbered_strict(result_text, batch)
                     break
                 except Exception as e:
+                    best = self._better_partial(best, e)
                     if attempt < retries - 1:
                         wait = 2 * (attempt + 1)
                         self._report("translate", 0.1 + 0.8 * (batch_idx / total_batches),
-                                     f"Groq rate limited, retrying in {wait}s...")
+                                     f"Groq batch {batch_idx + 1}: {str(e)[:80] or type(e).__name__}"
+                                     f" — retrying in {wait}s...")
                         time.sleep(wait)
-
-            if not success:
-                self._report("translate", 0.1, "Groq failed, using Google Translate for batch...")
-                for seg in batch:
-                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
+            # Lines no reply gave are translated one by one (and reported).
+            self._fill_numbered_batch(batch, best, "Groq",
+                                      0.1 + 0.9 * (batch_idx / total_batches))
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (Groq)")
 
     def _translate_batch_openai_compat(self, batch, api_url, api_key, model, engine_name):
-        """Translate a batch using any OpenAI-compatible API. Returns translations list or None."""
+        """Translate a batch using any OpenAI-compatible API.
+
+        Returns the by-number translations, or None. A reply that skips or
+        splits a line is re-requested; when the retries run out the most
+        complete trustworthy reply is returned with '' for the lines it
+        lacks (callers fill those via _fill_numbered_batch)."""
         import requests as _requests
         lines = [f"{i+1}. {seg['text']}" for i, seg in enumerate(batch)]
         system_msg = self._get_translation_prompt("system")
         user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
 
+        best = None
         for attempt in range(3):
             try:
                 resp = _requests.post(
@@ -6584,18 +6656,21 @@ class Pipeline:
                     },
                     timeout=60,
                 )
-                if resp.status_code == 429:
+                # Key rotation is Groq's: a SambaNova retry must keep its own key.
+                if resp.status_code == 429 and engine_name == "Groq":
                     _groq_keys.report_rate_limit(api_key)
-                    api_key = get_groq_key()  # Switch to next key
+                    api_key = get_groq_key() or api_key  # Switch to next key
                 resp.raise_for_status()
-                return self._parse_numbered_translations(
-                    resp.json()["choices"][0]["message"]["content"], len(batch))
-            except Exception:
+                return self._parse_numbered_strict(
+                    resp.json()["choices"][0]["message"]["content"], batch)
+            except Exception as e:
+                best = self._better_partial(best, e)
                 if attempt < 2:
-                    _groq_keys.report_rate_limit(api_key)
-                    api_key = get_groq_key()  # Try next key on retry
+                    if engine_name == "Groq":
+                        _groq_keys.report_rate_limit(api_key)
+                        api_key = get_groq_key() or api_key  # Try next key on retry
                     time.sleep(1)
-        return None
+        return best
 
     # Engine configs for OpenAI-compatible APIs (all using Llama 3.3 70B)
     TURBO_ENGINE_CONFIG = {
@@ -6615,13 +6690,9 @@ class Pipeline:
             batch = segments[start:end]
 
             translations = self._translate_batch_openai_compat(batch, url, api_key, model, "SambaNova")
-            if translations:
-                for i, seg in enumerate(batch):
-                    seg["text_translated"] = translations[i] if translations[i] else seg["text"]
-            else:
-                self._report("translate", 0.1, "SambaNova failed, using Google Translate for batch...")
-                for seg in batch:
-                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
+            # Lines no reply gave are translated one by one (and reported).
+            self._fill_numbered_batch(batch, translations, "SambaNova",
+                                      0.1 + 0.9 * (batch_idx / total_batches))
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (SambaNova)")
@@ -6660,9 +6731,10 @@ class Pipeline:
             for fut in as_completed(futures):
                 batch_idx, batch, engine_name = futures[fut]
                 translations = fut.result()
+                _prog = 0.1 + 0.9 * (completed / total_batches)
                 if translations:
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
+                    # Lines the reply lacks: one by one (and reported).
+                    self._fill_numbered_batch(batch, translations, engine_name, _prog)
                 else:
                     # Retry with another Turbo engine (Groq if SambaNova failed, vice versa)
                     retry_success = False
@@ -6675,16 +6747,14 @@ class Pipeline:
                         retry_result = self._translate_batch_openai_compat(
                             batch, url, retry_key, model, retry_name)
                         if retry_result:
-                            for i, seg in enumerate(batch):
-                                seg["text_translated"] = retry_result[i] if retry_result[i] else seg["text"]
+                            self._fill_numbered_batch(batch, retry_result, retry_name, _prog)
                             retry_success = True
                             break
                     if not retry_success:
-                        # All Turbo engines failed — last resort: Google Translate
+                        # All Turbo engines failed — last resort: line by line (Ollama/Google)
                         self._report("translate", 0.1,
-                                     f"All Turbo engines failed batch {batch_idx+1}, using Google Translate...")
-                        for seg in batch:
-                            seg["text_translated"] = self._translate_single_fallback(seg["text"])
+                                     f"All Turbo engines failed batch {batch_idx+1}, translating it line by line...")
+                        self._fill_numbered_batch(batch, None, "TURBO", _prog)
 
                 completed += 1
                 self._report("translate", 0.1 + 0.9 * (completed / total_batches),
@@ -6764,7 +6834,10 @@ class Pipeline:
 
     def _turbo_refine_batch(self, batch, api_url, api_key, model, engine_name,
                             system_msg, user_msg):
-        """Send a refinement batch to an OpenAI-compatible API. Returns list or None."""
+        """Send a refinement batch to an OpenAI-compatible API. Returns the
+        by-number refined lines, or None (keep the current lines): a reply
+        that skips, merges or splits a line is never applied, because its
+        lines could land on the wrong segments."""
         import requests as _requests
         retries = 3
         for attempt in range(retries):
@@ -6786,7 +6859,7 @@ class Pipeline:
                 )
                 resp.raise_for_status()
                 text = resp.json()["choices"][0]["message"]["content"]
-                return self._parse_numbered_translations(text, len(batch))
+                return self._parse_numbered_strict(text, batch, key="text_translated")
             except Exception as e:
                 if attempt < retries - 1:
                     time.sleep(2 * (attempt + 1))
@@ -6842,6 +6915,7 @@ class Pipeline:
             lines = [f"{i+1}. {seg['text']}" for i, seg in enumerate(batch)]
             user_msg = self._get_translation_prompt("user_prefix") + "\n".join(lines)
 
+            translations = None
             try:
                 resp = _requests.post("http://localhost:11434/api/chat", json={
                     "model": model,
@@ -6853,13 +6927,14 @@ class Pipeline:
                     "options": {"temperature": 0.7},
                 }, timeout=120)
                 result_text = resp.json().get("message", {}).get("content", "")
-                translations = self._parse_numbered_translations(result_text, len(batch))
-                for i, seg in enumerate(batch):
-                    seg["text_translated"] = translations[i] if translations[i] else seg["text"]
+                translations = self._parse_numbered_strict(result_text, batch)
             except Exception as e:
-                self._report("translate", 0.1, f"Ollama failed for batch: {e}, using Google Translate...")
-                for seg in batch:
-                    seg["text_translated"] = self._translate_single_fallback(seg["text"])
+                translations = self._better_partial(None, e)
+                self._report("translate", 0.1 + 0.9 * (batch_idx / total_batches),
+                             f"Ollama batch {batch_idx + 1}: {str(e)[:80] or type(e).__name__}")
+            # Lines the reply lacks: one by one (and reported).
+            self._fill_numbered_batch(batch, translations, f"Ollama ({model})",
+                                      0.1 + 0.9 * (batch_idx / total_batches))
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (Ollama: {model})")
@@ -6883,6 +6958,7 @@ class Pipeline:
 
             retries = 3
             success = False
+            best = None   # by-number lines; a reply that skips a line is re-requested
             for attempt in range(retries):
                 try:
                     response = client.chat.completions.create(
@@ -6894,20 +6970,23 @@ class Pipeline:
                         temperature=0.3,
                     )
                     text = response.choices[0].message.content or ""
-                    translations = self._parse_numbered_translations(text, len(batch))
-                    for i, seg in enumerate(batch):
-                        seg["text_translated"] = translations[i] if translations[i] else seg["text"]
+                    best = self._parse_numbered_strict(text, batch)
                     success = True
                     break
                 except Exception as e:
+                    best = self._better_partial(best, e)
                     if attempt < retries - 1:
                         wait = 2 * (attempt + 1)
                         self._report("translate", 0.1 + 0.8 * (batch_idx / total_batches),
-                                     f"GPT-4o rate limited, retrying in {wait}s...")
+                                     f"GPT-4o batch {batch_idx + 1}: {str(e)[:80] or type(e).__name__}"
+                                     f" — retrying in {wait}s...")
                         time.sleep(wait)
 
-            if not success:
-                # Fall back to Groq > Gemini > Google Translate
+            if success:
+                self._fill_numbered_batch(batch, best, "GPT-4o",
+                                          0.1 + 0.9 * (batch_idx / total_batches))
+            else:
+                # Fall back to Groq > Gemini > line by line (Ollama/Google)
                 groq_key = get_groq_key()
                 gemini_key = get_gemini_key()
                 if groq_key:
@@ -6921,8 +7000,8 @@ class Pipeline:
                         seg["text_translated"] = seg.get("text", "")
                     self._translate_segments_gemini(batch, gemini_key)
                 else:
-                    for seg in batch:
-                        seg["text_translated"] = self._translate_single_fallback(seg["text"])
+                    self._fill_numbered_batch(batch, best, "GPT-4o",
+                                              0.1 + 0.9 * (batch_idx / total_batches))
 
             self._report("translate", 0.1 + 0.9 * ((batch_idx + 1) / total_batches),
                          f"Translated batch {batch_idx + 1}/{total_batches} (GPT-4o)")
@@ -6981,6 +7060,7 @@ class Pipeline:
                 + "\n".join(lines)
             )
 
+            best = None   # by-number lines; a reply that skips a line is re-requested
             for attempt in range(3):
                 try:
                     response = client.chat.completions.create(
@@ -6990,17 +7070,22 @@ class Pipeline:
                         temperature=0.3,
                     )
                     result_text = response.choices[0].message.content
-                    translations = self._parse_numbered_translations(result_text, len(batch))
+                    translations = self._parse_numbered_strict(result_text, batch)
                     for i, seg in enumerate(batch):
                         if translations[i]:
                             seg["text_translated"] = translations[i]
                     return True
                 except Exception as e:
+                    best = self._better_partial(best, e)
                     _cerebras_keys.report_rate_limit(worker_key)
                     if attempt < 2:
                         worker_key = get_cerebras_key() or api_key
                         client = Cerebras(api_key=worker_key)
                         time.sleep(2)
+            # Keep the lines the best reply did give; the rest count as missing below.
+            for i, seg in enumerate(batch):
+                if best and best[i]:
+                    seg["text_translated"] = best[i]
             return False
 
         keys_label = f", {num_keys} keys" if num_keys > 1 else ""
@@ -7018,10 +7103,14 @@ class Pipeline:
                              f"Cerebras: {completed[0]}/{total_batches} batches")
 
         # Check if we got translations for all segments
-        missing = sum(1 for s in segments if not s.get("text_translated"))
-        if missing > len(segments) * 0.1:  # >10% missing → failure
-            print(f"[Cerebras] {missing}/{len(segments)} segments missing — fallback needed", flush=True)
+        missing = [s for s in segments if not s.get("text_translated")]
+        if len(missing) > len(segments) * 0.1:  # >10% missing → failure
+            print(f"[Cerebras] {len(missing)}/{len(segments)} segments missing — fallback needed", flush=True)
             return False
+        if missing:
+            # A few lines no reply gave: one by one instead of silently
+            # voicing their English text (they had no text_translated at all).
+            self._fill_numbered_batch(missing, None, "Cerebras", 0.96)
         return True
 
     def _translate_segments_google(self, segments):
@@ -7128,11 +7217,14 @@ class Pipeline:
         # Untranslated lines would be voiced in English by the Hindi voice and
         # the job would still say "Complete" — fail loudly instead.
         if failed and len(failed) > max(2, 0.05 * total):
-            why = ("Google is rate-limiting this PC ('Too many requests')" if rate_limited[0]
-                   else "Google returned errors")
+            # Waiting does not help: Google's free endpoint has answered every
+            # request from this PC with 429 since 2026-09-30, so point at an
+            # engine that works instead of "retry later".
+            why = ("Google's free endpoint is blocking this PC ('Too many requests')"
+                   if rate_limited[0] else "Google returned errors")
             raise RuntimeError(
                 f"Google Translate failed for {len(failed)}/{total} segments — {why}. "
-                f"Wait 30-60 min and retry, or pick another Translation engine (Groq/Gemini) in Settings.")
+                f"Pick Groq or Gemini in Advanced Settings -> Translation.")
         if failed:
             self._report("translate", 0.97,
                          f"Google Translate: {len(failed)} segment(s) left untranslated after retries")
@@ -7260,7 +7352,9 @@ class Pipeline:
                         response = client.models.generate_content(
                             model=GEMINI_LLM_MODEL,
                             contents=polish_system + "\n\n" + user_msg)
-                        polished = self._parse_numbered_translations(response.text, len(batch))
+                        # A reply that skips/merges a line is not applied (next engine).
+                        polished = self._parse_numbered_strict(response.text, batch,
+                                                               key="text_translated")
                     except Exception:
                         continue
                 else:
@@ -7284,8 +7378,9 @@ class Pipeline:
                             timeout=60,
                         )
                         resp.raise_for_status()
-                        polished = self._parse_numbered_translations(
-                            resp.json()["choices"][0]["message"]["content"], len(batch))
+                        polished = self._parse_numbered_strict(
+                            resp.json()["choices"][0]["message"]["content"], batch,
+                            key="text_translated")
                     except Exception:
                         continue
 
@@ -7446,7 +7541,8 @@ class Pipeline:
                             r = client.models.generate_content(
                                 model=GEMINI_LLM_MODEL,
                                 contents=polish_system + "\n\n" + user_msg)
-                            return self._parse_numbered_translations(r.text, len(batch))
+                            # A reply that skips/merges a line is not a "good result".
+                            return self._parse_numbered_strict(r.text, batch, key="text_translated")
                         except Exception:
                             return None
                     else:
@@ -7471,8 +7567,9 @@ class Pipeline:
                                 timeout=60,
                             )
                             resp.raise_for_status()
-                            return self._parse_numbered_translations(
-                                resp.json()["choices"][0]["message"]["content"], len(batch))
+                            return self._parse_numbered_strict(
+                                resp.json()["choices"][0]["message"]["content"], batch,
+                                key="text_translated")
                         except Exception:
                             return None
 
@@ -7565,22 +7662,79 @@ class Pipeline:
 
     @staticmethod
     def _parse_numbered_translations(text: str, expected_count: int) -> List[str]:
-        """Parse numbered translation output from Gemini."""
-        lines = text.strip().split("\n")
-        translations = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # Match: "1. translation" or "1) translation" or "1: translation" or "1- translation"
-            match = re.match(r'\s*\d+[\.:\)\-]\s*(?:\[[^\]]*\]\s*)?(.*)', line)
-            if match:
-                trans = match.group(1).strip()
-                translations.append(trans)
-        # Pad with empty strings if Gemini returned fewer lines
-        while len(translations) < expected_count:
-            translations.append("")
-        return translations[:expected_count]
+        """Numbered LLM output ("1. x", "1) x", "1: x", "1- x") read back BY
+        NUMBER: entry i is the line numbered i+1, '' when the reply lacks it.
+        Appending matches in reply order put every line after a merged or
+        skipped one onto the wrong segment."""
+        return _check_numbered_reply(text, expected_count)[0]
+
+    @staticmethod
+    def _parse_numbered_strict(text: str, batch: List[Dict], key: str = "text") -> List[str]:
+        """_parse_numbered_translations for a batch whose lines were seg[key];
+        raises NumberedReplyMismatch unless the reply numbers exactly 1..N with
+        text on every line, so the caller's retry re-requests the batch."""
+        lines, problem, trusted = _check_numbered_reply(
+            text, len(batch), [seg.get(key) or "" for seg in batch])
+        if problem:
+            raise NumberedReplyMismatch(problem, lines, trusted)
+        return lines
+
+    @staticmethod
+    def _better_partial(best: Optional[List[str]], exc: Exception) -> Optional[List[str]]:
+        """After a failed attempt keep the most complete reply whose numbering
+        can be trusted; its lines are used once the retries run out."""
+        if isinstance(exc, NumberedReplyMismatch) and exc.trusted:
+            if best is None or sum(1 for x in exc.lines if x) > sum(1 for x in best if x):
+                return exc.lines
+        return best
+
+    def _fill_numbered_batch(self, batch: List[Dict], lines: Optional[List[str]],
+                             engine: str, progress: float) -> None:
+        """Write a batch's by-number translations onto its segments.
+
+        Lines the engine never returned (after its retries) are translated one
+        at a time by _translate_single_fallback (Ollama, then Google). A line
+        that is still English keeps its English text so the dub has no hole,
+        but it is listed in result_warnings, never passed off as Hindi.
+        """
+        lines = list(lines or [])
+        todo = []
+        for i, seg in enumerate(batch):
+            line = (lines[i] if i < len(lines) else "").strip()
+            text = seg.get("text", "")
+            if line:
+                seg["text_translated"] = line
+            elif not any(c.isalpha() for c in text):
+                seg["text_translated"] = text   # "♪", "...": nothing to translate
+            else:
+                todo.append(seg)
+        if not todo:
+            return
+        self._report("translate", progress,
+                     f"{engine} did not return {len(todo)} line(s) — translating them one by one "
+                     f"(Ollama/Google, no context)...")
+        left = []
+        for k, seg in enumerate(todo, 1):
+            self._check_cancelled()
+            text = seg.get("text", "")
+            out = (self._translate_single_fallback(text) or "").strip()
+            if out and out != text.strip():
+                seg["text_translated"] = out
+            else:
+                seg["text_translated"] = text
+                left.append(seg)
+            if k % 5 == 0 or k == len(todo):
+                self._report("translate", progress,
+                             f"{engine}: one-by-one fallback {k}/{len(todo)} line(s)")
+        if len(todo) > len(left):
+            self.result_warnings.append(
+                f"{engine} did not return {len(todo) - len(left)} line(s); they were translated "
+                f"one by one by the Ollama/Google fallback (no dialogue context)")
+        for seg in left:
+            self._english_left.append(seg)
+            self.result_warnings.append(
+                f"segment @ {seg.get('start', 0):.1f}s left in ENGLISH ({engine} did not return "
+                f"it and the Ollama/Google fallback failed): {seg.get('text', '')[:60]!r}")
 
     # ── Step 5: Continuous TTS ────────────────────────────────────────────
     def _tts_continuous(self, translated_text: str) -> Path:

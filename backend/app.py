@@ -264,6 +264,9 @@ class Job:
     result_status: Optional[str] = None
     status_reasons: List[str] = field(default_factory=list)
     report_path: Optional[str] = None    # report.md of a hindi_dialogue job
+    # Where the finished job's SRT now lives (the saved folder): the job's
+    # work folder is deleted after saving, so the old path 404s.
+    subtitles_path: Optional[str] = None
 
 
 class JobCreateRequest(BaseModel):
@@ -476,6 +479,13 @@ app.mount("/static/jobs", StaticFiles(directory=str(OUTPUTS)), name="job-files")
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _english_source(lang: Optional[str]) -> str:
+    """The English->Hindi lock, enforced here as well as in the UI: an
+    'auto' (or empty) source language means English. Auto-detection is not
+    offered -- a misdetected source would translate the wrong way."""
+    return "en" if (lang or "auto") == "auto" else lang
+
+
 def _calc_overall(step: str, step_progress: float) -> float:
     """Calculate overall progress from current step and its progress."""
     overall = 0.0
@@ -534,6 +544,7 @@ def _save_to_titled_folder(job: Job):
     if srt_src.exists():
         srt_name = f"{title} - {lang.upper()} Dubbed.srt"
         shutil.move(str(srt_src), str(folder / srt_name))
+        job.subtitles_path = str(folder / srt_name)   # served by /srt after cleanup
 
     # Move manual review queue if present (must happen before job_dir cleanup)
     mrq_src = OUTPUTS / job.id / "manual_review_queue.json"
@@ -816,6 +827,11 @@ def _apply_legacy_outcome(job: Job, pipeline) -> None:
     "Complete"."""
     warnings = list(getattr(pipeline, "result_warnings", None) or [])
     status = getattr(pipeline, "result_status", "completed") if pipeline is not None else "completed"
+    _apply_outcome(job, status, warnings)
+
+
+def _apply_outcome(job: Job, status: str, warnings: List[str]) -> None:
+    """Honest result status + reasons on the job, label appended to its message."""
     if not warnings and status == "completed":
         return
     if status == "completed":
@@ -869,6 +885,51 @@ def _resolve_dialogue_modules(req: JobCreateRequest, source_kind: str, files: Di
         overrides.setdefault("params", {})["num_speakers"] = int(req.dialogue_num_speakers)
     return resolve(getattr(req, "dialogue_preset", "") or DEFAULT_PRESET, overrides,
                    ctx={"source_kind": source_kind, "files": files}, probe=_dialogue_probe())
+
+
+def _dialogue_speakers(speakers_json: Path, providers: List[str],
+                       turns: Optional[List[Any]] = None) -> List[Dict]:
+    """job.speakers (the job page's Characters card) from a dialogue job's
+    speakers.json, in the classic pipeline's shape: {speaker, gender, voice,
+    voice_label, seconds, reused}.
+
+    The voice is the speaker's binding for the first TTS provider that has
+    one. Like a classic voice slot, "voice" carries the pitch variant, so
+    Madhur and Madhur +20Hz count as two voices on the card. The UNKNOWN
+    catch-all is listed only when lines were actually voiced by it.
+    """
+    from dubbing.dialogue.contracts import CATEGORY_FEMALE, UNKNOWN_SPEAKER
+    from dubbing.hindi_voices import slot_label
+    try:
+        data = json.loads(Path(speakers_json).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"[hindi_dialogue] no speaker list for the job page ({e})", flush=True)
+        return []
+    # UNKNOWN has no diarized speech of its own but voices every unattributed
+    # line (all of them when speaker detection is off): count its turn time.
+    turn_s: Dict[str, float] = {}
+    for t in turns or []:
+        turn_s[t.speaker_id] = (turn_s.get(t.speaker_id, 0.0)
+                                + max(0.0, float(t.source_end) - float(t.source_start)))
+    out = []
+    for sid, rec in (data.get("speakers") or {}).items():
+        seconds = float(rec.get("total_speech_s") or 0.0) or turn_s.get(sid, 0.0)
+        if sid == UNKNOWN_SPEAKER and seconds <= 0:
+            continue   # placeholder that no line used
+        pv = rec.get("provider_voices") or {}
+        b = next((pv[p] for p in providers if pv.get(p)), {})
+        voice = b.get("voice") or ""
+        slot = f"{voice}|{b['pitch']}" if voice and b.get("pitch") else voice
+        out.append({
+            "speaker": sid,
+            "gender": "female" if rec.get("voice_category") == CATEGORY_FEMALE else "male",
+            "voice": slot,
+            "voice_label": slot_label(slot),
+            "seconds": round(seconds, 1),
+            "reused": bool(b.get("indistinguishable_reuse")),
+        })
+    out.sort(key=lambda d: (-d["seconds"], d["speaker"]))
+    return out
 
 
 def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
@@ -930,8 +991,22 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         modules=resolution.to_dict(),
         **resolution.config,
     )
-    res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
-                       cancel_check=job.cancel_event.is_set)
+    # Every legacy Pipeline the dialogue path creates (link download, local
+    # Whisper) becomes job.pipeline_ref, so Cancel kills its yt-dlp/ffmpeg
+    # children at once instead of waiting for them to finish. (Checked by
+    # name so this works whichever side of that orchestrator change merges first.)
+    import inspect
+    run_kw: Dict[str, Any] = {}
+    if "on_legacy_pipeline" in inspect.signature(run_dialogue).parameters:
+        run_kw["on_legacy_pipeline"] = lambda p: setattr(job, "pipeline_ref", p)
+    else:
+        print("[hindi_dialogue] orchestrator has no on_legacy_pipeline hook: Cancel cannot "
+              "stop its download/ASR subprocesses early", flush=True)
+    try:
+        res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
+                           cancel_check=job.cancel_event.is_set, **run_kw)
+    finally:
+        job.pipeline_ref = None   # run over: nothing left to kill; /transcript shows the turns
 
     job.result_status = res.status
     job.status_reasons = list(res.reasons)
@@ -939,6 +1014,18 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
     job.segments = [{"start": t.source_start, "end": t.source_end, "text": t.source_text,
                      "text_translated": t.speech_text, "speaker_id": t.speaker_id,
                      "turn_id": t.turn_id} for t in res.turns]
+    # Characters card: who speaks, detected gender, the voice each one got.
+    job.speakers = _dialogue_speakers(out_dir / "speakers.json",
+                                      list(cfg.tts_providers or []), res.turns)
+    if not job.video_title:
+        # The acquire step saves the downloaded video's real title.
+        try:
+            lines = (work_dir / "source_title.txt").read_text(encoding="utf-8").strip().splitlines()
+            job.video_title = lines[0].strip() if lines else ""
+        except (OSError, ValueError):
+            pass
+    if not job.video_title and (job.source_url or "").startswith("upload:"):
+        job.video_title = Path(job.source_url[len("upload:"):]).stem   # uploaded file's name
     if not job.video_title:
         job.video_title = (Path(req.url).stem if not re.match(r"^https?://", req.url or "")
                            else req.url.rstrip("/").split("/")[-1].split("=")[-1]) or "Untitled"
@@ -953,6 +1040,12 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
             job.saved_video = str(folder / res.output_video.name)
     except Exception as e:
         print(f"[hindi_dialogue] could not copy outputs to {folder}: {e}", flush=True)
+    # Subtitles button: the saved copy (outlives the job folder), else dialogue_out's.
+    if res.subtitles:
+        saved_srt = folder / res.subtitles.name
+        srt = saved_srt if saved_srt.exists() else res.subtitles
+        if srt.exists():
+            job.subtitles_path = str(srt)
 
     if res.output_video and res.output_video.exists():
         job.result_path = res.output_video
@@ -1007,6 +1100,14 @@ def _run_job(job: Job, req: JobCreateRequest):
     req.use_google_tts     = False
     req.use_coqui_xtts     = False
     req.use_fish_speech    = False
+
+    # ── SOURCE LANGUAGE LOCK: English ──
+    # Before any mode dispatch: every path below (classic, split, dialogue,
+    # new/hybrid) reads req.source_language, and 'auto' must never reach them.
+    if (req.source_language or "auto") == "auto":
+        print(f"[Route] source_language={req.source_language!r} -> 'en' (English source lock)",
+              flush=True)
+    req.source_language = _english_source(req.source_language)
 
     # ── VOICE SELECTION: auto per language + user override ──
     # If user explicitly picked a voice in the UI → honor their choice.
@@ -1087,7 +1188,19 @@ def _run_job(job: Job, req: JobCreateRequest):
         # themselves and don't want the classic Pipeline invoked per-part.
         _split_skipped_for = ("oneflow", "srtdub")
         _current_mode = getattr(req, 'pipeline_mode', 'classic')
-        if req.split_duration > 0 and _current_mode not in _split_skipped_for:
+        # An uploaded English transcript covers the WHOLE video, so it can
+        # only be dubbed in one pass (run_from_source_srt below); split mode
+        # would transcribe each part and silently ignore it. new/hybrid
+        # transcribe the audio themselves and never read it: say so.
+        _dub_from_transcript = bool((getattr(req, "transcript_srt_content", "") or "").strip())
+        if _dub_from_transcript and _current_mode in ("new", "hybrid"):
+            _note = (f"the uploaded transcript is not used by pipeline_mode={_current_mode} "
+                     f"(it transcribes the audio itself); pick classic to dub from the transcript")
+            print(f"[Route] {_note}", flush=True)
+            job.events.append({"type": "note", "message": _note})
+            _dub_from_transcript = False
+        if (req.split_duration > 0 and _current_mode not in _split_skipped_for
+                and not _dub_from_transcript):
             _setup_status(f"Split mode: video will be processed in "
                           f"{req.split_duration}-minute chunks", 0.30)
             _run_job_split(job, req, voice)
@@ -1095,6 +1208,11 @@ def _run_job(job: Job, req: JobCreateRequest):
         if req.split_duration > 0 and _current_mode in _split_skipped_for:
             print(f"[Route] split_duration={req.split_duration} ignored — "
                   f"pipeline_mode={_current_mode} has its own assembly", flush=True)
+        elif req.split_duration > 0 and _dub_from_transcript:
+            _note = (f"split_duration={req.split_duration} ignored: the uploaded transcript "
+                     f"is dubbed in one pass")
+            print(f"[Route] {_note}", flush=True)
+            job.events.append({"type": "note", "message": _note})
 
         _setup_status("Building pipeline configuration...", 0.40)
 
@@ -1370,8 +1488,8 @@ def _run_job(job: Job, req: JobCreateRequest):
                         if _untranslated_run[0] >= 5:
                             raise RuntimeError(
                                 "Translation is failing (5 cues in a row came back untranslated; "
-                                "Google may be rate-limiting this PC). Retry later or pick "
-                                "another Translation engine (Groq/Gemini) in Settings.")
+                                "Google's free endpoint may be blocking this PC). Pick Groq or "
+                                "Gemini in Advanced Settings -> Translation.")
                     else:
                         _untranslated_run[0] = 0
                     return out
@@ -1892,6 +2010,10 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
     # Titled output folders (sanitized for Windows); parts are saved as they finish.
     base_title = _sanitize_filename(job.video_title or "Untitled")
     saved_parts = []
+    saved_srts = []
+    # (part_num, result_status, result_warnings) of every part: one part's
+    # missing audio or English lines must not vanish behind "Complete".
+    part_outcomes: List[tuple] = []
     # One character bank for the whole video: each part's speakers are matched
     # to the characters already met, so a character keeps one voice throughout.
     speaker_bank: Dict[str, Dict] = {}
@@ -2020,6 +2142,8 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
         pipeline.video_title = f"{job.video_title} - Part {part_num}"
         pipeline._speaker_bank = speaker_bank
         pipeline.run()
+        part_outcomes.append((part_num, getattr(pipeline, "result_status", "completed"),
+                              list(getattr(pipeline, "result_warnings", None) or [])))
 
         # Each part diarizes its own audio; keep every part's speakers.
         job.speakers.extend({**d, "part": part_num}
@@ -2056,18 +2180,37 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             shutil.copy2(part_out, dest_path)
             saved_parts.append(str(dest_path))
             job.saved_video = job.saved_video or str(dest_path)
+            # This part's subtitles: every part writes the same job_dir path,
+            # so take it now (moved, so a later part can never ship it again).
+            part_srt = job_dir / f"subtitles_{req.target_language}.srt"
+            if part_srt.exists():
+                srt_dest = dest_dir / f"{part_title}.srt"
+                shutil.move(str(part_srt), str(srt_dest))
+                saved_srts.append(str(srt_dest))
+            else:
+                part_outcomes[-1][2].append("no subtitles file was written")
             _store.save(job)
             print(f"[SPLIT] Saved: {dest_path}", flush=True)
+        else:
+            part_outcomes[-1] = (part_num, "draft_incomplete",
+                                 part_outcomes[-1][2] + ["no dubbed video was produced"])
 
     if not output_parts:
         raise RuntimeError("No parts were produced")
 
     job.result_path = output_parts[0][1]  # First part for preview
-    job.saved_folder = str(SAVED_DIR / base_title) if len(output_parts) == 1 else str(SAVED_DIR)
+    # One part: its own "<title> - Part N" folder (SAVED_DIR/<title> never exists).
+    job.saved_folder = str(Path(saved_parts[0]).parent) if len(output_parts) == 1 else str(SAVED_DIR)
     job.saved_video = saved_parts[0] if saved_parts else None
+    job.subtitles_path = saved_srts[0] if saved_srts else None   # first part, like the preview
     job.overall_progress = 1.0
     job.state = "done"
     job.message = f"Complete — {len(output_parts)} parts dubbed!"
+    # Every part's honest outcome, labelled by part.
+    _apply_outcome(job,
+                   "draft_incomplete" if any(s == "draft_incomplete" for _, s, _ in part_outcomes)
+                   else "completed",
+                   [f"Part {n}: {w}" for n, _, ws in part_outcomes for w in ws])
     job.events.append({"type": "complete", "state": "done",
                        "parts": len(output_parts)})
     _store.save(job)
@@ -2653,7 +2796,7 @@ async def create_job_upload(
     try:
         req = JobCreateRequest(
             url=str(saved_path),
-            source_language=source_language,
+            source_language=_english_source(source_language),   # English source lock
             target_language=target_language,
             voice=voice,
             asr_model=asr_model,
@@ -3033,7 +3176,7 @@ async def create_job_with_srt(
     try:
         req = JobCreateRequest(
             url=source_url,
-            source_language=source_language,
+            source_language=_english_source(source_language),   # English source lock
             target_language=target_language,
             voice=voice,
             asr_model=asr_model,
@@ -3270,6 +3413,7 @@ def get_job(job_id: str):
         "result_status":      job.result_status,
         "status_reasons":     job.status_reasons,
         "report_path":        job.report_path,
+        "subtitles_path":     job.subtitles_path,
     }
 
 
@@ -3498,8 +3642,16 @@ def get_srt(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    srt_path = OUTPUTS / job_id / f"subtitles_{job.target_language}.srt"
-    if not srt_path.exists():
+    # A finished job's SRT lives in its saved folder (classic jobs delete the
+    # job folder once saved); the job-folder path covers runs in progress,
+    # and the saved-folder scan covers jobs saved before subtitles_path existed.
+    candidates = [Path(job.subtitles_path)] if job.subtitles_path else []
+    candidates.append(OUTPUTS / job_id / f"subtitles_{job.target_language}.srt")
+    if job.saved_folder and Path(job.saved_folder) != SAVED_DIR and Path(job.saved_folder).is_dir():
+        candidates += [p for p in sorted(Path(job.saved_folder).glob("*.srt"))
+                       if not p.name.startswith("transcript_")]
+    srt_path = next((p for p in candidates if p.is_file()), None)
+    if srt_path is None:
         raise HTTPException(status_code=404, detail="Subtitles not found")
 
     return FileResponse(
@@ -3569,8 +3721,11 @@ def get_dialogue_report(job_id: str, fmt: str = "md"):
         path = Path(job.saved_folder) / path.name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report file missing")
-    media = "text/markdown; charset=utf-8" if fmt == "md" else "application/json"
-    return FileResponse(path=str(path), media_type=media, filename=path.name)
+    # "Open report" must show the report in the browser tab: text/markdown
+    # and an attachment disposition both made the browser download it.
+    media = "text/plain; charset=utf-8" if fmt == "md" else "application/json"
+    return FileResponse(path=str(path), media_type=media, filename=path.name,
+                        content_disposition_type="inline")
 
 
 @app.get("/api/jobs/{job_id}/qa")
@@ -3626,10 +3781,11 @@ def _run_resume(job: Job):
             source="resume",
             work_dir=work_dir,
             output_path=out_path,
-            source_language=req.source_language if req else "en",
+            source_language=_english_source(req.source_language if req else "en"),
             target_language=job.target_language,
             asr_model=req.asr_model if req else "groq-whisper",
-            translation_engine=req.translation_engine if req else "google",
+            # Not "google": its free endpoint is IP-blocked on this PC.
+            translation_engine=req.translation_engine if req else "groq",
             tts_voice=voice,
             tts_rate=req.tts_rate if req else "+0%",
             use_cosyvoice=False,
@@ -4004,17 +4160,18 @@ def delete_job(job_id: str):
                     # _kill_all_procs returns. If the worker is still alive
                     # after 30s it's stuck in a native call we can't reach.
                     worker.join(timeout=30.0)
-                    if worker.is_alive():
-                        print(f"[CANCEL] Worker thread for {job_id} did not exit "
-                              f"in 30s — proceeding with cleanup anyway. The "
-                              f"thread will be reaped when the process exits.",
-                              flush=True)
                 except Exception as e:
                     print(f"[CANCEL] join failed for {job_id}: {e}", flush=True)
+                if worker.is_alive():
+                    # Never delete files under a live worker: it would fail in
+                    # confusing ways or re-create half the folder. This daemon
+                    # thread waits for it instead; if it never exits, the folder
+                    # goes when the job is deleted or pruned.
+                    print(f"[CANCEL] Worker thread for {job_id} did not exit in 30s — "
+                          f"keeping {OUTPUTS / job_id} until it does", flush=True)
+                    worker.join()
 
-            # Remove the work directory. If the worker is genuinely still
-            # alive and writing files, ignore_errors=True keeps cleanup
-            # best-effort instead of crashing.
+            # Remove the work directory now that no worker is using it.
             job_dir = OUTPUTS / job_id
             if job_dir.exists():
                 try:
