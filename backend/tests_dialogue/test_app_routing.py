@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from dubbing.dialogue import audio
 from dubbing.dialogue import orchestrator as orch_mod
 
 from test_orchestrator_e2e import HAVE_FFMPEG, HINDI, SCRIPT, _components, _make_media
@@ -20,6 +21,13 @@ def client(monkeypatch, tmp_path):
 
     def fake_components(cfg):
         comps = _components(calls, orch_holder=holder)
+
+        def silent_background(original, work, policy):
+            out = work / "background_estimate.wav"
+            audio.run_ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "10",
+                              str(out)])
+            return {"status": "ok", "background": str(out), "detail": "test bed (silence)"}
+        comps.separate = silent_background
         return comps
 
     real_init = orch_mod.DialogueOrchestrator.__init__
@@ -30,6 +38,10 @@ def client(monkeypatch, tmp_path):
         holder["orch"] = self
 
     monkeypatch.setattr(orch_mod, "default_components", fake_components)
+    # A fully equipped PC (the real probe reflects this container, which has
+    # no Whisper/pyannote/Demucs); the module resolver is tested separately.
+    from test_modules import FakeProbe
+    monkeypatch.setattr(app_mod, "_dialogue_probe", lambda max_age=60.0: FakeProbe())
     monkeypatch.setattr(orch_mod.DialogueOrchestrator, "__init__", init)
     monkeypatch.setattr(app_mod, "SAVED_DIR", tmp_path / "saved")
     (tmp_path / "saved").mkdir()
@@ -52,10 +64,12 @@ def test_upload_routes_to_dialogue_profile(client, tmp_path):
     job = _wait(app_mod, r.json()["id"])
     assert job.state == "done" and job.result_status == "completed", (job.message, job.status_reasons)
     assert calls["diarize"] == 1                       # diarization ran although multi_speaker=false
-    assert any("diarization always runs" in e.get("message", "") for e in job.events)
+    # speakers come from the module matrix (default preset), not the legacy flag
     body = c.get(f"/api/jobs/{job.id}").json()
     assert body["result_status"] == "completed" and body["report_path"].endswith("report.md")
     rep = c.get(f"/api/jobs/{job.id}/report?fmt=json").json()
+    mods = rep["config"]["modules"]
+    assert mods["preset"] == "free-online" and mods["selections"]["speakers"] == ["pyannote"]
     assert rep["generated_turn_ids"] == ["t0001", "t0002", "t0003", "t0004"]
     assert {s["speaker_id"] for s in json.loads(json.dumps(rep["speakers"]))} == {"SPEAKER_00", "SPEAKER_01"}
     assert job.saved_video and job.saved_video.endswith("dubbed_hi.mp4")
@@ -75,3 +89,33 @@ def test_with_srt_hindi_routes_to_dialogue_profile(client, tmp_path):
     assert job.result_status == "completed", job.status_reasons
     assert calls["diarize"] == 1 and "asr" not in calls
     assert [s["speaker_id"] for s in job.segments] == ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00", "SPEAKER_01"]
+
+
+def test_module_endpoints(client):
+    c, app_mod, _ = client
+    m = c.get("/api/dialogue/modules?source_kind=file").json()
+    assert {s["id"] for s in m["stages"]} >= {"speakers", "voices", "background", "translation"}
+    presets = c.get("/api/dialogue/presets").json()["presets"]
+    assert any(p["id"] == "free-local" for p in presets)
+    r = c.post("/api/dialogue/resolve", json={"preset": "free-online",
+                                              "overrides": {"voices": ["sarvam", "edge"]},
+                                              "source_kind": "file"}).json()
+    assert r["selections"]["voices"] == ["edge"]
+    assert any(ch["choice"] == "sarvam" and "paid" in ch["reason"] for ch in r["changes"])
+
+
+def test_preset_job_single_narrator_skips_speaker_detection(client, tmp_path):
+    c, app_mod, calls = client
+    media = _make_media(tmp_path)
+    with open(media, "rb") as f:
+        r = c.post("/api/jobs/upload", files={"file": ("clip.mp4", f, "video/mp4")},
+                   data={"pipeline_mode": "hindi_dialogue", "dialogue_preset": "single-narrator",
+                         "dialogue_modules_json": json.dumps({"verify": ["off"]})})
+    job = _wait(app_mod, r.json()["id"])
+    assert "diarize" not in calls
+    assert {s["speaker_id"] for s in job.segments} == {"UNKNOWN"}
+    rep = c.get(f"/api/jobs/{job.id}/report?fmt=json").json()
+    assert rep["config"]["modules"]["selections"]["verify"] == ["off"]
+    assert rep["config"]["diarization"] is False
+    # chosen single voice is a limitation, not a "diarization unavailable" failure
+    assert not any("diarization unavailable" in x for x in rep["unresolved_failures"])

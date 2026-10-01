@@ -36,11 +36,47 @@ def _load_env():
         pass
 
 
+def _overrides(args):
+    ov = {"params": {}}
+    for item in args.set:
+        stage, _, val = item.partition("=")
+        ov[stage.strip()] = [v.strip() for v in val.split(",") if v.strip()]
+    if args.allow_paid:
+        ov["params"]["allow_paid"] = True
+    if args.local_only:
+        ov["params"]["local_only"] = True
+    if getattr(args, "ollama_model", ""):
+        ov["params"]["ollama_model"] = args.ollama_model
+    if getattr(args, "speakers", None):
+        ov["params"]["num_speakers"] = args.speakers
+    return ov
+
+
+def _print_resolution(res):
+    print(f"\nPreset '{res.preset}' on this PC:")
+    for stage, sel in res.selections.items():
+        print(f"  {stage:<17} {', '.join(sel) if sel else '(skipped)'}")
+    for ch in res.changes:
+        print(f"  * {ch['stage']}: {ch['action']} {ch['choice']} — {ch['reason']}"
+              + (f"\n      fix: {ch['fix']}" if ch.get("fix") else ""))
+    for w in res.warnings:
+        print(f"  ! {w}")
+    for b in res.blocking:
+        print(f"  BLOCKED: {b}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m dubbing.dialogue")
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("doctor", help="check dependencies, credentials presence, GPU, disk")
     d.add_argument("--providers", default="edge")
+    m = sub.add_parser("modules", help="show the module matrix, presets and what a preset "
+                       "resolves to on this PC")
+    m.add_argument("--preset", default="free-online")
+    m.add_argument("--set", action="append", default=[], metavar="STAGE=a,b",
+                   help="override a stage, e.g. --set voices=indic_parler,edge")
+    m.add_argument("--allow-paid", action="store_true")
+    m.add_argument("--local-only", action="store_true")
     r = sub.add_parser("dub", help="dub a URL or local video into Hindi")
     r.add_argument("source")
     r.add_argument("--out", type=Path, default=None, help="output folder")
@@ -53,6 +89,14 @@ def main(argv=None) -> int:
     r.add_argument("--speakers", type=int, default=None, help="exact number of speakers, if known")
     r.add_argument("--min-speakers", type=int, default=None)
     r.add_argument("--max-speakers", type=int, default=None)
+    r.add_argument("--preset", default=None,
+                   help="module preset (see `modules`): free-online, free-local, fast-draft, "
+                        "single-narrator, premium-voices, hindi-srt-revoice")
+    r.add_argument("--set", action="append", default=[], metavar="STAGE=a,b",
+                   help="override a stage of the preset, e.g. --set background=none")
+    r.add_argument("--allow-paid", action="store_true", help="allow paid services")
+    r.add_argument("--local-only", action="store_true", help="no cloud AI services")
+    r.add_argument("--ollama-model", default="", help="Ollama model for local translation")
     r.add_argument("--providers", default="edge",
                    help="comma list in priority order, e.g. edge or sarvam,edge (paid providers only if listed)")
     r.add_argument("--engines", default="gemini,groq,cerebras", help="LLM translation engines in order")
@@ -69,18 +113,47 @@ def main(argv=None) -> int:
         print(format_preflight(res))
         return 0 if res["ready"] else 2
 
+    if args.cmd == "modules":
+        from dubbing.dialogue.modules import PRESETS, describe_matrix, resolve
+        matrix = describe_matrix()
+        for st in matrix["stages"]:
+            print(f"\n{st['label']}  [{st['id']}]{'  (ordered chain)' if st['multi'] else ''}")
+            for c in st["choices"]:
+                mark = "OK  " if c["available"] else "--  "
+                miss = "" if c["available"] else "  missing: " + ", ".join(x["name"] for x in c["missing"])
+                print(f"  {mark}{c['id']:<14} {c['cost']:<9} {c['label']}{miss}")
+        print("\nPresets: " + ", ".join(p["id"] for p in PRESETS))
+        res = resolve(args.preset, _overrides(args), ctx={"source_kind": "file"})
+        _print_resolution(res)
+        return 0 if res.ok else 2
+
     from dubbing.dialogue.orchestrator import DialogueConfig, run_dialogue
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out = args.out or (BACKEND / "dubbed_outputs" / f"dialogue_{stamp}")
-    cfg = DialogueConfig(
-        source=args.source, work_dir=args.work or (out / "work"), output_dir=out,
-        source_srt=args.srt_en, translated_srt=args.srt_hi,
-        use_youtube_subs=not args.no_youtube_subs, asr=args.asr, asr_model=args.asr_model,
-        num_speakers=args.speakers, min_speakers=args.min_speakers, max_speakers=args.max_speakers,
+    module_kw = {}
+    modules = None
+    if args.preset or args.set or args.allow_paid or args.local_only or args.ollama_model:
+        from dubbing.dialogue.modules import resolve
+        import re as _re
+        res = resolve(args.preset or "free-online", _overrides(args),
+                      ctx={"source_kind": "url" if _re.match(r"^https?://", args.source) else "file",
+                           "files": {"english_srt": bool(args.srt_en), "hindi_srt": bool(args.srt_hi)}})
+        _print_resolution(res)
+        if not res.ok:
+            return 2
+        module_kw, modules = res.config, res.to_dict()
+    legacy_kw = dict(
+        use_youtube_subs=not args.no_youtube_subs, asr=args.asr,
+        num_speakers=args.speakers,
         tts_providers=[p.strip() for p in args.providers.split(",") if p.strip()],
         translation_engines=[e.strip() for e in args.engines.split(",") if e.strip()],
         background=args.background, content_verify=args.verify, max_stretch=args.max_stretch,
-        limit_seconds=args.limit_seconds)
+    ) if not module_kw else {}
+    cfg = DialogueConfig(
+        source=args.source, work_dir=args.work or (out / "work"), output_dir=out,
+        source_srt=args.srt_en, translated_srt=args.srt_hi, asr_model=args.asr_model,
+        min_speakers=args.min_speakers, max_speakers=args.max_speakers,
+        limit_seconds=args.limit_seconds, modules=modules, **legacy_kw, **module_kw)
 
     def progress(step, frac, msg):
         print(f"[{step:>10}] {int(frac * 100):3d}%  {msg}", flush=True)

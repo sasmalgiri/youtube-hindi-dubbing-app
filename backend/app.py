@@ -366,6 +366,10 @@ class JobCreateRequest(BaseModel):
     dialogue_num_speakers: int = 0                  # 0 = detect automatically
     dialogue_background: str = "auto"               # "auto" | "demucs" | "none"
     dialogue_verify: str = "auto"                   # Hindi re-ASR content check: "auto" | "on" | "off"
+    # Module matrix (dubbing/dialogue/modules.py). When a preset or module JSON
+    # is given, the resolver decides every stage and the fields above are ignored.
+    dialogue_preset: str = ""                       # e.g. "free-online", "free-local"
+    dialogue_modules_json: str = ""                 # {"<stage>": [choices], "params": {...}}
     # ── SRT Direct mode options ──
     sd_srt_content: str = ""            # Full SRT content (cues verbatim) — required for srtdub mode
     sd_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown; freeze-pads if still short
@@ -822,6 +826,51 @@ def _apply_legacy_outcome(job: Job, pipeline) -> None:
     job.message = f"{job.message} — {label}: {warnings[0] if warnings else ''}"[:300]
 
 
+_PROBE_CACHE: Dict[str, Any] = {"t": 0.0, "probe": None}
+
+
+def _dialogue_probe(max_age: float = 60.0):
+    """What this PC has installed (cached briefly; importing torch is slow)."""
+    from dubbing.dialogue.modules import Probe
+    now = time.time()
+    if _PROBE_CACHE["probe"] is None or now - _PROBE_CACHE["t"] > max_age:
+        _PROBE_CACHE["probe"] = Probe.detect()
+        _PROBE_CACHE["t"] = now
+    return _PROBE_CACHE["probe"]
+
+
+def _legacy_dialogue_overrides(req: JobCreateRequest) -> Dict[str, Any]:
+    """Map the older dialogue_* fields onto module overrides."""
+    voices = [p.strip() for p in (req.dialogue_tts_providers or "edge").split(",") if p.strip()]
+    engines = [e.strip() for e in (req.dialogue_translation_engines or "").split(",") if e.strip()]
+    paid = any(v in ("sarvam", "elevenlabs", "google") for v in voices) or "openai" in engines
+    return {
+        "voices": voices or ["edge"],
+        "translation": engines + ["google_basic"],
+        "background": ["none" if req.dialogue_background == "none" else "keep"],
+        "verify": ["off" if req.dialogue_verify == "off" else "whisper"],
+        "asr": ["groq" if (req.asr_model or "").startswith("groq") else "auto"],
+        "params": {"num_speakers": int(req.dialogue_num_speakers or 0), "allow_paid": paid},
+    }
+
+
+def _resolve_dialogue_modules(req: JobCreateRequest, source_kind: str, files: Dict[str, bool]):
+    from dubbing.dialogue.modules import DEFAULT_PRESET, resolve
+    overrides: Dict[str, Any] = {}
+    raw = (getattr(req, "dialogue_modules_json", "") or "").strip()
+    if raw:
+        try:
+            overrides = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"dialogue_modules_json is not valid JSON: {e}")
+    elif not getattr(req, "dialogue_preset", ""):
+        overrides = _legacy_dialogue_overrides(req)
+    if req.dialogue_num_speakers and "num_speakers" not in overrides.get("params", {}):
+        overrides.setdefault("params", {})["num_speakers"] = int(req.dialogue_num_speakers)
+    return resolve(getattr(req, "dialogue_preset", "") or DEFAULT_PRESET, overrides,
+                   ctx={"source_kind": source_kind, "files": files}, probe=_dialogue_probe())
+
+
 def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
                        english_srt: Optional[Path] = None):
     """pipeline_mode="hindi_dialogue": the shared speaker-aware dialogue path.
@@ -841,8 +890,6 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
     if getattr(req, "use_yt_translate", False):  # option removed on this branch
         notes.append("YouTube auto-translated Hindi is not used (it cannot be attached to "
                      "speaker turns); contextual translation is used instead")
-    if not req.multi_speaker:
-        notes.append("speaker diarization always runs in the Hindi dialogue profile")
     if req.split_duration:
         notes.append("split_duration ignored (dialogue profile processes the video in one pass)")
     for n in notes:
@@ -855,18 +902,33 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         source_srt = work_dir / "transcript_upload_en.srt"
         source_srt.write_text(transcript, encoding="utf-8")
 
+    # Module matrix: preset + user overrides + what this PC has -> every stage.
+    resolution = _resolve_dialogue_modules(req, source_kind=(
+        "url" if re.match(r"^https?://", req.url or "") else "file"),
+        files={"english_srt": bool(source_srt), "hindi_srt": bool(translated_srt)})
+    for ch in resolution.changes:
+        msg = (f"[modules] {ch['stage']}: {ch['action']} {ch['choice']} — {ch['reason']}"
+               + (f" (fix: {ch['fix']})" if ch.get("fix") else ""))
+        print(f"[hindi_dialogue] {msg}", flush=True)
+        job.events.append({"type": "note", "message": msg})
+    if not resolution.ok:
+        job.state = "error"
+        job.result_status = "failed"
+        job.error = "Cannot run on this PC: " + " | ".join(resolution.blocking)
+        job.message = job.error[:300]
+        job.status_reasons = list(resolution.blocking)
+        job.events.append({"type": "complete", "state": "error", "error": job.error})
+        _store.save(job)
+        return
+
     cfg = DialogueConfig(
         source=req.url, work_dir=work_dir, output_dir=out_dir,
         source_srt=source_srt, translated_srt=translated_srt,
-        use_youtube_subs=False,  # YouTube-subs input was removed on this branch (092e758)
-        asr="groq" if (req.asr_model or "").startswith("groq") else "auto",
         asr_model=req.asr_model if req.asr_model not in ("groq-whisper", "groq", "parakeet") else "large-v3",
-        num_speakers=req.dialogue_num_speakers or None,
-        tts_providers=[p.strip() for p in req.dialogue_tts_providers.split(",") if p.strip()] or ["edge"],
-        translation_engines=[e.strip() for e in req.dialogue_translation_engines.split(",") if e.strip()],
-        background=req.dialogue_background, content_verify=req.dialogue_verify,
         audio_bitrate=req.audio_bitrate,
         limit_seconds=float(req.dub_duration or 0) * 60.0,
+        modules=resolution.to_dict(),
+        **resolution.config,
     )
     res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
                        cancel_check=job.cancel_event.is_set)
@@ -2561,6 +2623,8 @@ async def create_job_upload(
     preset_name: str = Form(""),
     # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
+    dialogue_preset: str = Form(""),
+    dialogue_modules_json: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -2638,6 +2702,8 @@ async def create_job_upload(
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
+            dialogue_preset=dialogue_preset,
+            dialogue_modules_json=dialogue_modules_json,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -2919,6 +2985,8 @@ async def create_job_with_srt(
     preset_name: str = Form(""),
     # Pipeline mode + mode-specific fields (SRT Direct)
     pipeline_mode: str = Form("classic"),
+    dialogue_preset: str = Form(""),
+    dialogue_modules_json: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -3013,6 +3081,8 @@ async def create_job_with_srt(
             gap_mode=gap_mode,
             preset_name=preset_name,
             pipeline_mode=pipeline_mode,
+            dialogue_preset=dialogue_preset,
+            dialogue_modules_json=dialogue_modules_json,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
@@ -3455,6 +3525,36 @@ def get_source_srt(job_id: str):
         media_type="text/plain",
         filename=f"source_{job_id}.srt",
     )
+
+
+class DialogueResolveRequest(BaseModel):
+    preset: str = ""
+    overrides: Dict[str, Any] = {}
+    source_kind: str = "url"            # "url" | "file"
+    files: Dict[str, bool] = {}         # {"english_srt": bool, "hindi_srt": bool}
+
+
+@app.get("/api/dialogue/modules")
+def dialogue_modules(source_kind: str = "url"):
+    """Module matrix for the Hindi dialogue profile with availability on this PC."""
+    from dubbing.dialogue.modules import describe_matrix
+    return describe_matrix(probe=_dialogue_probe(), ctx={"source_kind": source_kind})
+
+
+@app.get("/api/dialogue/presets")
+def dialogue_presets():
+    from dubbing.dialogue.modules import PRESETS
+    return {"presets": list(PRESETS)}
+
+
+@app.post("/api/dialogue/resolve")
+def dialogue_resolve(body: DialogueResolveRequest):
+    """Preview what a preset + overrides becomes on this PC (auto on/off + reasons)."""
+    from dubbing.dialogue.modules import DEFAULT_PRESET, resolve
+    res = resolve(body.preset or DEFAULT_PRESET, body.overrides,
+                  ctx={"source_kind": body.source_kind, "files": body.files},
+                  probe=_dialogue_probe())
+    return res.to_dict()
 
 
 @app.get("/api/jobs/{job_id}/report")
