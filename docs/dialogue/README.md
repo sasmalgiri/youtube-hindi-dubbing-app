@@ -53,20 +53,40 @@ Guarantees, each enforced in code and covered by tests:
 A status reached by automated checks does **not** certify how natural the voices sound or how good
 the Hindi is. Listen before publishing.
 
-## Setup (Windows desktop, one time)
+## Setup (Windows desktop)
 
-1. Run the normal setup (`setup.bat`) so the base app works.
-2. Install the optional dialogue dependencies, preferably in a fresh venv first:
-   `pip install -r backend\requirements-dialogue.txt`.
-   Add `torch` with CUDA from pytorch.org for your GPU.
-3. Speaker diarization needs a Hugging Face token:
+On the owner's PC everything this profile needs is **already installed** in the main Python 3.10:
+CUDA torch 2.4.1+cu121 for the RTX 3060, pyannote.audio 4.0.4, faster-whisper 1.1.1,
+audio-separator, Demucs, IndicTransToolkit and Parler-TTS. Do **not** run
+`pip install -r backend\requirements.txt` or `pip install -r backend\requirements-dialogue.txt`
+there. whisperx and pyannote.audio declare torch 2.8 and Demucs accepts any torch, so pip would
+replace the CUDA torch with a CPU-only torch 2.8. faster-whisper's `onnxruntime` dependency would
+also overwrite `onnxruntime-gpu`.
+
+1. Check readiness: `cd backend` then `python -m dubbing.dialogue doctor`. This reports only
+   *whether* each credential is set, never its value.
+2. Speaker diarization needs a Hugging Face token:
    - Accept the conditions of `pyannote/speaker-diarization-community-1` on huggingface.co.
    - Put `HF_TOKEN=hf_...` in `backend\.env`.
-4. Translation uses the LLM keys the app already reads (`GEMINI_API_KEY`, `GROQ_API_KEY`,
+3. Translation uses the LLM keys the app already reads (`GEMINI_API_KEY`, `GROQ_API_KEY`,
    `CEREBRAS_API_KEY`). If none is set, a non-contextual Google fallback is used and every affected
-   turn is flagged.
-5. Check readiness: `cd backend` then `python -m dubbing.dialogue doctor`. This reports only
-   *whether* each credential is set, never its value.
+   turn is flagged. Google's free endpoint answers HTTP 429 on this PC, so keep `GROQ_API_KEY` set.
+4. Install any new package with `backend\constraints.txt`. It pins torch, torchaudio, numpy,
+   transformers, pyannote.audio, faster-whisper and onnxruntime-gpu (plus torchvision and
+   CTranslate2) to the working versions, so pip stops with a conflict instead of replacing them.
+   The first command only shows what pip would change; the second installs:
+
+   ```
+   python -m pip install --dry-run -c backend\constraints.txt <package>
+   python -m pip install -c backend\constraints.txt <package>
+   ```
+
+   If pip reports a conflict, or the dry run lists `torch`, `numpy` or `onnxruntime`, install the
+   package with `--no-deps` instead and add its missing dependencies one at a time (with `-c`).
+
+On a new PC, `setup.bat` installs `backend\requirements.txt` with the constraints and the CUDA 12.1
+torch. Then add the dialogue packages one at a time as in step 4. On torch 2.4.1, pyannote.audio 4.x
+needs `--no-deps`.
 
 ## Running
 
@@ -100,6 +120,8 @@ jobs):
 Pick a preset in the UI (Free — Online, Free — Local AI, Fast Draft, Single Narrator, Premium
 Voices, My Hindi SRT) or use `--preset` on the CLI. Options that cannot run on your PC are switched
 off automatically, with the reason and the fix shown. Fallbacks switch on automatically.
+My Hindi SRT needs a Hindi SRT, so for a link or an uploaded video it is shown disabled: upload the
+SRT in the **SRT Dub** tab instead (Hindi Dialogue mode picks it up there).
 
 The full matrix, the dependency rules and the free / local-AI setup are in
 [modules.md](modules.md). To see what a preset becomes on your PC, run:

@@ -1,12 +1,20 @@
 # Optional dependencies for the Hindi dialogue profile (pipeline_mode=hindi_dialogue).
 # Base requirements (backend/requirements.txt) must be installed first.
 #
-# These are version RANGES, not a tested lock: the cloud environment that
-# built this profile had no GPU and could not install/run these models.
-# Install into a separate virtualenv first, run
-#     python -m dubbing.dialogue doctor
-# and only then switch your working environment. Do not upgrade an existing
-# working install blindly (pyannote 4 / torch 2.8 are large upgrades).
+# On the owner's PC these are ALREADY INSTALLED on the CUDA torch 2.4.1+cu121
+# (faster-whisper 1.1.1, pyannote.audio 4.0.4, audio-separator 0.47.0,
+# demucs 4.0.1, deep-translator 1.11.4). Check readiness instead:
+#     cd backend && python -m dubbing.dialogue doctor
+# Do not `pip install -r` this file there: pyannote.audio 4.x declares
+# torch>=2.8, so pip would swap the CUDA torch for a CPU torch 2.8. The -c line
+# below applies constraints.txt (the working versions), which makes pip stop
+# with a conflict instead. A single missing package:
+#     python -m pip install -c backend/constraints.txt <package>
+# or, when pip reports a conflict, with --no-deps.
+#
+# The ranges below are not a tested lock (they were written without a GPU
+# test environment); the tested set is constraints.txt.
+-c constraints.txt
 
 numpy>=1.24
 python-dotenv>=0.19

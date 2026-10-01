@@ -12,10 +12,22 @@ import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
 import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
 
+// The "My Hindi SRT" dialogue preset (text_source = hindi_srt) voices a Hindi
+// SRT. A link or an uploaded video gives it none — the preset panel shows it
+// disabled — so a saved setting that still selects it is stopped here (link,
+// upload, batch and a saved link's Start) instead of starting a job that has
+// no Hindi text to voice.
+function srtOnlyPresetError(s: DubbingSettings): string | null {
+    return s.pipeline_mode === 'hindi_dialogue' && (s as any).dialogue_preset === 'hindi-srt-revoice'
+        ? 'The "My Hindi SRT" preset needs a Hindi SRT: upload it in the SRT Dub tab, or pick another Hindi Dialogue preset.'
+        : null;
+}
 
 export default function HomePage() {
     const router = useRouter();
-    const [sourceLanguage, setSourceLanguage] = useState('auto');
+    // The app is locked to English -> Hindi: 'auto' made Whisper guess the
+    // source language instead of being told it is English.
+    const [sourceLanguage, setSourceLanguage] = useState('en');
     const [targetLanguage, setTargetLanguage] = useState('hi');
     const [settings, setSettings] = useState<DubbingSettings>({
         voice: 'hi-IN-MadhurNeural',         // Default: Hindi male voice
@@ -163,6 +175,12 @@ export default function HomePage() {
             setSubmitting(false);
             return;
         }
+        const presetError = srtOnlyPresetError(settings);
+        if (presetError) {
+            setError(presetError);
+            setSubmitting(false);
+            return;
+        }
 
         try {
             // Auto-save URL to saved links — WITHOUT blob fields (stripForPreset)
@@ -196,6 +214,12 @@ export default function HomePage() {
             setSubmitting(false);
             return;
         }
+        const presetError = srtOnlyPresetError(settings);
+        if (presetError) {
+            setError(presetError);
+            setSubmitting(false);
+            return;
+        }
         try {
             const { id } = await createJobUpload(file, {
                 source_language: sourceLanguage,
@@ -210,6 +234,11 @@ export default function HomePage() {
     }, [sourceLanguage, targetLanguage, settings, router, stripModeBloat]);
 
     const handleBatchSubmit = useCallback((urls: string[]) => {
+        const presetError = srtOnlyPresetError(settings);
+        if (presetError) {
+            setError(presetError);
+            return;
+        }
         // Auto-save all batch URLs with current preset — stripped of blob fields
         const preset = stripForPreset(settings);
         urls.forEach(u => addLink(u, undefined, preset).catch(() => { }));
@@ -232,7 +261,10 @@ export default function HomePage() {
             const { id } = await createJobWithSrt(srtFile, {
                 source_language: sourceLanguage,
                 target_language: targetLanguage,
-                ...settings,
+                // Same cleaning as the other submits: the Hindi Dialogue module
+                // choices must travel as dialogue_modules_json — the raw object
+                // was sent as "[object Object]" and silently dropped.
+                ...stripModeBloat(settings),
                 audio_untouchable: !needsTranslation,  // Only lock audio when already translated
                 post_tts_level: needsTranslation ? 'full' : 'none',
                 srt_needs_translation: needsTranslation || false,
@@ -242,7 +274,7 @@ export default function HomePage() {
             setError(e instanceof Error ? e.message : 'Failed to start SRT dubbing');
             setSubmitting(false);
         }
-    }, [sourceLanguage, targetLanguage, settings, router]);
+    }, [sourceLanguage, targetLanguage, settings, router, stripModeBloat]);
 
     return (
         <div className="min-h-screen">
@@ -264,7 +296,16 @@ export default function HomePage() {
 
                     {/* Saved Links */}
                     <div className="mt-4">
-                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) })} />
+                        <SavedLinks onSelect={setCurrentUrl} onJobStarted={(id) => router.push(`/jobs/${id}`)} getCurrentSettings={() => {
+                            // A saved link's "Start" submits these settings: same guard
+                            // as the submits above (SavedLinks catches the throw, so no job).
+                            const presetError = srtOnlyPresetError(settings);
+                            if (presetError) {
+                                setError(presetError);
+                                throw new Error(presetError);
+                            }
+                            return { source_language: sourceLanguage, target_language: targetLanguage, ...stripModeBloat(settings) };
+                        }} />
                     </div>
 
                     {error && (
@@ -351,8 +392,8 @@ export default function HomePage() {
                         onClick={() => {
                             const isVoiceClone = settings.audio_untouchable && settings.use_coqui_xtts && !settings.use_edge_tts;
                             if (isVoiceClone) {
-                                // Cancel voice clone — restore defaults
-                                setSourceLanguage('auto');
+                                // Cancel voice clone — restore defaults (English source)
+                                setSourceLanguage('en');
                                 setSettings(s => ({
                                     ...s,
                                     use_cosyvoice: false,
