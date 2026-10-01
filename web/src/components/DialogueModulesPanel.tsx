@@ -28,6 +28,12 @@ const COST_BADGE: Record<string, string> = {
 };
 const COST_LABEL: Record<string, string> = { free: 'free', free_tier: 'free tier', paid: 'paid' };
 
+// A preset whose text source is a Hindi SRT has nothing to read from a link or
+// an uploaded video: picked there it started a job with no Hindi text. Such
+// presets are shown disabled with this pointer to SRT mode.
+const SRT_MODE_HINT = 'Needs SRT mode: upload your Hindi SRT in the SRT Dub tab.';
+const needsHindiSrt = (p: DialoguePreset) => (p.selections?.text_source ?? []).includes('hindi_srt');
+
 export default function DialogueModulesPanel({ preset, overrides, onChange, sourceKind }: Props) {
     const [matrix, setMatrix] = useState<DialogueMatrix | null>(null);
     const [presets, setPresets] = useState<DialoguePreset[]>([]);
@@ -88,15 +94,22 @@ export default function DialogueModulesPanel({ preset, overrides, onChange, sour
             <div>
                 <div className="text-xs font-semibold text-text-primary mb-2">Hindi Dialogue preset</div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {presets.map((p) => (
-                        <button key={p.id} type="button"
-                            onClick={() => onChange(p.id, {})}
-                            className={`text-left rounded-lg border px-3 py-2 transition-colors ${p.id === activePreset
-                                ? 'border-pink-500 bg-pink-500/10' : 'border-border bg-white/5 hover:bg-white/10'}`}>
-                            <div className="text-xs font-semibold text-text-primary">{p.name}</div>
-                            <div className="text-[11px] text-text-muted leading-snug">{p.description}</div>
-                        </button>
-                    ))}
+                    {presets.map((p) => {
+                        // This panel is shown for a link or an uploaded video only.
+                        const srtOnly = needsHindiSrt(p) && (sourceKind === 'url' || sourceKind === 'file');
+                        return (
+                            <button key={p.id} type="button" disabled={srtOnly}
+                                title={srtOnly ? SRT_MODE_HINT : undefined}
+                                onClick={() => onChange(p.id, {})}
+                                className={`text-left rounded-lg border px-3 py-2 transition-colors ${p.id === activePreset
+                                    ? 'border-pink-500 bg-pink-500/10' : 'border-border bg-white/5'} ${srtOnly
+                                    ? 'opacity-50 cursor-not-allowed' : p.id === activePreset ? '' : 'hover:bg-white/10'}`}>
+                                <div className="text-xs font-semibold text-text-primary">{p.name}</div>
+                                <div className="text-[11px] text-text-muted leading-snug">{p.description}</div>
+                                {srtOnly && <div className="text-[11px] text-amber-400 leading-snug mt-0.5">{SRT_MODE_HINT}</div>}
+                            </button>
+                        );
+                    })}
                 </div>
             </div>
 

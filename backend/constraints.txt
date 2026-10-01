@@ -1,0 +1,44 @@
+# pip constraints: the working GPU stack of the owner's PC (Windows 11,
+# Python 3.10, RTX 3060). Every pin is the version actually installed there,
+# read with importlib.metadata on 2026-10-01.
+#
+# Why: `pip install -r backend/requirements.txt` or requirements-dialogue.txt
+# on that PC would replace the CUDA torch 2.4.1+cu121 with a CPU-only torch 2.8
+# (whisperx 3.8 declares torch~=2.8, pyannote.audio 4.x torch>=2.8, Demucs any
+# torch) and overwrite onnxruntime-gpu. With this file pip either keeps these
+# exact versions or stops with a conflict; it can no longer swap them.
+#
+# Use it for EVERY pip install into that environment:
+#     python -m pip install -c backend/constraints.txt <package>
+# See first what pip would change (installs nothing):
+#     python -m pip install --dry-run -c backend/constraints.txt <package>
+# A conflict means the package wants another torch/numpy/...: install it with
+# --no-deps (then its missing dependencies one by one, again with -c) or do
+# without it. whisperx 3.8.4 is installed with --no-deps for this reason, and
+# pyannote.audio 4.0.4 runs here on torch 2.4.1 although it declares 2.8.
+#
+# onnxruntime: faster-whisper declares the CPU package "onnxruntime", which is
+# deliberately NOT installed (onnxruntime-gpu provides the same module), and a
+# constraint cannot forbid it. If pip lists "onnxruntime" to install, use
+# --no-deps instead: next to onnxruntime-gpu it overwrites the same files and
+# the CUDA provider is gone. Repair:
+#     python -m pip uninstall -y onnxruntime
+#     python -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.23.2
+#
+# The +cu121 builds are on the PyTorch index, not on PyPI. When pip has to
+# download them (a fresh PC; setup.bat does this), also pass:
+#     --extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1+cu121
+torchaudio==2.4.1+cu121
+numpy==2.2.6
+transformers==4.51.3
+pyannote.audio==4.0.4
+faster-whisper==1.1.1
+onnxruntime-gpu==1.23.2
+
+# Same CUDA stack: torchvision must match torch 2.4.1, and CTranslate2
+# (faster-whisper's engine) loads the cuDNN that torch 2.4.1 ships here; a
+# newer one can need another cuDNN.
+torchvision==0.19.1
+ctranslate2==4.7.1

@@ -218,10 +218,14 @@ export interface JobStatus {
     avg_words_per_sent?: number;
     max_seg_words?: number;
     max_sent_words?: number;
-    // Hindi dialogue profile: honest outcome + report
+    // Honest outcome (any mode) + the dialogue report. result_status is also
+    // set for classic jobs with warnings, which have no report: the job page
+    // links the report only when report_path is set.
     result_status?: 'completed' | 'completed_with_warnings' | 'draft_incomplete' | 'failed' | 'cancelled' | null;
     status_reasons?: string[];
     report_path?: string | null;
+    // Subtitle file the backend serves at /api/jobs/{id}/srt (null = none)
+    subtitles_path?: string | null;
 }
 
 export interface TranscriptSegment {

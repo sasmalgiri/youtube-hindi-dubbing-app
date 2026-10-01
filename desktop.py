@@ -3,20 +3,25 @@ VoiceDub Desktop App
 ====================
 Self-contained launcher that:
   1. Checks all dependencies (Python packages, Node.js, FFmpeg)
-  2. Auto-installs missing Python packages
-  3. Starts FastAPI backend + Next.js frontend
+  2. Reports missing Python packages with the exact pip command to run
+     (never runs pip itself: see check_python_packages)
+  3. Starts FastAPI backend (port 8000) + Next.js frontend (port 3000),
+     replacing an old VoiceDub server that still holds either port
   4. Opens a native desktop window via pywebview
   5. Cleans up everything on close
 
 Works on any Windows PC — just copy the folder and run VoiceDub.bat.
 """
 import os
+import re
 import sys
+import json
 import time
 import shutil
 import signal
 import subprocess
 import threading
+import urllib.error
 import urllib.request
 import importlib
 
@@ -30,6 +35,8 @@ FRONTEND_DIR = os.path.join(APP_DIR, "web")
 PYTHON = sys.executable
 BACKEND_PORT = 8000
 FRONTEND_PORT = 3000
+CONSTRAINTS_FILE = os.path.join(BACKEND_DIR, "constraints.txt")
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 processes = []
 
@@ -69,26 +76,189 @@ def wait_for_server(url, timeout=60):
     return False
 
 
-def find_free_port(start_port):
-    """Find a free port starting from start_port."""
-    import socket
-    port = start_port
-    while port < start_port + 100:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("localhost", port)) != 0:
-                return port
-        port += 1
-    return start_port
+# ── Ports ────────────────────────────────────────────────────────────────────
+# Always 8000 (backend) and 3000 (frontend). This launcher used to move to the
+# next free port, which started a SECOND backend next to a running one; that
+# backend's startup hook marks the first one's running jobs as failed and
+# wipes the caches in the shared jobs.db. Now an old VoiceDub server holding a
+# port is stopped the way start.bat does it (netstat -ano -> taskkill), and a
+# port held by anything that does not answer as VoiceDub is never touched.
+BACKEND_TITLE = "YouTube Hindi Dubbing API"   # FastAPI(title=...) in backend/app.py
+FRONTEND_TITLE = "YouTube Hindi Dubbing"      # metadata.title in web/src/app/layout.tsx
+# The backend (uvicorn --host 0.0.0.0) listens on IPv4 only, and on Windows
+# "localhost" tries ::1 first: each request then waits ~2 s for the refusal.
+BACKEND_HOST = "127.0.0.1"
+
+
+def parse_listening_pids(netstat_text, port):
+    """PIDs LISTENING on TCP `port` in `netstat -ano` output (IPv4 and IPv6)."""
+    pids = []
+    for line in netstat_text.splitlines():
+        parts = line.split()
+        # Proto  Local-Address  Foreign-Address  State  PID. The state name is
+        # localised; a listening socket's foreign address is always 0:0.
+        if (len(parts) == 5 and parts[0].upper() == "TCP"
+                and parts[1].rsplit(":", 1)[-1] == str(port)
+                and (parts[3].upper() == "LISTENING" or parts[2] in ("0.0.0.0:0", "[::]:0"))
+                and parts[4].isdigit() and int(parts[4]) > 4    # never 0 (Idle) / 4 (System)
+                and int(parts[4]) not in pids):
+            pids.append(int(parts[4]))
+    return pids
+
+
+def listening_pids(port):
+    """PIDs listening on `port`, from `netstat -ano` like start.bat ([] if unknown)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=60,
+                             creationflags=NO_WINDOW).stdout
+    except Exception:
+        return []
+    return parse_listening_pids(out.decode("utf-8", errors="replace"), port)
+
+
+def _process_name(pid):
+    """Image name of `pid` for messages ("?" when unknown)."""
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                             capture_output=True, timeout=30, creationflags=NO_WINDOW).stdout
+        name = out.decode("utf-8", errors="replace").strip().split(",")[0].strip('"')
+        return name if name and not name.upper().startswith("INFO:") else "?"
+    except Exception:
+        return "?"
+
+
+def _http_get(url, timeout):
+    """(status, body) of a GET, or None when nothing answers."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:
+        return None
+
+
+def is_voicedub_backend(port):
+    """/api/health says ok AND the API title is ours: a bare health endpoint
+    returning {"status": "ok"} is common to many local servers."""
+    health = _http_get(f"http://{BACKEND_HOST}:{port}/api/health", 10)
+    if not health or health[0] != 200:
+        return False
+    spec = _http_get(f"http://{BACKEND_HOST}:{port}/openapi.json", 30)
+    if not spec or spec[0] != 200:
+        return False
+    try:
+        return (json.loads(health[1]).get("status") == "ok"
+                and json.loads(spec[1]).get("info", {}).get("title") == BACKEND_TITLE)
+    except (ValueError, AttributeError):
+        return False
+
+
+def is_voicedub_frontend(port):
+    """Our Next.js UI, recognised by its page title. A dev server compiles a
+    page on its first request, hence the long timeout."""
+    page = _http_get(f"http://localhost:{port}/", 60)
+    return bool(page) and page[0] == 200 and f">{FRONTEND_TITLE}<" in page[1]
+
+
+def inspect_port(port, what, is_ours):
+    """[] when `port` is free; the LISTENING PIDs when an old VoiceDub `what`
+    server holds it; None, after saying why, when anything else holds it --
+    that program is left running."""
+    if not is_port_in_use(port):
+        return []
+    log(f"Port {port} is busy - checking whether an old VoiceDub {what} holds it...", "STEP")
+    pids = listening_pids(port)
+    ids = ", ".join(map(str, pids))
+    if is_ours(port):
+        if pids:
+            log(f"An old VoiceDub {what} is running on port {port} (PID {ids}) "
+                f"- it will be replaced", "WARN")
+            return pids
+        log(f"An old VoiceDub {what} answers on port {port}, but netstat -ano does not "
+            f"show its process. Close it, then start VoiceDub again.", "ERR")
+        return None
+    who = ", ".join(f"PID {p} ({_process_name(p)})" for p in pids) or "a process netstat does not show"
+    kill = "taskkill /F " + (" ".join(f"/PID {p}" for p in pids) or "/PID <pid>")
+    log(f"Port {port} is used by {who}, which does not answer as the VoiceDub {what}.", "ERR")
+    log("It was left running. Close that program - or, if it is an old VoiceDub window that "
+        f"stopped responding, end it with: {kill} - then start VoiceDub again.", "INFO")
+    return None
+
+
+def _active_jobs(port):
+    """Titles of the jobs the backend on `port` is still working on."""
+    jobs = _http_get(f"http://{BACKEND_HOST}:{port}/api/jobs", 15)
+    try:
+        return [j.get("video_title") or j.get("id", "?") for j in json.loads(jobs[1])
+                if j.get("state") in ("running", "queued")]
+    except (TypeError, ValueError, AttributeError):
+        return []
+
+
+def confirm_stop_backend(port):
+    """Stopping the old backend ends the jobs it is working on: ask first."""
+    busy = _active_jobs(port)
+    if not busy:
+        return True
+    log(f"It is still working on {len(busy)} job(s): {', '.join(busy)[:200]}", "WARN")
+    log("Stopping it ends them; they would have to be resubmitted.", "WARN")
+    try:
+        input("  Press Enter to stop it anyway, or close this window to keep it running... ")
+        return True
+    except (EOFError, KeyboardInterrupt):
+        print()
+        log("Left the old backend running.", "INFO")
+        return False
+
+
+def stop_old_server(port, what, pids):
+    """Stop an old VoiceDub server like start.bat does (taskkill /F; /T also
+    ends its ffmpeg / Whisper / diarization children, which would otherwise
+    keep the GPU busy). True once the port is free."""
+    log(f"Stopping the old VoiceDub {what} on port {port}...", "STEP")
+    if what == "backend":
+        log("If start-backend-stable.bat started it, close that window too: "
+            "it restarts the backend by itself.", "INFO")
+    for pid in pids:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, creationflags=NO_WINDOW)
+    deadline = time.time() + 15
+    while is_port_in_use(port):
+        if time.time() > deadline:
+            log(f"Port {port} is still busy after stopping the old {what}.", "ERR")
+            return False
+        time.sleep(0.5)
+    time.sleep(2)   # like start.bat: give Windows a moment to release the socket
+    log(f"Port {port} is free", "OK")
+    return True
 
 
 # ── Dependency Checks ────────────────────────────────────────────────────────
-def check_python_packages():
-    """Check and install missing Python packages from requirements.txt."""
-    req_file = os.path.join(BACKEND_DIR, "requirements.txt")
-    if not os.path.exists(req_file):
-        log("requirements.txt not found!", "ERR")
-        return False
+def _requirement_spec(pip_name):
+    """`pip_name`'s line in backend/requirements.txt (e.g. "edge-tts==7.2.7"),
+    so the printed command installs the version the app expects."""
+    try:
+        with open(os.path.join(BACKEND_DIR, "requirements.txt"), encoding="utf-8") as f:
+            for line in f:
+                spec = line.split("#", 1)[0].strip()
+                name = re.split(r"[\[<>=!~;@ ]", spec, maxsplit=1)[0]
+                if spec and name.lower().replace("_", "-") == pip_name.lower():
+                    return spec
+    except OSError:
+        pass
+    return pip_name
 
+
+def check_python_packages():
+    """Check that the key Python packages import. Never runs pip: on the
+    owner's PC `pip install -r requirements.txt` would break the working GPU
+    setup (faster-whisper's CPU "onnxruntime" dependency overwrites
+    onnxruntime-gpu; with whisperx listed, it would also swap the CUDA torch
+    2.4.1+cu121 for a CPU torch 2.8). Prints the exact command, pinned by
+    backend/constraints.txt, for the user to run instead."""
     log("Checking Python packages...")
 
     # Quick check: try importing key packages
@@ -108,15 +278,19 @@ def check_python_packages():
             missing.append(pip_name)
 
     if missing:
-        log(f"Installing missing packages: {', '.join(missing)}", "STEP")
-        ok, out = run_cmd([PYTHON, "-m", "pip", "install", "-r", req_file, "--quiet"])
-        if not ok:
-            log(f"pip install failed. Run manually:\n    {PYTHON} -m pip install -r {req_file}", "ERR")
-            return False
-        log("Python packages installed", "OK")
-    else:
-        log("Python packages ready", "OK")
+        log(f"Missing Python packages: {', '.join(missing)}", "ERR")
+        log("They are not installed automatically. Run this, then start VoiceDub again", "INFO")
+        log("(backend/constraints.txt keeps torch, numpy and onnxruntime-gpu as they are):", "INFO")
+        # Specs are quoted (">=" would redirect); the interpreter only when it
+        # must be: a quoted first word is not a command in PowerShell.
+        specs = " ".join(f'"{_requirement_spec(m)}"' for m in missing)
+        py = f'"{PYTHON}"' if " " in PYTHON else PYTHON
+        print(f'\n    {py} -m pip install -c "{CONSTRAINTS_FILE}" {specs}\n')
+        log("If pip reports a conflict, or --dry-run shows it would install torch, numpy", "INFO")
+        log("or onnxruntime, install that package with --no-deps instead.", "INFO")
+        return False
 
+    log("Python packages ready", "OK")
     return True
 
 
@@ -277,8 +451,8 @@ def start_backend(port):
 
 def start_frontend(port, backend_port):
     """Start the Next.js frontend (output -> backend/logs/desktop-frontend.log).
-    BACKEND_PORT tells next.config.mjs where to proxy /api (the backend may
-    not be on 8000 if that port was busy)."""
+    BACKEND_PORT tells next.config.mjs where to proxy /api (kept explicit
+    although the launcher now always runs the backend on 8000)."""
     env = os.environ.copy()
     env["PORT"] = str(port)
     env["BACKEND_PORT"] = str(backend_port)
@@ -352,15 +526,31 @@ def main():
 
     print()
 
-    # ── Step 2: Find free ports ──
-    global BACKEND_PORT, FRONTEND_PORT
-    BACKEND_PORT = find_free_port(8000)
-    FRONTEND_PORT = find_free_port(3000)
+    # ── Step 2: Claim ports 8000 / 3000 (see "Ports" above) ──
+    # Both are inspected before anything is stopped, so a stranger on 3000
+    # never costs the user their running backend.
+    old_backend = inspect_port(BACKEND_PORT, "backend", is_voicedub_backend)
+    old_frontend = (inspect_port(FRONTEND_PORT, "frontend", is_voicedub_frontend)
+                    if old_backend is not None else None)
+    if old_backend is None or old_frontend is None:
+        input("\n  Press Enter to exit...")
+        sys.exit(1)
+    if old_backend and not confirm_stop_backend(BACKEND_PORT):
+        input("\n  Press Enter to exit...")
+        sys.exit(1)
+    for port, what, pids in ((BACKEND_PORT, "backend", old_backend),
+                             (FRONTEND_PORT, "frontend", old_frontend)):
+        if pids and not stop_old_server(port, what, pids):
+            input("\n  Press Enter to exit...")
+            sys.exit(1)
 
     # ── Step 3: Start servers ──
     log(f"Starting backend on port {BACKEND_PORT}...", "STEP")
-    start_backend(BACKEND_PORT)
-    if not wait_for_server(f"http://localhost:{BACKEND_PORT}/api/health"):
+    backend = start_backend(BACKEND_PORT)
+    # The health check only proves that *something* answers on the port; if
+    # our process has already exited, that is not this launch's backend.
+    if (not wait_for_server(f"http://{BACKEND_HOST}:{BACKEND_PORT}/api/health")
+            or backend.poll() is not None):
         log("Backend failed to start!", "ERR")
         out = _log_tail(BACKEND_LOG)
         if out:
@@ -371,8 +561,9 @@ def main():
     log(f"Backend running on port {BACKEND_PORT} (log: {BACKEND_LOG})", "OK")
 
     log(f"Starting frontend on port {FRONTEND_PORT}...", "STEP")
-    start_frontend(FRONTEND_PORT, BACKEND_PORT)
-    if not wait_for_server(f"http://localhost:{FRONTEND_PORT}", timeout=60):
+    frontend = start_frontend(FRONTEND_PORT, BACKEND_PORT)
+    if (not wait_for_server(f"http://localhost:{FRONTEND_PORT}", timeout=60)
+            or frontend.poll() is not None):
         log("Frontend failed to start!", "ERR")
         out = _log_tail(FRONTEND_LOG)
         if out:

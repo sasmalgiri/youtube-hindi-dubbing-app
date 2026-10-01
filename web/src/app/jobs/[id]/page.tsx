@@ -7,7 +7,7 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
-import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob, dialogueReportUrl } from '@/lib/api';
+import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob, dialogueReportUrl, getJob, type JobStatus } from '@/lib/api';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
@@ -49,6 +49,18 @@ export default function JobPage() {
         restart,
     } = useJobProgress(jobId);
     const [continuing, setContinuing] = useState(false);
+
+    // The Subtitles button is shown only when the backend has a subtitle file
+    // for this job (the old always-on button 404ed). Split classic jobs move
+    // their subtitles into the saved folder just after the final "done" event,
+    // so the hook's last status read can miss subtitles_path: read once more.
+    const [lateStatus, setLateStatus] = useState<JobStatus | null>(null);
+    useEffect(() => {
+        if (!isComplete || !status || status.subtitles_path) return;
+        const t = setTimeout(() => { getJob(jobId).then(setLateStatus).catch(() => { }); }, 3000);
+        return () => clearTimeout(t);
+    }, [isComplete, status, jobId]);
+    const hasSubtitles = Boolean(status?.subtitles_path || lateStatus?.subtitles_path);
 
     const handleSrtUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
@@ -105,16 +117,18 @@ export default function JobPage() {
                     {/* Download buttons - shown when complete */}
                     {isComplete && (
                         <>
-                            <a
-                                href={resultSrtUrl(jobId)}
-                                download
-                                className="btn-secondary text-sm flex items-center gap-2"
-                            >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M17 6.1H3" /><path d="M21 12.1H3" /><path d="M15.1 18H3" />
-                                </svg>
-                                Subtitles
-                            </a>
+                            {hasSubtitles && (
+                                <a
+                                    href={resultSrtUrl(jobId)}
+                                    download
+                                    className="btn-secondary text-sm flex items-center gap-2"
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M17 6.1H3" /><path d="M21 12.1H3" /><path d="M15.1 18H3" />
+                                    </svg>
+                                    Subtitles
+                                </a>
+                            )}
                             <a
                                 href={resultVideoUrl(jobId)}
                                 download={status?.video_title ? `${status.video_title} - Dubbed.mp4` : `dubbed_${jobId}.mp4`}
@@ -256,13 +270,18 @@ export default function JobPage() {
                 {status?.speakers && status.speakers.length > 0 && (() => {
                     // One row per character (split jobs report each part; the
                     // character bank keeps labels and voices stable across parts).
+                    // Dialogue jobs fill this list from speakers.json (voice
+                    // categories male_like / female_like / unknown): a missing
+                    // field must not crash the whole job page.
                     const chars = new Map<string, { gender: string; voice: string; label: string; seconds: number; parts: number[]; reused: boolean }>();
                     for (const s of status.speakers!) {
+                        const speaker = String(s.speaker ?? '?');
+                        const voice = String(s.voice ?? '');
                         // Job-wide CHARxx labels merge across parts; older split jobs
                         // reused SPEAKER_xx per part, so keep those rows per part.
-                        const key = s.part != null && !s.speaker.startsWith('CHAR') ? `Part ${s.part} · ${s.speaker}` : s.speaker;
-                        const c = chars.get(key) ?? { gender: s.gender, voice: s.voice, label: s.voice_label || s.voice.split('-').pop()?.replace('Neural', '') || s.voice, seconds: 0, parts: [], reused: false };
-                        c.seconds += s.seconds;
+                        const key = s.part != null && !speaker.startsWith('CHAR') ? `Part ${s.part} · ${speaker}` : speaker;
+                        const c = chars.get(key) ?? { gender: String(s.gender ?? '').toLowerCase(), voice, label: s.voice_label || voice.split('-').pop()?.replace('Neural', '') || voice || '?', seconds: 0, parts: [], reused: false };
+                        c.seconds += Number(s.seconds) || 0;
                         if (s.part != null && !c.parts.includes(s.part)) c.parts.push(s.part);
                         c.reused = c.reused || !!s.reused;
                         chars.set(key, c);
@@ -277,8 +296,8 @@ export default function JobPage() {
                                 {rows.map(([name, c]) => (
                                     <div key={name} className="flex items-center justify-between text-xs">
                                         <div className="flex items-center gap-2">
-                                            <span className={`px-1.5 py-0.5 rounded font-medium ${c.gender === 'female' ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'}`}>
-                                                {c.gender === 'female' ? 'F' : 'M'}
+                                            <span className={`px-1.5 py-0.5 rounded font-medium ${c.gender.startsWith('female') ? 'bg-pink-500/20 text-pink-300' : c.gender.startsWith('male') ? 'bg-blue-500/20 text-blue-300' : 'bg-zinc-500/20 text-zinc-300'}`}>
+                                                {c.gender.startsWith('female') ? 'F' : c.gender.startsWith('male') ? 'M' : '?'}
                                             </span>
                                             <span className="text-text-secondary">{name}</span>
                                             <span className="text-text-muted">
@@ -295,7 +314,8 @@ export default function JobPage() {
                     );
                 })()}
 
-                {/* Hindi dialogue profile: honest result status + report */}
+                {/* Honest result status (any mode); the report link only when a
+                    report exists — classic jobs with warnings have none (404) */}
                 {status?.result_status && (
                     <div className="glass-card p-4">
                         <div className="flex items-center justify-between gap-3">
@@ -312,10 +332,12 @@ export default function JobPage() {
                                     </ul>
                                 )}
                             </div>
-                            <a href={dialogueReportUrl(jobId)} target="_blank" rel="noreferrer"
-                               className="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-text-primary whitespace-nowrap">
-                                Open report
-                            </a>
+                            {status.report_path && (
+                                <a href={dialogueReportUrl(jobId)} target="_blank" rel="noreferrer"
+                                   className="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-text-primary whitespace-nowrap">
+                                    Open report
+                                </a>
+                            )}
                         </div>
                     </div>
                 )}

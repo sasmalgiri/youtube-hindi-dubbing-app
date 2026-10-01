@@ -1,3 +1,10 @@
+# Backend packages. On the owner's PC all of this is already installed: do not
+# `pip install -r` this file there (faster-whisper's CPU "onnxruntime"
+# dependency would overwrite onnxruntime-gpu; see constraints.txt). A missing
+# package is installed on its own, constrained to the working versions:
+#     python -m pip install -c backend/constraints.txt <package>
+# A fresh PC: setup.bat installs this file with -c constraints.txt and the
+# cu121 index (for the pinned CUDA torch).
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
@@ -18,9 +25,17 @@ pywebview>=5.0
 supabase>=2.0.0
 
 # ── GPU features: WhisperX word-level alignment + Demucs background separation ──
-# torch must be the CUDA build to use the GPU. On an NVIDIA machine install with:
-#   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# torch must be the CUDA build to use the GPU. Working version on the owner's
+# PC: torch==2.4.1+cu121 + torchaudio==2.4.1+cu121 from the cu121 index:
+#   pip install -c backend/constraints.txt torch==2.4.1+cu121 torchaudio==2.4.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
 # (plain `pip install torch` pulls the CPU build — WhisperX/Demucs still run, just slowly.)
-torch>=2.2
-whisperx>=3.8.0        # forced alignment for tighter word timestamps (on by default)
+# Not listed here any more: `torch>=2.2` let pip pick any torch, and whisperx
+# 3.8 declares torch~=2.8 + faster-whisper>=1.2, so a normal install swaps the
+# CUDA torch for a CPU torch 2.8. whisperx 3.8.4 is installed without its deps
+# (nltk, omegaconf, pandas go in separately with -c; pyannote.audio: see
+# requirements-dialogue.txt):
+#   pip install --no-deps whisperx==3.8.4
+# (without it, word timing reports "WhisperX not available" and uses local Whisper).
+# torch>=2.2
+# whisperx>=3.8.0        # forced alignment for tighter word timestamps (on by default)
 demucs>=4.0.0          # vocal/background stem separation for "keep background music"

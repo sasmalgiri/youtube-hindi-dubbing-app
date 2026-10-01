@@ -873,14 +873,14 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     : 'Translates transcribed text into your target language.'}
                             </p>
                             <p className="text-[10px] text-text-muted mb-3">
-                                <b className="text-text-secondary">Recommended:</b> <i>Google</i> = fastest free (used by default). <i>Gemma 4</i> = best Hindi quality but needs GEMINI_API_KEY. <i>Cerebras</i> = ultra-fast LLM, also good.
+                                <b className="text-text-secondary">Recommended:</b> <i>Groq</i> (gpt-oss-120b) = free, fast, good Hindi — used by default, needs GROQ_API_KEY. <i>Google</i>&apos;s free endpoint is blocked on this PC (HTTP 429), so Google jobs stop at translation. <i>Gemma 4</i> = best Hindi quality but needs GEMINI_API_KEY. <i>Cerebras</i> = ultra-fast LLM, also good.
                             </p>
                             <div className="grid grid-cols-6 gap-2 mb-3">
                                 {[
                                     { value: 'auto', label: 'Auto', desc: 'Best available' },
                                     { value: 'gemma4', label: 'Gemma 4', desc: 'Best Hindi (free, 31B)' },
                                     { value: 'turbo', label: 'Turbo', desc: 'Groq+SambaNova parallel' },
-                                    { value: 'groq', label: 'Groq', desc: 'Llama 3.3 70B (free)' },
+                                    { value: 'groq', label: 'Groq', desc: 'gpt-oss-120b (free)' },
                                     { value: 'sambanova', label: 'SambaNova', desc: 'Llama 3.3 70B (free)' },
                                     { value: 'gemini', label: 'Gemini', desc: 'Google AI (free)' },
                                 ].map((m) => (
