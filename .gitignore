@@ -100,3 +100,6 @@ backend/credentials/
 
 # Optional local-AI model environments (setup_local_ai.bat)
 backend/.venvs/
+
+# Downloaded AI model weights (audio-separator BS-Roformer is ~640 MB; never commit)
+backend/models/

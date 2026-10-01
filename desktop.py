@@ -232,17 +232,42 @@ def check_gpu():
 
 
 # ── Server Management ────────────────────────────────────────────────────────
+# Server output goes to log files, never to subprocess.PIPE: nothing reads
+# those pipes while the app runs, so once the OS pipe buffer (a few KB) fills
+# up, the server's next print() blocks forever — the backend froze mid-job.
+LOG_DIR = os.path.join(BACKEND_DIR, "logs")
+BACKEND_LOG = os.path.join(LOG_DIR, "desktop-backend.log")
+FRONTEND_LOG = os.path.join(LOG_DIR, "desktop-frontend.log")
+
+
+def _open_log(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, "a", encoding="utf-8", errors="replace")
+    f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    f.flush()
+    return f
+
+
+def _log_tail(path, n=2000):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()[-n:]
+    except OSError:
+        return ""
+
+
 def start_backend(port):
-    """Start the FastAPI backend."""
+    """Start the FastAPI backend (output -> backend/logs/desktop-backend.log)."""
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
 
     proc = subprocess.Popen(
         [PYTHON, "-m", "uvicorn", "app:app",
          "--host", "0.0.0.0", "--port", str(port)],
         cwd=BACKEND_DIR,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=_open_log(BACKEND_LOG),
         stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
@@ -250,17 +275,20 @@ def start_backend(port):
     return proc
 
 
-def start_frontend(port):
-    """Start the Next.js frontend."""
+def start_frontend(port, backend_port):
+    """Start the Next.js frontend (output -> backend/logs/desktop-frontend.log).
+    BACKEND_PORT tells next.config.mjs where to proxy /api (the backend may
+    not be on 8000 if that port was busy)."""
     env = os.environ.copy()
     env["PORT"] = str(port)
+    env["BACKEND_PORT"] = str(backend_port)
     npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
 
     proc = subprocess.Popen(
         [npm_cmd, "run", "dev", "--", "-p", str(port)],
         cwd=FRONTEND_DIR,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=_open_log(FRONTEND_LOG),
         stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
@@ -334,23 +362,21 @@ def main():
     start_backend(BACKEND_PORT)
     if not wait_for_server(f"http://localhost:{BACKEND_PORT}/api/health"):
         log("Backend failed to start!", "ERR")
-        # Show last output
-        if processes:
-            try:
-                out = processes[-1].stdout.read(2000).decode(errors="replace")
-                if out:
-                    print(f"\n  Backend output:\n{out[:500]}")
-            except Exception:
-                pass
+        out = _log_tail(BACKEND_LOG)
+        if out:
+            print(f"\n  Backend output (end of {BACKEND_LOG}):\n{out}")
         cleanup()
         input("\n  Press Enter to exit...")
         sys.exit(1)
-    log(f"Backend running on port {BACKEND_PORT}", "OK")
+    log(f"Backend running on port {BACKEND_PORT} (log: {BACKEND_LOG})", "OK")
 
     log(f"Starting frontend on port {FRONTEND_PORT}...", "STEP")
-    start_frontend(FRONTEND_PORT)
-    if not wait_for_server(f"http://localhost:{FRONTEND_PORT}", timeout=30):
+    start_frontend(FRONTEND_PORT, BACKEND_PORT)
+    if not wait_for_server(f"http://localhost:{FRONTEND_PORT}", timeout=60):
         log("Frontend failed to start!", "ERR")
+        out = _log_tail(FRONTEND_LOG)
+        if out:
+            print(f"\n  Frontend output (end of {FRONTEND_LOG}):\n{out}")
         cleanup()
         input("\n  Press Enter to exit...")
         sys.exit(1)
@@ -366,6 +392,13 @@ def main():
     # ── Step 4: Open native window ──
     try:
         import webview
+
+        # pywebview ignores file downloads unless this is on: the Download
+        # video / subtitles / report buttons silently did nothing.
+        try:
+            webview.settings["ALLOW_DOWNLOADS"] = True
+        except Exception:
+            pass
 
         window = webview.create_window(
             title="VoiceDub",
