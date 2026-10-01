@@ -204,9 +204,10 @@ def default_components(cfg: DialogueConfig) -> Components:
         notes["asr"] = f"local faster-whisper {p.cfg.asr_model if p.cfg.asr_model not in ('groq-whisper','groq','parakeet') else 'medium'}"
         return segs
 
-    def diarize(wav: Path) -> DiarizationResult:
+    def diarize(wav: Path, seg_bounds=None) -> DiarizationResult:
         return run_pyannote(wav, hf_token_from_env(), cfg.diarization_model,
-                            cfg.num_speakers, cfg.min_speakers, cfg.max_speakers)
+                            cfg.num_speakers, cfg.min_speakers, cfg.max_speakers,
+                            seg_bounds=seg_bounds)
 
     def fetch_subs(url: str):
         p = _legacy_pipeline(cfg)
@@ -342,6 +343,7 @@ class DialogueOrchestrator:
         # text source
         mode, cues = self._text_source()
         asr_words = []
+        asr_segs = []
         with self._stage("transcribe") as st:
             st.data["text_source"] = mode
             if mode != "translated_srt":
@@ -354,6 +356,7 @@ class DialogueOrchestrator:
                 else:
                     try:
                         segs = self.c.asr(audio_16k)
+                        asr_segs = segs
                         asr_words = words_from_asr_segments(segs)
                         st.detail = f"{len(asr_words)} words; " + self.c.notes.get("asr", "")
                         if self.c.notes.get("asr_fallback"):
@@ -375,7 +378,13 @@ class DialogueOrchestrator:
                 st.detail = "no diarization backend"
             else:
                 try:
-                    diar = self.c.diarize(audio_16k)
+                    # Transcript line boundaries let diarization re-check each
+                    # line (minor characters); passed only to backends that take them.
+                    import inspect as _inspect
+                    _kw = {}
+                    if asr_segs and "seg_bounds" in _inspect.signature(self.c.diarize).parameters:
+                        _kw["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
+                    diar = self.c.diarize(audio_16k, **_kw)
                     st.detail = f"{diar.backend}: {len(diar.speakers)} speakers"
                     r.model_versions["diarization"] = diar.backend
                 except DiarizationUnavailable as e:

@@ -253,31 +253,47 @@ export default function JobPage() {
                         <p className="text-xs text-text-muted mt-1">{status.speaker_warning}</p>
                     </div>
                 )}
-                {status?.speakers && status.speakers.length > 0 && (
-                    <div className="glass-card p-4">
-                        <p className="text-sm font-medium text-text-primary mb-2">
-                            Speakers ({new Set(status.speakers.map((s) => s.voice)).size} voices)
-                        </p>
-                        <div className="space-y-1.5">
-                            {status.speakers.map((s, i) => (
-                                <div key={`${s.part ?? 0}-${s.speaker}-${i}`} className="flex items-center justify-between text-xs">
-                                    <div className="flex items-center gap-2">
-                                        <span className={`px-1.5 py-0.5 rounded font-medium ${s.gender === 'female' ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'}`}>
-                                            {s.gender === 'female' ? 'F' : 'M'}
+                {status?.speakers && status.speakers.length > 0 && (() => {
+                    // One row per character (split jobs report each part; the
+                    // character bank keeps labels and voices stable across parts).
+                    const chars = new Map<string, { gender: string; voice: string; label: string; seconds: number; parts: number[]; reused: boolean }>();
+                    for (const s of status.speakers!) {
+                        // Job-wide CHARxx labels merge across parts; older split jobs
+                        // reused SPEAKER_xx per part, so keep those rows per part.
+                        const key = s.part != null && !s.speaker.startsWith('CHAR') ? `Part ${s.part} · ${s.speaker}` : s.speaker;
+                        const c = chars.get(key) ?? { gender: s.gender, voice: s.voice, label: s.voice_label || s.voice.split('-').pop()?.replace('Neural', '') || s.voice, seconds: 0, parts: [], reused: false };
+                        c.seconds += s.seconds;
+                        if (s.part != null && !c.parts.includes(s.part)) c.parts.push(s.part);
+                        c.reused = c.reused || !!s.reused;
+                        chars.set(key, c);
+                    }
+                    const rows = [...chars.entries()].sort((a, b) => b[1].seconds - a[1].seconds);
+                    return (
+                        <div className="glass-card p-4">
+                            <p className="text-sm font-medium text-text-primary mb-2">
+                                Characters ({rows.length}) · {new Set(rows.map(([, c]) => c.voice)).size} distinct voices
+                            </p>
+                            <div className="space-y-1.5">
+                                {rows.map(([name, c]) => (
+                                    <div key={name} className="flex items-center justify-between text-xs">
+                                        <div className="flex items-center gap-2">
+                                            <span className={`px-1.5 py-0.5 rounded font-medium ${c.gender === 'female' ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'}`}>
+                                                {c.gender === 'female' ? 'F' : 'M'}
+                                            </span>
+                                            <span className="text-text-secondary">{name}</span>
+                                            <span className="text-text-muted">
+                                                {Math.round(c.seconds)}s{c.parts.length > 1 ? ` · parts ${c.parts.sort((x, y) => x - y).join(',')}` : ''}
+                                            </span>
+                                        </div>
+                                        <span className="text-text-primary">
+                                            {c.label}{c.reused && <span className="text-amber-400" title="More characters than distinct voices"> (reused)</span>}
                                         </span>
-                                        <span className="text-text-secondary">
-                                            {s.part != null ? `Part ${s.part} · ` : ''}{s.speaker}
-                                        </span>
-                                        <span className="text-text-muted">{Math.round(s.seconds)}s</span>
                                     </div>
-                                    <span className="text-text-primary">
-                                        {s.voice.split('-').pop()?.replace('Neural', '')}
-                                    </span>
-                                </div>
-                            ))}
+                                ))}
+                            </div>
                         </div>
-                    </div>
-                )}
+                    );
+                })()}
 
                 {/* Hindi dialogue profile: honest result status + report */}
                 {status?.result_status && (

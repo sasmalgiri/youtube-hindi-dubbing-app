@@ -625,9 +625,15 @@ def _generate_youtube_description(job: Job) -> str:
 
 def _get_video_duration(ffmpeg_path: str, video_path: Path) -> float:
     """Get video duration in seconds using ffprobe."""
-    ffprobe = str(Path(ffmpeg_path).parent / "ffprobe") if Path(ffmpeg_path).is_absolute() else "ffprobe"
-    if sys.platform == "win32" and not ffprobe.endswith(".exe"):
-        ffprobe += ".exe"
+    # Resolve ffprobe independently of ffmpeg_path (same rule as
+    # Pipeline._resolve_ffprobe): the pipeline's ffmpeg can be the
+    # imageio-ffmpeg binary, which has no ffprobe beside it. Deriving the
+    # path from it made every probe return 0, so split mode silently ran
+    # long videos as ONE part.
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        sib = Path(ffmpeg_path).parent / ("ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+        ffprobe = str(sib) if Path(ffmpeg_path).is_absolute() and sib.exists() else "ffprobe"
     try:
         result = subprocess.run(
             [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
@@ -1824,6 +1830,9 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
     # Titled output folders (sanitized for Windows); parts are saved as they finish.
     base_title = _sanitize_filename(job.video_title or "Untitled")
     saved_parts = []
+    # One character bank for the whole video: each part's speakers are matched
+    # to the characters already met, so a character keeps one voice throughout.
+    speaker_bank: Dict[str, Dict] = {}
     for part_idx, part_path in enumerate(parts):
         part_num = part_idx + 1
         part_label = f"Part {part_num}/{num_parts}"
@@ -1947,6 +1956,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
                            cancel_check=job.cancel_event.is_set)
         job.pipeline_ref = pipeline   # cancel handler can kill in-flight subprocesses
         pipeline.video_title = f"{job.video_title} - Part {part_num}"
+        pipeline._speaker_bank = speaker_bank
         pipeline.run()
 
         # Each part diarizes its own audio; keep every part's speakers.

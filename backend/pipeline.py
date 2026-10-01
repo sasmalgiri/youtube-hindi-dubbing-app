@@ -157,6 +157,12 @@ def _whisper_child_worker(wav_path_str: str, model_name: str, device: str,
         sys.exit(1)
 
 
+
+
+from dubbing.speaker_refine import (cut_at_bounds as _cut_at_bounds,  # noqa: E402
+                                   refine_speakers_by_turns as _refine_speakers_by_turns,
+                                   turn_embeddings as _turn_embeddings)
+
 # ── Subprocess worker for speaker diarization + gender ──────────────────────
 # Same isolation as Whisper: pyannote / wav2vec2 run in a child so a native
 # crash or CUDA OOM kills only the child, and all GPU memory is returned when
@@ -165,7 +171,7 @@ DIARIZE_GENDER_MODEL = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-libri
 
 
 def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
-                          result_path: str, given_ranges=None):
+                          result_path: str, given_ranges=None, seg_bounds=None):
     """Diarize (pyannote speaker-diarization-3.1) then classify each speaker's
     gender (wav2vec2 classifier). With given_ranges ({speaker: [(s, e)]},
     e.g. from an uploaded SRT) diarization is skipped and only gender runs.
@@ -210,6 +216,7 @@ def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
         dev = torch.device(device)
 
         ranges, emb_map = {}, {}
+        refined = 0
         if given_ranges:
             ranges = {k: [tuple(r) for r in v] for k, v in given_ranges.items()}
         else:
@@ -267,6 +274,16 @@ def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
                 for i, lab in enumerate(labels):
                     if i < len(embs) and np.all(np.isfinite(embs[i])):
                         emb_map[lab] = [float(x) for x in embs[i]]
+            # Turn-level refinement: recover minor characters that pyannote
+            # folded into a bigger cluster (see _refine_speakers_by_turns).
+            _stage("refine speakers")
+            ranges = _cut_at_bounds(ranges, seg_bounds)
+            emb_fn = getattr(pipe, "_embedding", None)
+            turn_embs = _turn_embeddings(ranges, waveform, sr, emb_fn) if emb_fn is not None else {}
+            ranges, cents, n_split = _refine_speakers_by_turns(ranges, turn_embs)
+            for k, c in cents.items():   # turn-based centroids for every speaker
+                emb_map[k] = [float(x) for x in c]
+            refined = n_split
             del pipe, waveform
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -308,7 +325,7 @@ def _diarize_child_worker(wav_path_str: str, hf_token: str, device: str,
 
         with open(result_path, "w", encoding="utf-8") as f:
             _json.dump({"ranges": ranges, "embeddings": emb_map, "gender": gender,
-                        "p_male": p_male, "error": None}, f)
+                        "p_male": p_male, "refined": refined, "error": None}, f)
         _stage("done")
     except Exception as exc:
         try:
@@ -993,20 +1010,23 @@ MALE_VOICES = {
     "ur": "ur-PK-AsadNeural",
 }
 
+from dubbing.hindi_voices import (MALE_SLOTS as _HI_MALE_SLOTS,  # noqa: E402
+                                 FEMALE_SLOTS as _HI_FEMALE_SLOTS,
+                                 base_voice as _base_voice,
+                                 edge_communicate as _edge_communicate,
+                                 slot_label as _slot_label)
+
 # Pool of distinct voices per gender per language for multi-speaker
 VOICE_POOL = {
     "en": {
         "female": ["en-US-JennyNeural", "en-US-AriaNeural", "en-US-SaraNeural"],
         "male":   ["en-US-GuyNeural", "en-US-ChristopherNeural", "en-US-EricNeural"],
     },
-    # Edge has only two native Hindi voices; extra same-gender speakers get
-    # Multilingual voices, which read Devanagari as intelligibly (Whisper
-    # word-match 85-88% vs Madhur 85% / Swara 79%). Ordered best-first.
+    # One slot per character, most distinct first (dubbing/hindi_voices.py:
+    # native + Multilingual voices, then +/-20 Hz variants).
     "hi": {
-        "female": ["hi-IN-SwaraNeural", "en-US-EmmaMultilingualNeural",
-                   "de-DE-SeraphinaMultilingualNeural", "fr-FR-VivienneMultilingualNeural"],
-        "male":   ["hi-IN-MadhurNeural", "en-US-BrianMultilingualNeural",
-                   "en-AU-WilliamMultilingualNeural", "de-DE-FlorianMultilingualNeural"],
+        "female": list(_HI_FEMALE_SLOTS),
+        "male":   list(_HI_MALE_SLOTS),
     },
     "es": {
         "female": ["es-ES-ElviraNeural", "es-MX-DaliaNeural"],
@@ -1376,6 +1396,9 @@ class Pipeline:
         self._speaker_speech_sec: Dict[str, float] = {}
         self._speaker_ranges: Dict[str, List[tuple]] = {}
         self._speaker_genders: Dict[str, str] = {}
+        # Split jobs: app.py shares one {label: {...}} bank across all parts
+        self._speaker_bank: Optional[Dict[str, Dict]] = None
+        self._reused_voices: set = set()
         # Shown on the job page: who spoke, detected gender, assigned voice;
         # and a sticky warning when multi-speaker was requested but failed.
         self.speaker_summary: List[Dict] = []
@@ -1879,7 +1902,7 @@ class Pipeline:
 
     # ── Speaker Diarization ───────────────────────────────────────────────
 
-    def _diarize(self, wav_path: Path) -> tuple:
+    def _diarize(self, wav_path: Path, seg_bounds=None) -> tuple:
         """Run speaker diarization + per-speaker gender in an isolated child.
         Returns (speaker_genders, speaker_ranges) or ({}, {}) on failure.
 
@@ -1888,12 +1911,16 @@ class Pipeline:
         similar real speaker, so a stray 2-second "speaker" never gets its
         own random voice."""
         MIN_SPEAKER_SEC = 3.0
-        res = self._run_speaker_worker(wav_path)
+        res = self._run_speaker_worker(wav_path, seg_bounds=seg_bounds)
         if not res:
             return {}, {}
         ranges = {k: [tuple(r) for r in v] for k, v in res["ranges"].items()}
         genders = dict(res.get("gender") or {})
         embs = res.get("embeddings") or {}
+        if res.get("refined"):
+            self._report("transcribe", 0.965,
+                         f"Speaker refinement: {res['refined']} line group(s) moved to their own "
+                         f"character (diarization had merged them)")
         if not ranges:
             self.speaker_warning = "Multi-speaker: no speech turns found — the whole video used one voice"
             self._report("transcribe", 0.97, self.speaker_warning)
@@ -1923,6 +1950,10 @@ class Pipeline:
         for s in ranges:
             genders.setdefault(s, self._default_voice_gender())
 
+        bank = getattr(self, "_speaker_bank", None)
+        if bank is not None:
+            ranges, genders, speech = self._match_speaker_bank(bank, ranges, genders, speech, embs)
+
         self._speaker_speech_sec = speech
         self._report("transcribe", 0.98, "Speakers: " + ", ".join(
             f"{s}={genders[s]} ({speech[s]:.0f}s)"
@@ -1951,7 +1982,8 @@ class Pipeline:
         return "female" if self.cfg.tts_voice in pool.get("female", []) else "male"
 
     def _run_speaker_worker(self, wav_path: Path, given_ranges=None, step: str = "transcribe",
-                            p_lo: float = 0.82, p_hi: float = 0.97) -> Optional[Dict]:
+                            p_lo: float = 0.82, p_hi: float = 0.97,
+                            seg_bounds=None) -> Optional[Dict]:
         """Spawn _diarize_child_worker; heartbeat every 10 s, honour cancel,
         bound by a timeout. Progress is reported under `step` within
         [p_lo, p_hi] (the SRT path runs inside "translate"). Returns the
@@ -2006,7 +2038,8 @@ class Pipeline:
             self._report(step, p_lo,
                          f"Detecting {what} on {device.upper()} (isolated process)...")
             p = mp.Process(target=_diarize_child_worker,
-                           args=(str(wav_path), hf_token, device, result_path, given_ranges),
+                           args=(str(wav_path), hf_token, device, result_path, given_ranges,
+                                 seg_bounds),
                            daemon=True)
             p.start()
             t0 = _time.time()
@@ -2238,6 +2271,8 @@ class Pipeline:
         self.speaker_summary = [
             {"speaker": spk, "gender": genders.get(spk, ""),
              "voice": (self._voice_map or {}).get(spk, self.cfg.tts_voice),
+             "voice_label": _slot_label((self._voice_map or {}).get(spk, self.cfg.tts_voice)),
+             "reused": spk in (getattr(self, "_reused_voices", None) or set()),
              "seconds": round(float(speech.get(spk, 0.0)), 1)}
             for spk in sorted(genders, key=lambda k: (-speech.get(k, 0.0), k))
         ]
@@ -2277,39 +2312,138 @@ class Pipeline:
         (shubh = male, ishita = female)."""
         female = set(VOICE_POOL.get(self.cfg.target_language, {}).get("female", [])) | {
             DEFAULT_VOICES.get(self.cfg.target_language, "")}
-        return "ishita" if edge_voice in female else "shubh"
+        return "ishita" if _base_voice(edge_voice) in {_base_voice(v) for v in female} else "shubh"
 
     def _sarvam_speaker_for_seg(self, seg: Dict) -> str:
         """Sarvam speaker for a segment, matching its speaker's voice gender."""
         return self._sarvam_speaker_for_voice(self._voice_for_segment(seg))
 
+    # Same character across split parts if voice fingerprints (cosine
+    # distance) are closer than this. pyannote 3.1's 0.7045 threshold is a
+    # Euclidean distance between unit vectors, i.e. ~0.25 cosine, so within a
+    # part it already separates voices ~0.25 apart; 0.4 leaves headroom for
+    # the same person sounding a bit different in another part without
+    # gluing two distinct characters together.
+    SPEAKER_BANK_MATCH_DIST = 0.4
+
+    def _match_speaker_bank(self, bank: Dict[str, Dict], ranges, genders, speech, embs):
+        """Relabel this part's speakers with job-wide character labels.
+
+        Split jobs diarize each part separately, so SPEAKER_01 in part 2 is
+        not SPEAKER_01 in part 1. Each local speaker is matched (most
+        talkative first, same gender, one-to-one) to the closest character
+        already in `bank` by embedding; otherwise it becomes a new character.
+        Matched characters keep their first gender and voice for the whole
+        video. `bank` is shared by all parts: {label: {emb, gender, seconds,
+        voice}}."""
+        import numpy as _np
+
+        def _dist(a, b):
+            a, b = _np.asarray(a, dtype=float), _np.asarray(b, dtype=float)
+            return 1.0 - float(a @ b / (_np.linalg.norm(a) * _np.linalg.norm(b) + 1e-9))
+
+        # Closest pairs first (not talk-time order): a talkative newcomer that
+        # happens to be near the hero's fingerprint must not take the hero's
+        # label/voice before the hero is matched.
+        pairs = sorted(
+            (_dist(embs[spk], ent["emb"]), spk, lab)
+            for spk in ranges if embs.get(spk) is not None
+            for lab, ent in bank.items()
+            if ent.get("emb") is not None and ent.get("gender") == genders.get(spk))
+        mapping, used = {}, set()
+        for d, spk, lab in pairs:
+            if d >= self.SPEAKER_BANK_MATCH_DIST:
+                break
+            if spk in mapping or lab in used:
+                continue
+            mapping[spk] = lab
+            used.add(lab)
+        for spk, lab in mapping.items():   # update fingerprints after matching
+            ent = bank[lab]
+            w0, w1 = ent.get("seconds", 0.0), speech.get(spk, 0.0)
+            ent["emb"] = list((_np.asarray(ent["emb"]) * w0 + _np.asarray(embs[spk]) * w1)
+                              / max(w0 + w1, 1e-9))
+            ent["seconds"] = w0 + w1
+        n_matched = len(mapping)
+        for spk in sorted(ranges, key=lambda k: -speech.get(k, 0.0)):
+            if spk in mapping:
+                continue
+            label = f"CHAR{len(bank) + 1:02d}"
+            e = embs.get(spk)
+            bank[label] = {"emb": list(e) if e is not None else None,
+                           "gender": genders.get(spk), "seconds": speech.get(spk, 0.0),
+                           "voice": None}
+            mapping[spk] = label
+        ranges = {mapping[k]: v for k, v in ranges.items()}
+        genders = {mapping[k]: bank[mapping[k]]["gender"] or v for k, v in genders.items()}
+        speech = {mapping[k]: v for k, v in speech.items()}
+        self._report("transcribe", 0.975,
+                     f"Characters: {n_matched} matched from earlier parts, "
+                     f"{len(mapping) - n_matched} new")
+        return ranges, genders, speech
+
     def _assign_voices_to_speakers(self, speaker_genders: Dict[str, str]) -> Dict[str, str]:
-        """Map each speaker to a distinct voice from VOICE_POOL. Speakers are
-        taken in order of how much they talk, so the main speaker of each
-        gender gets that gender's primary voice (the job's selected voice
-        when it is in the pool)."""
+        """Give every speaker (character) its own voice slot from VOICE_POOL.
+
+        Speakers are taken in order of how much they talk, so the main
+        speaker of each gender gets that gender's primary voice (the job's
+        selected voice when it is in the pool), and so on down the pool's
+        most-distinct-first order. A voice is reused only when a gender has
+        more characters than slots (marked "reused" in the speaker summary).
+        In split jobs the character bank keeps each character's voice across
+        parts."""
         lang = self.cfg.target_language
         pool = VOICE_POOL.get(lang, {})
-        female_voices = list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")]))
-        male_voices = list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")]))
-        for voices in (female_voices, male_voices):
+        slots = {
+            "female": list(pool.get("female", [DEFAULT_VOICES.get(lang, "en-US-JennyNeural")])),
+            "male": list(pool.get("male", [MALE_VOICES.get(lang, "en-US-GuyNeural")])),
+        }
+        for voices in slots.values():
             if self.cfg.tts_voice in voices:
                 voices.remove(self.cfg.tts_voice)
                 voices.insert(0, self.cfg.tts_voice)
 
+        bank = getattr(self, "_speaker_bank", None)
         speech = getattr(self, "_speaker_speech_sec", None) or {}
-        voice_map = {}
-        female_idx = 0
-        male_idx = 0
-
+        voice_map: Dict[str, str] = {}
+        taken = {g: [] for g in slots}
+        if bank is not None:
+            for ent in bank.values():
+                if ent.get("voice") and ent.get("gender") in taken:
+                    taken[ent["gender"]].append(ent["voice"])
+        self._reused_voices = set()
+        # voice -> [(owner, seconds, present in this run)]
+        owners: Dict[str, List[tuple]] = {}
+        if bank is not None:
+            for lab, ent in bank.items():
+                if ent.get("voice"):
+                    owners.setdefault(ent["voice"], []).append(
+                        (lab, float(ent.get("seconds", 0.0)), lab in speaker_genders))
         for speaker in sorted(speaker_genders, key=lambda s: (-speech.get(s, 0.0), s)):
-            if speaker_genders[speaker] == "male":
-                voice_map[speaker] = male_voices[male_idx % len(male_voices)]
-                male_idx += 1
+            g = "male" if speaker_genders[speaker] == "male" else "female"
+            ent = bank.get(speaker) if bank is not None else None
+            if ent and ent.get("voice"):
+                voice_map[speaker] = ent["voice"]
+                continue
+            free = [v for v in slots[g] if v not in taken[g]]
+            if free:
+                voice = free[0]
             else:
-                voice_map[speaker] = female_voices[female_idx % len(female_voices)]
-                female_idx += 1
-
+                # More characters than distinct slots: reuse the voice of the
+                # least-talkative character — preferably one not in this
+                # part — never the lead's by default. Both are flagged.
+                cands = [v for v in slots[g] if v in owners] or list(slots[g])
+                absent = [v for v in cands if not any(p for _, _, p in owners.get(v, []))]
+                voice = min(absent or cands,
+                            key=lambda v: (sum(sec for _, sec, _ in owners.get(v, [])),
+                                           -slots[g].index(v)))
+                self._reused_voices.add(speaker)
+                self._reused_voices.update(o for o, _, p in owners.get(voice, []) if p)
+            taken[g].append(voice)
+            owners.setdefault(voice, []).append((speaker, speech.get(speaker, 0.0), True))
+            voice_map[speaker] = voice
+            if ent is not None:
+                ent["voice"] = voice
         return voice_map
 
     def _save_speaker_refs(self, audio_raw: Path, segments: List[Dict]):
@@ -2521,7 +2655,9 @@ class Pipeline:
         if self.cfg.multi_speaker:
             # 16 kHz mono (what pyannote/wav2vec2 use) — 6x less RAM than the
             # 48 kHz stereo audio_raw on long videos.
-            speaker_genders, speaker_ranges = self._diarize(self._whisper_audio or audio_raw)
+            speaker_genders, speaker_ranges = self._diarize(
+                self._whisper_audio or audio_raw,
+                seg_bounds=[(float(sg["start"]), float(sg["end"])) for sg in text_segments])
             if speaker_genders and speaker_ranges:
                 text_segments = self._assign_speaker_to_segments(text_segments, speaker_ranges)
                 self._speaker_ranges = speaker_ranges
@@ -2533,7 +2669,7 @@ class Pipeline:
                 self._report("transcribe", 0.99,
                              f"{len(self._voice_map)} speakers → {len(set(self._voice_map.values()))} "
                              f"distinct voices: " + ", ".join(
-                                 f"{d['speaker']}={d['gender']}/{d['voice'].split('-')[-1].replace('Neural', '')}"
+                                 f"{d['speaker']}={d['gender']}/{d['voice_label']}"
                                  for d in self.speaker_summary))
 
         # Transcribe-only mode: save source SRT, extract per-speaker refs, and stop
@@ -10931,7 +11067,7 @@ class Pipeline:
             Path(mp3_path).write_bytes(cached_bytes)
             return
 
-        comm = edge_tts.Communicate(tts_input, _voice, rate=_rate)
+        comm = _edge_communicate(tts_input, _voice, rate=_rate)
         await comm.save(str(mp3_path))
 
         # Store in cache
@@ -11541,7 +11677,7 @@ class Pipeline:
 
                 # Strategies plain / pauses / natural: single-call path
                 async def _do():
-                    comm = edge_tts.Communicate(effective_text, voice, rate=effective_rate)
+                    comm = _edge_communicate(effective_text, voice, rate=effective_rate)
                     await comm.save(str(mp3))
 
                 asyncio.run(_do())
@@ -11601,7 +11737,7 @@ class Pipeline:
                 if len(pieces) < 2:
                     mp3 = retry_dir / f"retry_{sub_idx:04d}_chunked.mp3"
                     async def _do_single():
-                        comm = edge_tts.Communicate(text, voice, rate=rate)
+                        comm = _edge_communicate(text, voice, rate=rate)
                         await comm.save(str(mp3))
                     asyncio.run(_do_single())
                     if not mp3.exists() or mp3.stat().st_size < 200:
@@ -11629,7 +11765,7 @@ class Pipeline:
                     full_sentence = sentence_text + (terminator or "")
                     c_mp3 = retry_dir / f"retry_{sub_idx:04d}_sent{ci:02d}.mp3"
                     async def _do_sentence(_ct=full_sentence, _cm=c_mp3):
-                        comm = edge_tts.Communicate(_ct, voice, rate=rate)
+                        comm = _edge_communicate(_ct, voice, rate=rate)
                         await comm.save(str(_cm))
                     try:
                         asyncio.run(_do_sentence())
@@ -12836,7 +12972,7 @@ class Pipeline:
                                 sub_ok = False
                                 for sub_attempt in range(3):
                                     try:
-                                        comm = edge_tts.Communicate(sub_full, seg_voice, rate=rate)
+                                        comm = _edge_communicate(sub_full, seg_voice, rate=rate)
                                         await comm.save(str(sub_mp3))
                                         if sub_mp3.exists() and sub_mp3.stat().st_size > 200:
                                             sub_ok = True
@@ -12903,7 +13039,7 @@ class Pipeline:
                 # ── PATH B: single-call synthesis — try Edge once, fallback to Google ──
                 edge_ok = False
                 try:
-                    comm = edge_tts.Communicate(text, seg_voice, rate=rate)
+                    comm = _edge_communicate(text, seg_voice, rate=rate)
                     await comm.save(str(mp3))
 
                     # Long-segment trace: post-save state (file size, no exception)

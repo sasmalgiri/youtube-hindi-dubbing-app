@@ -206,7 +206,7 @@ export interface JobStatus {
     description?: string | null;
     qa_score?: number | null;
     // Multi-speaker outcome (per part in split jobs) + sticky failure warning
-    speakers?: { speaker: string; gender: string; voice: string; seconds: number; part?: number }[];
+    speakers?: { speaker: string; gender: string; voice: string; voice_label?: string; reused?: boolean; seconds: number; part?: number }[];
     speaker_warning?: string | null;
     chain_languages?: string[];
     chain_parent_id?: string | null;
