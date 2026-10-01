@@ -32,8 +32,8 @@ from .diarization import (DiarizationResult, DiarizationUnavailable,
                           assign_words, hf_token_from_env, run_pyannote)
 from .report import derive_status, write_report
 from .speaker_registry import SpeakerRegistry, ensure_unknown_speaker
-from .translation import (DialogueTranslator, default_llm_clients,
-                          load_glossary)
+from .translation import (DialogueTranslator, build_mt_engines,
+                          default_llm_clients, load_glossary)
 from .tts import TTSFailure, TTSRouter, build_providers
 from .turns import (align_text_to_words, build_turns, cues_from_turn_like,
                     turns_from_translated_cues, words_from_asr_segments,
@@ -60,7 +60,11 @@ class DialogueConfig:
     max_speakers: Optional[int] = None
     tts_providers: List[str] = field(default_factory=lambda: ["edge"])
     translation_engines: List[str] = field(default_factory=lambda: ["gemini", "groq", "cerebras"])
+    mt_engines: List[str] = field(default_factory=list)   # sentence-level MT fallbacks: indictrans2 | google_basic
     allow_basic_translation_fallback: bool = True
+    ollama_model: str = ""                   # model for the local Ollama translator
+    diarization: bool = True                 # False = single voice by choice (not a failure)
+    duration_rewrite: bool = True            # LLM shortens lines that do not fit
     background: str = "auto"                 # auto | demucs | none
     content_verify: str = "auto"             # auto | on | off
     verifier_model: str = "auto"
@@ -73,6 +77,7 @@ class DialogueConfig:
     unknown_voice_category: str = "male_like"
     limit_seconds: float = 0.0               # >0: dub only the first N seconds (trims media)
     embed_subtitles: bool = True
+    modules: Optional[Dict[str, Any]] = None  # resolved module matrix (recorded in the report)
 
     def public(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -96,6 +101,7 @@ class Components:
     separate: Callable[[Path, Path, str], Dict]
     basic_translate: Optional[Callable[[str], str]] = None
     notes: Dict[str, str] = field(default_factory=dict)
+    mt_engines: Optional[List[Any]] = None   # sentence-level MT engines (name + translate_batch)
 
 
 @dataclass
@@ -223,11 +229,13 @@ def default_components(cfg: DialogueConfig) -> Components:
         has_fw = False
 
     return Components(
-        acquire=default_acquire, asr=asr, diarize=diarize, fetch_subtitles=fetch_subs,
-        llm_clients=default_llm_clients(cfg.translation_engines),
+        acquire=default_acquire, asr=asr, diarize=diarize if cfg.diarization else None,
+        fetch_subtitles=fetch_subs,
+        llm_clients=default_llm_clients(cfg.translation_engines, ollama_model=cfg.ollama_model),
         tts_providers=build_providers(cfg.tts_providers),
         content_asr_factory=content_asr if has_fw else None,
-        separate=mix.separate_background, notes=notes)
+        separate=mix.separate_background, notes=notes,
+        mt_engines=build_mt_engines(cfg.mt_engines))
 
 
 # ── orchestrator ──────────────────────────────────────────────────────────
@@ -373,7 +381,11 @@ class DialogueOrchestrator:
 
         with self._stage("diarize") as st:
             diar = None
-            if self.c.diarize is None:
+            if not cfg.diarization:
+                st.status = "skipped"
+                st.detail = "single voice selected (speaker detection off)"
+                r.limitations.append("speaker detection was switched off: one voice for all lines")
+            elif self.c.diarize is None:
                 st.status = "skipped"
                 st.detail = "no diarization backend"
             else:
@@ -390,7 +402,7 @@ class DialogueOrchestrator:
                 except DiarizationUnavailable as e:
                     st.status = "degraded"
                     st.detail = str(e)[:300]
-            if diar is None:
+            if diar is None and cfg.diarization:
                 r.unresolved_failures.append(
                     "speaker diarization unavailable: all dialogue voiced by the default voice "
                     "(speakers not separated)")
@@ -436,12 +448,13 @@ class DialogueOrchestrator:
                     self.c.llm_clients, glossary=glossary,
                     allow_basic_fallback=cfg.allow_basic_translation_fallback,
                     basic_fallback=self.c.basic_translate,
+                    mt_engines=self.c.mt_engines,
                     on_progress=lambda p, m: self._progress("translate", p, m),
                     cancel_check=self.cancel_check)
                 if not self.c.llm_clients:
                     st.status = "degraded"
-                    r.limitations.append("no LLM translation engine configured; "
-                                         "non-contextual per-turn translation used")
+                    r.limitations.append("no LLM translation engine available; "
+                                         "line-by-line (non-contextual) translation used")
                 hints = {sid: rec.voice_category for sid, rec in self.registry.speakers.items()}
                 r.translation_warnings += tr.translate(self.turns, hints)
                 for t in self.turns:
@@ -449,6 +462,10 @@ class DialogueOrchestrator:
                         r.translation_warnings.append({"type": "translation_uncertain", "id": t.turn_id})
                 self.translator = tr
                 r.model_versions["translation"] = sorted(tr.engines_used)
+                if "indictrans2" in tr.engines_used:
+                    n = sum(1 for t in self.turns if "sentence_level_mt" in t.flags)
+                    r.limitations.append(f"{n} line(s) translated line by line by IndicTrans2 "
+                                         f"(no dialogue context: check gendered verb forms)")
                 st.detail = f"engines: {', '.join(sorted(tr.engines_used)) or 'none'}"
         self._check_cancel()
 
@@ -459,9 +476,11 @@ class DialogueOrchestrator:
 
         with self._stage("fit") as st:
             translator = getattr(self, "translator", None)
-            rewrite = translator.rewrite_shorter if translator and translator.clients else None
+            rewrite = (translator.rewrite_shorter
+                       if cfg.duration_rewrite and translator and translator.clients else None)
             if rewrite is None:
-                r.limitations.append("no LLM for duration rewrites; overlong turns only stretched")
+                r.limitations.append("line shortening off (disabled or no LLM): overlong "
+                                     "turns are only sped up (max %.2fx)" % cfg.max_stretch)
             accepted = {k: v for k, v in self.clips.items() if v.accepted}
             r.timing_deviations = fit.fit_all(
                 self.turns, accepted, self.media_dur, self._resynth, rewrite,
@@ -476,6 +495,10 @@ class DialogueOrchestrator:
             st.detail = (f"coverage {len(r.generated_turn_ids)}/{len(r.required_turn_ids)}; "
                          f"{len(r.content_warnings)} content warning(s)")
         self._check_cancel()
+
+        # Local model workers (Indic Parler, IndicTrans2) are done: free the GPU
+        # before Demucs separation.
+        self._close_local_models()
 
         with self._stage("mix") as st:
             self._mix_and_mux(st)
@@ -757,8 +780,18 @@ class DialogueOrchestrator:
         r.outputs.update(outputs)
         st.detail = f"{n_tracks} dialogue track(s); background={sep['status']}"
 
+    def _close_local_models(self):
+        for obj in list((self.c.tts_providers or {}).values()) + list(self.c.mt_engines or []):
+            close = getattr(obj, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
+
     # finalise
     def _finalise(self, aborted: str):
+        self._close_local_models()
         r, out = self.report, self.cfg.output_dir
         try:
             (out / "turns.json").write_text(json.dumps([t.to_dict() for t in self.turns],

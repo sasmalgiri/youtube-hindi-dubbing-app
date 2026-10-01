@@ -18,7 +18,7 @@ import json
 import os
 import re
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .contracts import CATEGORY_UNKNOWN, Turn
 from .text_checks import (critical_tokens_hindi, extract_protected_terms,
@@ -64,14 +64,17 @@ class OpenAICompatClient:
                    "", "OLLAMA_MODEL", ""),
     }
 
-    def __init__(self, name: str, timeout: float = 120.0):
+    def __init__(self, name: str, timeout: float = 120.0, model: Optional[str] = None):
         if name not in self.ENDPOINTS:
             raise ValueError(f"Unknown engine {name}")
         url, key_env, model_env, default_model = self.ENDPOINTS[name]
         self.name = name
+        if name == "ollama":
+            host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+            url = (host if host.startswith("http") else "http://" + host) + "/v1/chat/completions"
         self.url = url
         self.key = os.environ.get(key_env, "").strip() if key_env else ""
-        self.model = os.environ.get(model_env, "").strip() or default_model
+        self.model = (model or "").strip() or os.environ.get(model_env, "").strip() or default_model
         self.timeout = timeout
 
     @property
@@ -113,14 +116,20 @@ class OpenAICompatClient:
         raise TranslationEngineError(f"{self.name} failed after retries ({last})")
 
 
-def default_llm_clients(order: Sequence[str]) -> List[OpenAICompatClient]:
+def default_llm_clients(order: Sequence[str], ollama_model: str = "") -> List[OpenAICompatClient]:
     out = []
     for name in order:
         if name in OpenAICompatClient.ENDPOINTS:
-            c = OpenAICompatClient(name)
+            c = OpenAICompatClient(name, model=ollama_model if name == "ollama" else None)
             if c.available:
                 out.append(c)
     return out
+
+
+def build_mt_engines(names: Sequence[str]) -> List[Any]:
+    """Sentence-level MT engines in priority order (see mt_engines.py)."""
+    from .mt_engines import make_mt_engine
+    return [make_mt_engine(n) for n in names]
 
 
 def google_basic_translate(text: str) -> str:
@@ -131,6 +140,7 @@ def google_basic_translate(text: str) -> str:
 # ── validation ─────────────────────────────────────────────────────────────
 def parse_json_object(raw: str) -> Dict:
     s = (raw or "").strip()
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL).strip()   # reasoning models
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
     try:
         return json.loads(s)
@@ -189,7 +199,8 @@ class DialogueTranslator:
                  max_attempts: int = 3, allow_basic_fallback: bool = True,
                  basic_fallback: Optional[Callable[[str], str]] = None,
                  on_progress: Optional[Callable[[float, str], None]] = None,
-                 cancel_check: Optional[Callable[[], bool]] = None):
+                 cancel_check: Optional[Callable[[], bool]] = None,
+                 mt_engines: Optional[Sequence[Any]] = None):
         self.clients = list(clients)
         self.glossary = glossary or {}
         self.batch_size = batch_size
@@ -198,6 +209,12 @@ class DialogueTranslator:
         self.max_attempts = max_attempts
         self.allow_basic_fallback = allow_basic_fallback
         self.basic_fallback = basic_fallback or google_basic_translate
+        # Sentence-level MT fallbacks tried in order after the LLMs. None keeps
+        # the original behaviour: Google basic when allow_basic_fallback.
+        if mt_engines is None:
+            from .mt_engines import GoogleBasicMT
+            mt_engines = [GoogleBasicMT(self.basic_fallback)] if allow_basic_fallback else []
+        self.mt_engines = list(mt_engines)
         self.on_progress = on_progress or (lambda p, m: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.name_map: Dict[str, str] = {}
@@ -296,19 +313,29 @@ class DialogueTranslator:
                                 t.translation_attempts[-1]["note"] = str(it["note"])[:200]
                         self.engines_used.add(client.model_id)
                 pending = [t for t in pending if not t.hi_raw]
-        if pending and self.allow_basic_fallback:
-            for t in pending:
-                try:
-                    t.hi_raw = (self.basic_fallback(t.source_text) or "").strip()
-                except Exception as e:
-                    t.translation_attempts.append({"engine": "google_basic", "ok": False,
+        for engine in self.mt_engines:
+            if not pending:
+                break
+            try:
+                outs = engine.translate_batch([t.source_text for t in pending])
+            except Exception as e:
+                for t in pending:
+                    t.translation_attempts.append({"engine": engine.name, "ok": False,
                                                    "error": str(e)[:200]})
+                self.warnings.append({"type": "engine_error", "engine": engine.name,
+                                      "detail": str(e)[:200]})
+                continue
+            for t, out in zip(pending, outs):
+                out = (out or "").strip()
+                if not out:
                     continue
-                if t.hi_raw:
-                    t.add_flag("non_contextual_translation")
-                    t.translation_attempts.append({"engine": "google_basic", "ok": True})
-                    self.engines_used.add("google_basic")
-                    self.warnings.append({"type": "non_contextual_translation", "id": t.turn_id})
+                t.hi_raw = out
+                t.add_flag(engine.flag)
+                t.translation_attempts.append({"engine": engine.name, "ok": True})
+                self.engines_used.add(engine.name)
+                if engine.warn_per_turn:
+                    self.warnings.append({"type": engine.flag, "id": t.turn_id})
+            pending = [t for t in pending if not t.hi_raw]
         for t in batch:
             if not t.hi_raw:
                 t.add_flag("translation_failed")
