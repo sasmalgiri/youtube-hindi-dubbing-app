@@ -18,7 +18,12 @@ faster-whisper>=1.1,<2
 # Python >= 3.10, a Hugging Face token, and accepting the model's conditions)
 pyannote.audio>=4.0,<5
 
-# Background (speech/music) separation estimate — optional
+# Background (speech/music) separation estimate — optional.
+# audio-separator (MIT) runs BS-Roformer / UVR MDX-Net Inst HQ 4 (the model
+# SoniTranslate uses) and is tried first; Demucs is the fallback. Model weights
+# download on first use into backend/models/separation. Set
+# DIALOGUE_SEPARATOR_MODEL to pick another audio-separator model.
+audio-separator[gpu]>=0.30
 demucs>=4.0
 
 # Last-resort non-contextual translation fallback (flagged in the report)

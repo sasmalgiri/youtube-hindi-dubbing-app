@@ -51,7 +51,7 @@ Nothing changes silently. Every change appears in the UI preview, in the job's e
 | | Indic Parler-TTS | free | local | parler-tts (separate venv), `HF_TOKEN`, GPU strongly recommended | next provider (whole speaker) |
 | | IndicF5 | free | local | curated authorised references in `backend/voices/indicf5/` | next provider |
 | | Sarvam / ElevenLabs / Google | **paid** | cloud | key(s) + Allow paid | next provider |
-| Background | Keep background | free | local | demucs, torch | → **Hindi voice only** (reported) |
+| Background | Keep background | free | local | audio-separator **or** demucs, torch | → **Hindi voice only** (reported) |
 | | Hindi voice only | free | – | – | – |
 | Speech check | Check speech | free | local | faster-whisper | → **Skip** (reported) |
 | Shorten long lines | On | free | – | an **LLM** in the final translation chain | → **Off** |
@@ -122,8 +122,9 @@ per-turn identity checks, honest draft statuses, and this module matrix.
    model and says so.
 4. Check with `python -m dubbing.dialogue modules --preset free-local`.
 
-The local models load once per job and their worker processes are closed before Demucs runs, which
-frees GPU memory.
+Background separation runs first, before any local model is loaded, and frees its GPU memory when
+it finishes. The local models load once per job, and their worker processes are closed before the
+final mix.
 
 ## Verification status
 

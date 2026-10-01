@@ -66,9 +66,18 @@ class DialogueConfig:
     diarization: bool = True                 # False = single voice by choice (not a failure)
     duration_rewrite: bool = True            # LLM shortens lines that do not fit
     background: str = "auto"                 # auto | demucs | none
+    # Which audio speaker detection / voice analysis listens to. "vocals" =
+    # the separated vocals stem (music and effects otherwise create false
+    # speakers and wrong gender/pitch), falling back to the mix when no
+    # separator ran. ASR stays on the mix unless asr_on_vocals is set.
+    analysis_audio: str = "vocals"          # vocals | mix
+    asr_on_vocals: bool = False
+    asr_decode: str = "accurate"            # accurate (beam 5, punctuation prompt) | fast (greedy)
     content_verify: str = "auto"             # auto | on | off
     verifier_model: str = "auto"
     max_stretch: float = 1.15
+    story_brief: bool = True                 # one whole-transcript LLM call: genders, aap/tum, names
+    native_rate: bool = True                 # speed up via the TTS engine's own rate first (Edge)
     max_rewrites: int = 2
     max_tts_retries: int = 2
     tts_workers: int = 6
@@ -166,6 +175,9 @@ def default_acquire(cfg: DialogueConfig, work: Path) -> Path:
         raise AcquireError(f"{hint} Detail: {detail}") from e
 
 
+WHISPER_PUNCT_PROMPT = "Hello. Yes, I know! What did you say? Okay, let's go."
+
+
 def _groq_word_asr(wav: Path) -> List[Dict]:
     import requests
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -177,7 +189,8 @@ def _groq_word_asr(wav: Path) -> List[Dict]:
         r = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
                           headers={"Authorization": f"Bearer {key}"},
                           data=[("model", "whisper-large-v3"), ("response_format", "verbose_json"),
-                                ("language", "en"), ("timestamp_granularities[]", "word"),
+                                ("language", "en"), ("prompt", WHISPER_PUNCT_PROMPT),
+                                ("timestamp_granularities[]", "word"),
                                 ("timestamp_granularities[]", "segment")],
                           files={"file": (wav.name, f, "audio/wav")}, timeout=600)
     r.raise_for_status()
@@ -206,7 +219,7 @@ def default_components(cfg: DialogueConfig) -> Components:
                     raise
                 notes["asr_fallback"] = f"groq failed ({str(e)[:100]}); used local faster-whisper"
         p = _legacy_pipeline(cfg)
-        segs = p._transcribe_local(wav)       # child process, word timestamps, no cache
+        segs = p._transcribe_local(wav, decode=cfg.asr_decode)  # child process, no cache
         notes["asr"] = f"local faster-whisper {p.cfg.asr_model if p.cfg.asr_model not in ('groq-whisper','groq','parakeet') else 'medium'}"
         return segs
 
@@ -348,6 +361,30 @@ class DialogueOrchestrator:
         self.video, self.audio_48k, self.audio_16k, self.media_dur = video, audio_48k, audio_16k, media_dur
         self._check_cancel()
 
+        # Separate once, up front: the vocals stem feeds speaker detection,
+        # gender/pitch analysis and reference clips; the background bed is
+        # reused by the final mix (no second separation pass).
+        self.sep = None
+        self.vocals_16k = self.vocals_48k = None
+        if cfg.background != "none":
+            with self._stage("separate") as st:
+                sep = self.c.separate(audio_48k, w, cfg.background)
+                self.sep = sep
+                st.detail = f"{sep.get('status')}: {str(sep.get('detail', ''))[:160]}"
+                if sep.get("status") != "ok":
+                    st.status = "degraded"
+                voc = sep.get("vocals")
+                if voc and Path(voc).exists():
+                    try:
+                        self.vocals_48k = Path(voc)
+                        self.vocals_16k = audio.to_wav(self.vocals_48k, w / "vocals_16k_mono.wav",
+                                                       sr=16000, channels=1)
+                    except Exception as e:
+                        self.vocals_48k = self.vocals_16k = None
+                        st.data["vocals_error"] = str(e)[:200]
+                st.data["analysis_audio"] = "vocals" if self._use_vocals() else "mix"
+            self._check_cancel()
+
         # text source
         mode, cues = self._text_source()
         asr_words = []
@@ -363,7 +400,8 @@ class DialogueOrchestrator:
                     r.limitations.append("ASR unavailable: subtitle words timed by cue interpolation")
                 else:
                     try:
-                        segs = self.c.asr(audio_16k)
+                        segs = self.c.asr(self.vocals_16k if (cfg.asr_on_vocals and self.vocals_16k)
+                                          else audio_16k)
                         asr_segs = segs
                         asr_words = words_from_asr_segments(segs)
                         st.detail = f"{len(asr_words)} words; " + self.c.notes.get("asr", "")
@@ -396,7 +434,7 @@ class DialogueOrchestrator:
                     _kw = {}
                     if asr_segs and "seg_bounds" in _inspect.signature(self.c.diarize).parameters:
                         _kw["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
-                    diar = self.c.diarize(audio_16k, **_kw)
+                    diar = self.c.diarize(self._analysis_16k(), **_kw)
                     st.detail = f"{diar.backend}: {len(diar.speakers)} speakers"
                     r.model_versions["diarization"] = diar.backend
                 except DiarizationUnavailable as e:
@@ -450,7 +488,7 @@ class DialogueOrchestrator:
                     basic_fallback=self.c.basic_translate,
                     mt_engines=self.c.mt_engines,
                     on_progress=lambda p, m: self._progress("translate", p, m),
-                    cancel_check=self.cancel_check)
+                    cancel_check=self.cancel_check, story_brief=cfg.story_brief)
                 if not self.c.llm_clients:
                     st.status = "degraded"
                     r.limitations.append("no LLM translation engine available; "
@@ -461,6 +499,9 @@ class DialogueOrchestrator:
                     if "translation_uncertain" in t.flags:
                         r.translation_warnings.append({"type": "translation_uncertain", "id": t.turn_id})
                 self.translator = tr
+                if tr.brief:
+                    st.data["story_brief"] = tr.brief
+                    self._check_brief_genders(tr.brief)
                 r.model_versions["translation"] = sorted(tr.engines_used)
                 if "indictrans2" in tr.engines_used:
                     n = sum(1 for t in self.turns if "sentence_level_mt" in t.flags)
@@ -485,7 +526,8 @@ class DialogueOrchestrator:
             r.timing_deviations = fit.fit_all(
                 self.turns, accepted, self.media_dur, self._resynth, rewrite,
                 fit.FitConfig(max_stretch=cfg.max_stretch, max_rewrites=cfg.max_rewrites),
-                self.cancel_check, lambda p, m: self._progress("fit", p, m))
+                self.cancel_check, lambda p, m: self._progress("fit", p, m),
+                native_rate=self._native_rate if cfg.native_rate else None)
             self.clips.update(accepted)
             st.detail = f"{sum(1 for d in r.timing_deviations if d.get('severity') != 'info')} timing issue(s)"
         self._check_cancel()
@@ -497,7 +539,7 @@ class DialogueOrchestrator:
         self._check_cancel()
 
         # Local model workers (Indic Parler, IndicTrans2) are done: free the GPU
-        # before Demucs separation.
+        # (separation already ran up front; a fallback separation may run in the mix).
         self._close_local_models()
 
         with self._stage("mix") as st:
@@ -545,14 +587,14 @@ class DialogueOrchestrator:
         # Gender: wav2vec2 classifier first (one isolated child for all
         # speakers); F0 is kept as evidence and is the explicit, reported
         # fallback only when the classifier cannot run.
-        p_male = classify_gender_ml(self.audio_16k, speaker_ranges)
+        p_male = classify_gender_ml(self._analysis_16k(), speaker_ranges)
         for spk in sorted({t.speaker_id for t in self.turns}):
             if spk == UNKNOWN_SPEAKER:
                 ensure_unknown_speaker(self.registry)
                 continue
             ranges = speaker_ranges[spk]
             try:
-                cat, conf, ev = analyze_speaker(self.audio_16k, ranges)
+                cat, conf, ev = analyze_speaker(self._analysis_16k(), ranges)
             except Exception as e:
                 cat, conf, ev = CATEGORY_UNKNOWN, None, {"reason": f"analysis_failed: {e}"}
             if spk in p_male:
@@ -576,6 +618,27 @@ class DialogueOrchestrator:
             t.voice_category_hint = self.registry.speakers[t.speaker_id].voice_category
         self.registry.save(self.cfg.work_dir / "speakers.json")
 
+    def _check_brief_genders(self, brief: Dict):
+        """The transcript says one gender, the voice analysis another: the
+        voice or the Hindi verb forms may be wrong. Reported, not overridden."""
+        cat_of = {"male": CATEGORY_MALE, "female": CATEGORY_FEMALE}
+        for sid, v in (brief.get("speakers") or {}).items():
+            rec = self.registry.speakers.get(sid)
+            want = cat_of.get(v.get("gender"))
+            if not rec or not want or rec.voice_category not in (CATEGORY_MALE, CATEGORY_FEMALE):
+                continue
+            if rec.voice_category != want:
+                self.report.content_warnings.append({
+                    "type": "speaker_gender_disagreement", "speaker_id": sid,
+                    "voice_category": rec.voice_category, "transcript_gender": v.get("gender"),
+                    "evidence": v.get("evidence", "")})
+
+    def _use_vocals(self) -> bool:
+        return bool(self.cfg.analysis_audio == "vocals" and getattr(self, "vocals_16k", None))
+
+    def _analysis_16k(self) -> Path:
+        return self.vocals_16k if self._use_vocals() else self.audio_16k
+
     def _save_reference(self, rec, ranges, refs: Path):
         """Longest clean range (<=12 s) + its transcript, for review/optional cloning."""
         if not ranges:
@@ -585,7 +648,8 @@ class DialogueOrchestrator:
         try:
             refs.mkdir(exist_ok=True)
             p = refs / f"{rec.speaker_id}.wav"
-            audio.run_ffmpeg(["-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", str(self.audio_48k),
+            audio.run_ffmpeg(["-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i",
+                              str(self.vocals_48k if self._use_vocals() else self.audio_48k),
                               "-ac", "1", "-ar", "24000", str(p)])
             rec.reference_clip = str(p)
             words = []
@@ -609,13 +673,14 @@ class DialogueOrchestrator:
                          self.cfg.work_dir / "clips", max_retries=self.cfg.max_tts_retries,
                          pronunciation=pron)
 
-    def _synth_checked(self, t: Turn, reason: str, only_provider: Optional[str] = None) -> Clip:
+    def _synth_checked(self, t: Turn, reason: str, only_provider: Optional[str] = None,
+                       speed: float = 1.0) -> Clip:
         """Synthesize + cheap checks; one regeneration (same voice) on failure."""
-        clip = self.router.synthesize(t, reason=reason, only_provider=only_provider)
+        clip = self.router.synthesize(t, reason=reason, only_provider=only_provider, speed=speed)
         chk = verify.check_clip(clip)
         if not chk["ok"]:
             again = self.router.synthesize(t, reason="cheap_check_regen:" + ",".join(chk["problems"]),
-                                           only_provider=only_provider or clip.provider)
+                                           only_provider=only_provider or clip.provider, speed=speed)
             chk2 = verify.check_clip(again)
             again.retry_history = clip.retry_history + again.retry_history
             clip, chk = again, chk2
@@ -629,6 +694,14 @@ class DialogueOrchestrator:
         if not c.accepted:
             raise RuntimeError(f"regenerated clip for {t.turn_id} failed checks")
         return c
+
+    def _native_rate(self, t: Turn, speed: float) -> Optional[Clip]:
+        """Same voice, faster native speaking rate (no stretching artefacts)."""
+        if not self.router.supports_native_rate(t.speaker_id):
+            return None
+        c = self._synth_checked(t, f"native_rate:{speed:.3f}",
+                                only_provider=self.router.providers_for(t.speaker_id)[0], speed=speed)
+        return c if c.accepted else None
 
     def _synthesize_all(self):
         self.router = self._new_router()
@@ -742,7 +815,9 @@ class DialogueOrchestrator:
             r.unresolved_failures.append(f"track collisions: {collisions[:5]}")
         rend = mix.render_dialogue(accepted, self.media_dur, w / "stems")
         st.data.update({"tracks": n_tracks, "render": {k: v for k, v in rend.items() if k != 'stems'}})
-        sep = self.c.separate(self.audio_48k, w, cfg.background)
+        sep = getattr(self, "sep", None)
+        if sep is None:
+            sep = self.c.separate(self.audio_48k, w, cfg.background)
         r.separation = sep
         if sep["status"] in ("failed", "unavailable") and cfg.background == "demucs":
             r.unresolved_failures.append(f"background separation {sep['status']}: {sep['detail']}")
@@ -750,7 +825,8 @@ class DialogueOrchestrator:
             r.limitations.append(f"no background bed: {sep['detail']}")
         final_wav = out / "hindi_mix.wav"
         mixinfo = mix.final_mix(Path(rend["bus"]), Path(sep["background"]) if sep.get("background") else None,
-                                final_wav, self.media_dur, target_lufs=cfg.target_lufs)
+                                final_wav, self.media_dur, target_lufs=cfg.target_lufs,
+                                vocals_key=Path(sep["vocals"]) if sep.get("vocals") else None)
         st.data["mix"] = mixinfo
         cues = mix.subtitle_cues({t.turn_id: t for t in self.turns}, {c.turn_id: c for c in accepted})
         srt, vtt = out / "subtitles_hi.srt", out / "subtitles_hi.vtt"

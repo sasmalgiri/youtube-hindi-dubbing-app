@@ -23,6 +23,16 @@ from .diarization import DiarizationResult, derive_exclusive
 
 SENTENCE_END = re.compile(r"[.!?।…][\"'\)\]”’]*$")
 CLAUSE_END = re.compile(r"[,;:—-][\"'\)\]]*$")
+_DIGIT_DOT = re.compile(r"\d\.$")
+_DIGIT_START = re.compile(r"^\.?\d")
+
+
+def _sentence_end(prev: str, nxt: Optional[str] = None) -> bool:
+    """Sentence-final punctuation, except a number split across tokens
+    ("3." + "5"), which is never a boundary (pyVideoTrans' digit guard)."""
+    if not SENTENCE_END.search(prev):
+        return False
+    return not (nxt and _DIGIT_DOT.search(prev) and _DIGIT_START.match(nxt))
 NONLEXICAL = re.compile(r"^[\[\(♪*].*[\]\)♪*]$|^♪+$")
 
 
@@ -168,7 +178,7 @@ def _spk(w: WordRecord) -> str:
 
 def build_turns(words: Sequence[WordRecord], max_pause: float = 0.7,
                 sentence_split_min_s: float = 3.0, sentence_pause_s: float = 0.3,
-                max_turn_s: float = 15.0) -> List[Turn]:
+                max_turn_s: float = 10.0) -> List[Turn]:
     """Group attributed words into dialogue turns (see module docstring)."""
     words = sorted(words, key=lambda w: (w.start, w.end))
     groups: List[List[WordRecord]] = []
@@ -188,7 +198,7 @@ def build_turns(words: Sequence[WordRecord], max_pause: float = 0.7,
             pause = w.start - prev.end
             cur_dur = prev.end - cur[0].start
             if (pause > max_pause
-                    or (SENTENCE_END.search(prev.text)
+                    or (_sentence_end(prev.text, w.text)
                         and (cur_dur >= sentence_split_min_s or pause >= sentence_pause_s))):
                 groups.append(open_turns.pop(spk))
                 cur = None
@@ -236,10 +246,12 @@ def _split_long(g: List[WordRecord], max_turn_s: float) -> List[List[WordRecord]
         prev = g[i - 1]
         pause = g[i].start - prev.end
         score = pause * 4.0
-        if SENTENCE_END.search(prev.text):
+        if _sentence_end(prev.text, g[i].text):
             score += 3.0
         elif CLAUSE_END.search(prev.text):
-            score += 1.5
+            score += 2.0 if pause >= 0.15 else 1.5
+        elif _DIGIT_DOT.search(prev.text) or (prev.text[-1:].isdigit() and _DIGIT_START.match(g[i].text)):
+            score -= 5.0
         score -= abs(prev.end - mid_t) / max(max_turn_s, 1.0)
         if best_score is None or score > best_score:
             best_i, best_score = i, score

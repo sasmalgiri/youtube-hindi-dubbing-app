@@ -10,12 +10,14 @@ Use it for conversations, interviews, films and any video with more than one spe
 ## What it does
 
 ```
-link / file ─► download ─► extract audio ─► text source ─► AUDIO diarization ─► word attribution
+link / file ─► download ─► extract audio ─► separate (vocals + background, if installed)
+            ─► text source ─► AUDIO diarization on the vocals ─► word attribution
             ─► speaker turns ─► speaker registry (one stable voice per speaker)
+            ─► story brief (whole transcript: genders, aap/tum, names)
             ─► contextual Hindi translation (JSON keyed by turn ID)
-            ─► TTS via the voice resolver ─► fit (slack → faithful rewrite → ≤1.15× stretch)
+            ─► TTS via the voice resolver ─► fit (slack → faithful rewrite → native rate → stretch, ≤1.15× total)
             ─► verification (clip checks, Hindi re-ASR, coverage, identity)
-            ─► multi-track mix (+ separated background if available) ─► MP4 + SRT/VTT + report
+            ─► multi-track mix (levelled clips + separated background) ─► MP4 + SRT/VTT + report
 ```
 
 Guarantees, each enforced in code and covered by tests:
@@ -114,7 +116,7 @@ python -m dubbing.dialogue modules --preset free-local
 | `dialogue_tts_providers` / `--providers` | `edge` | Priority list. `sarvam`, `elevenlabs` and `google` are paid and used **only if listed**. ElevenLabs needs `ELEVENLABS_VOICES_MALE` and `ELEVENLABS_VOICES_FEMALE` (comma-separated voice IDs). Google needs `GOOGLE_TTS_API_KEY`. `indicf5` is experimental (see below). |
 | `dialogue_translation_engines` / `--engines` | `gemini,groq,cerebras` | `openai` and `ollama` are also supported. |
 | `dialogue_num_speakers` / `--speakers` | auto | Set it when you know the count; this helps diarization. |
-| `dialogue_background` / `--background` | `auto` | `auto` means Demucs if installed, otherwise Hindi only. `demucs` makes a failure a warning. `none` means Hindi only. |
+| `dialogue_background` / `--background` | `auto` | `auto` separates with audio-separator (BS-Roformer, then UVR MDX Inst HQ 4) or Demucs if installed, otherwise Hindi only. `demucs` (any separator) makes a failure a warning. `none` means Hindi only. |
 | `dialogue_verify` / `--verify` | `auto` | Hindi re-ASR of every clip (needs faster-whisper). `off` is recorded as a limitation. |
 | `dub_duration` (minutes) / `--limit-seconds` | 0 | Dubs only the first part of the video. |
 
@@ -126,6 +128,30 @@ each with an exact transcript in `<id>.txt`. Then run with `--providers indicf5,
 - A speaker whose category has no reference is voiced entirely by the next provider, never mixed.
 - Original-voice cloning is **not** enabled.
 - This provider has not been run in this repository's CI (it needs a GPU and the gated weights).
+
+## Ideas adopted from SoniTranslate and pyVideoTrans
+
+Both projects were read for ideas (no code was copied). Adopted, each covered by a test:
+
+| Idea | Where | Default |
+| --- | --- | --- |
+| Separate first; the vocals stem feeds diarization, gender/pitch analysis and speaker reference clips (music no longer creates false speakers). The background is reused by the mix. | `orchestrator` (`separate` stage) | on (`analysis_audio="vocals"`; `"mix"` restores the old behaviour; `asr_on_vocals` is off) |
+| Better separator: audio-separator BS-Roformer / UVR MDX Inst HQ 4, Demucs as fallback | `mix.separate_background` | when installed |
+| Gentle second background duck keyed on the original English voice (hides separation residue) | `mix.final_mix` | when a vocals stem exists |
+| Per-clip loudness levelling (active speech toward −20 dBFS, ±9 dB) so voices sit at an even level | `mix.render_dialogue` | on |
+| Speed up with Edge's own speaking rate before stretching; total speed-up still ≤ `max_stretch` | `fit.fit_all`, `tts` | on (`native_rate`) |
+| If the previous Hindi clip overran, start up to 0.4 s later instead of talking over it (bounded: no drift) | `fit.fit_all` | on |
+| The last turn may start up to 1.5 s early so the end of the video does not cut it | `fit.fit_all` | on |
+| Whisper beam search 5, no conditioning on previous text, punctuation prompt (Groq gets the prompt too) | `pipeline._whisper_child_worker` | dialogue profile only (`asr_decode="accurate"`) |
+| Story brief: one LLM call over the whole transcript for speaker genders, aap/tum register and names; a gender that disagrees with the voice analysis is reported | `translation.build_brief` | on when an LLM is available |
+| Clean spoken text (stage directions, markdown, symbols, ellipses) before TTS; subtitles unchanged | `tts.tts_sanitize` | on |
+| Edge retries with backoff and jitter, 45 s timeout per request | `tts` | on |
+| Gentler silence trim (−50 dB, 40 ms head / 120 ms tail, short fades) | `audio.trim_silence` | on |
+| Turns at most 10 s, clause-aware splitting, numbers never split ("3." + "5") | `turns` | on |
+
+Not adopted: changing the video speed, speed-ups beyond 1.15×, a subtitle-level speaker vote (word
+attribution is more precise), using the original English audio as background, and a cross-job TTS
+cache (jobs start from scratch).
 
 ## Owner acceptance (listening) procedure
 

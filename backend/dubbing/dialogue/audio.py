@@ -121,8 +121,14 @@ def audio_stats(path: Path) -> Dict:
             "sample_rate": sr, "channels": data.shape[1]}
 
 
-def trim_silence(path: Path, out: Path, threshold_db: float = -45.0, keep_s: float = 0.03) -> float:
-    """Trim leading/trailing silence only (never inside speech). Returns new duration."""
+def trim_silence(path: Path, out: Path, threshold_db: float = -50.0, keep_head_s: float = 0.04,
+                 keep_tail_s: float = 0.12) -> float:
+    """Trim leading/trailing silence only (never inside speech). Returns new duration.
+
+    The tail keeps more padding than the head (soft Hindi endings such as a
+    breathy "है" decay below the threshold), and short fades avoid clicks at
+    the cut points (padding values follow pyVideoTrans' remove_silence_wav).
+    """
     import numpy as np
     data, sr = read_wav(path)
     mono = np.abs(data.mean(axis=1))
@@ -136,10 +142,47 @@ def trim_silence(path: Path, out: Path, threshold_db: float = -45.0, keep_s: flo
     if len(idx) == 0:
         write_wav(out, data, sr)
         return len(data) / float(sr)
-    s = max(0, idx[0] - int(keep_s * sr))
-    e = min(len(data), idx[-1] + int(keep_s * sr))
-    write_wav(out, data[s:e], sr)
+    s = max(0, idx[0] - int(keep_head_s * sr))
+    e = min(len(data), idx[-1] + int(keep_tail_s * sr))
+    seg = np.array(data[s:e], dtype=np.float32)
+    fi, fo = min(len(seg), int(0.005 * sr)), min(len(seg), int(0.015 * sr))
+    if s > 0 and fi > 1:
+        seg[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)[:, None]
+    if e < len(data) and fo > 1:
+        seg[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)[:, None]
+    write_wav(out, seg, sr)
     return (e - s) / float(sr)
+
+
+def speech_level_gain(x, sr: int, target_dbfs: float = -20.0, max_gain_db: float = 9.0,
+                      peak_cap: float = 0.89) -> float:
+    """Linear gain bringing a clip's *active speech* RMS toward target_dbfs.
+
+    TTS voices (and pitch variants) come out at different loudness, so one
+    speaker can sound much louder than another before the final loudnorm,
+    which only fixes the overall mix. Bounded to +/-max_gain_db and so the
+    peak stays under peak_cap.
+    """
+    import numpy as np
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0:
+        return 1.0
+    win = max(1, int(0.02 * sr))
+    n = len(x) // win
+    if n == 0:
+        return 1.0
+    frames = x[:n * win].reshape(n, win)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    loud = rms[rms > max(1e-4, float(np.max(rms)) * 0.1)]
+    if loud.size == 0:
+        return 1.0
+    level_db = 20 * np.log10(float(np.sqrt(np.mean(loud ** 2))))
+    gain_db = max(-max_gain_db, min(max_gain_db, target_dbfs - level_db))
+    gain = 10 ** (gain_db / 20.0)
+    peak = float(np.max(np.abs(x)))
+    if peak > 0 and peak * gain > peak_cap:
+        gain = peak_cap / peak
+    return float(gain)
 
 
 def time_stretch(src: Path, dst: Path, speed: float) -> Path:

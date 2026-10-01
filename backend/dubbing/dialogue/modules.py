@@ -33,6 +33,7 @@ PKG = {
     "pyannote.audio": "pyannote.audio>=4",
     "torch": "torch (CUDA build from pytorch.org for GPU)",
     "demucs": "demucs",
+    "audio_separator": "audio-separator[gpu]",
     "edge_tts": "edge-tts",
     "deep_translator": "deep-translator",
     "transformers": "transformers",
@@ -182,9 +183,13 @@ STAGES: Tuple[Stage, ...] = (
 
     Stage("background", "Background sound", "Keep the video's music/effects under the Hindi voice.",
           (
-              Choice("keep", "Keep background", "Demucs removes the English voice and keeps "
-                     "music/effects (an estimate; listen to check).",
-                     requires=(_pkg("demucs"), _pkg("torch"), _GPU)),
+              Choice("keep", "Keep background", "Removes the English voice and keeps "
+                     "music/effects (BS-Roformer / UVR MDX via audio-separator, else Demucs; an "
+                     "estimate, listen to check). The separated voice also improves speaker "
+                     "detection.",
+                     requires=(Req("env_any", "audio_separator|demucs",
+                                   'pip install "audio-separator[gpu]" (or pip install demucs)'),
+                               _pkg("torch"), _GPU)),
               Choice("none", "Hindi voice only", "No background bed."),
           ), default=("keep",), fallback_order=("none",)),
 

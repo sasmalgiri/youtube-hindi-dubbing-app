@@ -132,8 +132,14 @@ def test_matrix_describes_every_choice_with_availability():
     stages = {s["id"]: s for s in m["stages"]}
     assert set(stages) == {s.id for s in STAGES}
     keep = [c for c in stages["background"]["choices"] if c["id"] == "keep"][0]
-    assert keep["available"] is False and keep["missing"][0]["name"] == "demucs"
+    assert keep["available"] is False and keep["missing"][0]["name"] == "audio_separator|demucs"
     assert len(m["presets"]) == len(PRESETS)
+
+
+def test_audio_separator_alone_keeps_background():
+    probe = FakeProbe(pkgs=(ALL_PKGS - {"demucs"}) | {"audio_separator"})
+    res = resolve("free-online", probe=probe)
+    assert res.selections["background"] == ["keep"] and res.config["background"] == "demucs"
 
 
 def test_single_voice_preset():

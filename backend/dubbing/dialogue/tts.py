@@ -16,8 +16,10 @@ import asyncio
 import base64
 import math
 import os
+import random
 import re
 import threading
+import time
 import wave
 from array import array
 from pathlib import Path
@@ -28,6 +30,40 @@ from .contracts import UNKNOWN_SPEAKER, Clip, Turn
 from .speaker_registry import SpeakerRegistry, VoiceResolutionError
 
 SENTENCE_SPLIT = re.compile(r"(?<=[।.!?])\s+")
+
+_BRACKETED = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|<[^>]*>")
+_SYMBOLS = re.compile(r"[*#_~^`|♪♫•]+")
+
+
+def tts_sanitize(text: str) -> str:
+    """Remove what a TTS engine would read aloud or choke on.
+
+    LLM output can carry stage directions ("[हँसते हुए]"), markdown, music
+    symbols or a leading/trailing ellipsis; Edge reads some of these aloud or
+    returns no audio. Only the *spoken* text is cleaned; subtitles keep the
+    translation as written. Never returns an empty string for non-empty text.
+    """
+    if not text:
+        return text
+    t = _BRACKETED.sub(" ", text)
+    t = _SYMBOLS.sub(" ", t)
+    t = t.replace("\u201c", "").replace("\u201d", "").replace('"', "")
+    t = re.sub(r"\s*[—–]\s*", ", ", t)
+    t = re.sub(r"\.{3,}|…", "…", t)
+    t = re.sub(r"^[\s…,]+|[\s…,]+$", "", t)
+    t = t.replace("…", ", ")
+    t = re.sub(r"\s*,\s*(,\s*)+", ", ", t)
+    t = re.sub(r"\s+([,।.!?])", r"\1", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if re.search(r"\w", t) else text.strip()
+
+
+def rate_with_speed(rate: Optional[str], speed: float) -> str:
+    """Edge-style prosody rate ("+5%") with an extra speed factor applied."""
+    m = re.match(r"^\s*([+-]?\d+)\s*%\s*$", rate or "")
+    base = int(m.group(1)) if m else 0
+    pct = round(((1 + base / 100.0) * speed - 1) * 100)
+    return f"{pct:+d}%"
 
 
 class TTSProviderError(RuntimeError):
@@ -68,6 +104,8 @@ class BaseProvider:
     name = "base"
     max_chars = 3000
     paid = False
+    native_rate = False      # accepts binding["rate"] (speaking rate) natively
+    retry_backoff_s = 0.0    # base delay before a retry (online, rate-limited services)
 
     def synthesize_part(self, text: str, binding: Dict, out: Path) -> Path:
         raise NotImplementedError
@@ -99,6 +137,9 @@ class BaseProvider:
 class EdgeProvider(BaseProvider):
     name = "edge"
     max_chars = 2000
+    native_rate = True
+    retry_backoff_s = 2.0    # Edge throttles bursts; immediate retries just fail again
+    timeout_s = 45.0         # one stalled websocket must not hang the job
 
     def synthesize_part(self, text, binding, out):
         try:
@@ -109,9 +150,17 @@ class EdgeProvider(BaseProvider):
         kwargs = {"rate": binding.get("rate") or "+0%"}
         if binding.get("pitch"):
             kwargs["pitch"] = binding["pitch"]
+        try:
+            import inspect
+            params = inspect.signature(edge_tts.Communicate.__init__).parameters
+            if "connect_timeout" in params:
+                kwargs.update(connect_timeout=8, receive_timeout=30)
+        except (TypeError, ValueError):
+            pass
 
         async def _go():
-            await edge_tts.Communicate(text, binding["voice"], **kwargs).save(str(mp3))
+            await asyncio.wait_for(edge_tts.Communicate(text, binding["voice"], **kwargs).save(str(mp3)),
+                                   timeout=self.timeout_s)
         try:
             asyncio.run(_go())
         except Exception as e:
@@ -207,10 +256,12 @@ class MockProvider(BaseProvider):
     name = "mock"
 
     def __init__(self, seconds_per_char: float = 0.06,
-                 fail: Optional[Callable[[str, Dict], bool]] = None, name: str = "mock"):
+                 fail: Optional[Callable[[str, Dict], bool]] = None, name: str = "mock",
+                 native_rate: bool = False):
         self.seconds_per_char = seconds_per_char
         self.fail = fail
         self.name = name
+        self.native_rate = native_rate
         self.calls: List[Dict] = []
         self._lock = threading.Lock()
 
@@ -221,6 +272,9 @@ class MockProvider(BaseProvider):
             raise TTSProviderError("mock failure")
         sr = 24000
         dur = max(0.3, len(text) * self.seconds_per_char)
+        m = re.match(r"^([+-]?\d+)%$", binding.get("rate") or "")
+        if self.native_rate and m:
+            dur /= 1 + int(m.group(1)) / 100.0
         f0 = 110.0 + (sum(map(ord, binding["voice"])) % 7) * 25.0
         data = array("h", (int(8000 * math.sin(2 * math.pi * f0 * n / sr)
                                * (0.6 + 0.4 * math.sin(2 * math.pi * 3 * n / sr)))
@@ -360,14 +414,20 @@ class TTSRouter:
         for k in sorted(self.pronunciation, key=len, reverse=True):
             if k in text:
                 text = text.replace(k, self.pronunciation[k])
-        return text
+        return tts_sanitize(text)
+
+    def supports_native_rate(self, speaker_id: str) -> bool:
+        prov = self.providers.get(self.providers_for(speaker_id)[0])
+        return bool(prov is not None and prov.native_rate)
 
     def providers_for(self, speaker_id: str) -> List[str]:
         first = self.speaker_provider.get(speaker_id, self.order[0])
         return [first] + [p for p in self.order if p != first]
 
     def synthesize(self, turn: Turn, reason: str = "initial",
-                   only_provider: Optional[str] = None) -> Clip:
+                   only_provider: Optional[str] = None, speed: float = 1.0) -> Clip:
+        """``speed`` > 1 asks a native-rate provider to speak faster (same
+        voice, same pitch); providers without native rate ignore it."""
         text = turn.speech_text
         if not text:
             raise TTSFailure(turn.turn_id, [{"error": "empty text"}])
@@ -385,7 +445,12 @@ class TTSRouter:
             except VoiceResolutionError as e:
                 history.append({"provider": prov_name, "error": str(e)})
                 continue
+            if abs(speed - 1.0) > 1e-3 and prov.native_rate:
+                binding = dict(binding, rate=rate_with_speed(binding.get("rate"), speed))
             for attempt in range(self.max_retries + 1):
+                if attempt and prov.retry_backoff_s > 0:
+                    time.sleep(min(10.0, prov.retry_backoff_s * 2 ** (attempt - 1))
+                               + random.uniform(0, 0.5))
                 clip_id = self._next_id()
                 raw = self.clip_dir / f"{turn.turn_id}_{clip_id}_raw.wav"
                 final = self.clip_dir / f"{turn.turn_id}_{clip_id}.wav"
@@ -404,7 +469,8 @@ class TTSRouter:
                                                   turn.turn_id, history[-1]["error"] if history else "")
                 return Clip(clip_id=clip_id, turn_id=turn.turn_id, speaker_id=turn.speaker_id,
                             provider=prov_name, voice=binding["voice"], model=binding.get("model", ""),
-                            voice_params={"pitch": binding.get("pitch"), "variant": binding.get("variant")},
+                            voice_params={"pitch": binding.get("pitch"), "variant": binding.get("variant"),
+                                          "rate": binding.get("rate")},
                             spoken_text=spoken, path=str(final), natural_duration=dur,
                             final_duration=dur, degraded=degraded,
                             retry_history=history + [{"reason": reason}])
