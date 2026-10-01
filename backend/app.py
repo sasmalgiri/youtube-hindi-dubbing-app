@@ -4256,11 +4256,42 @@ def remove_preset(slug: str):
     return {"status": "deleted", "slug": slug}
 
 
+def _refresh_ytdlp() -> None:
+    """Keep yt-dlp fresh. YouTube breaks old yt-dlp builds every few weeks:
+    on 2026-10-01 yt-dlp 2026.03.17 got HTTP 403 on every video until it was
+    updated together with yt-dlp-ejs (the "[default]" extra; it solves
+    YouTube's JS challenges with the Node runtime we pass via --js-runtimes).
+    Runs at startup in the background, at most once every
+    YTDLP_CHECK_EVERY_DAYS (stamp file), asking pip for the newest
+    "yt-dlp[default]". Never fatal (offline is fine)."""
+    YTDLP_CHECK_EVERY_DAYS = 3
+    stamp = Path(__file__).resolve().parent / "cache" / ".ytdlp_last_check"
+    try:
+        from importlib.metadata import version as _version
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < YTDLP_CHECK_EVERY_DAYS * 86400:
+            return
+        before = _version("yt-dlp")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]"],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.write_text(time.strftime("%Y-%m-%d %H:%M"), encoding="utf-8")
+            after = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"],
+                                   capture_output=True, text=True, timeout=60).stdout.strip()
+            print(f"[STARTUP] yt-dlp checked: {before} -> {after or '?'}", flush=True)
+        else:
+            print(f"[STARTUP] yt-dlp update FAILED (downloads may get HTTP 403): "
+                  f"{(r.stderr or r.stdout or '')[-300:]}", flush=True)
+    except Exception as e:
+        print(f"[STARTUP] yt-dlp freshness check skipped: {e}", flush=True)
+
+
 @app.on_event("startup")
 def _on_startup():
     """Server startup hook — recover any jobs left in `running` state from a
     previous crash, wipe stale work directories + caches (no-reuse mode),
     then announce readiness."""
+    threading.Thread(target=_refresh_ytdlp, daemon=True, name="ytdlp-refresh").start()
     # Auto-recover stuck jobs: if the backend crashed mid-job, the DB will still
     # show state="running" but no worker thread is alive to update it. Mark them
     # failed on startup so the UI doesn't show ghost "Starting..." entries forever.

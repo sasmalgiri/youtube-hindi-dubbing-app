@@ -13,7 +13,7 @@ google-cloud-texttospeech>=2.16.0
 requests>=2.28.0
 sse-starlette==2.1.0
 rich==13.9.4
-yt-dlp>=2024.1.0
+yt-dlp[default]>=2026.8.19   # [default] adds yt-dlp-ejs: YouTube returns HTTP 403 without it
 pywebview>=5.0
 supabase>=2.0.0
 

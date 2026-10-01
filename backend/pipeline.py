@@ -3722,7 +3722,15 @@ class Pipeline:
                 if result.returncode != 0:
                     error_msg = (result.stderr or result.stdout or "Unknown error").strip()
                     print(f"[YTDLP] error: {error_msg[:500]}", flush=True)
-                    raise RuntimeError(f"yt-dlp failed: {error_msg}")
+                    # stderr starts with WARNING lines (e.g. "version is older
+                    # than 90 days"); surface the real ERROR line(s) instead.
+                    errs = [l.strip() for l in error_msg.splitlines() if l.strip().startswith("ERROR")]
+                    shown = " | ".join(errs[-2:]) if errs else error_msg[:400]
+                    if "403" in shown:
+                        shown += (" — YouTube refused the download; usually yt-dlp is outdated. "
+                                  "Restart the backend (it updates yt-dlp on startup) or run: "
+                                  "python -m pip install -U \"yt-dlp[default]\"")
+                    raise RuntimeError(f"yt-dlp failed: {shown}")
             except RuntimeError:
                 raise
             except Exception as e:
