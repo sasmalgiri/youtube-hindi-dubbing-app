@@ -93,6 +93,20 @@ jobs):
 - `report.md` / `report.json`
 - `turns.json`, `clips.json`, `speakers.json`
 
+## Presets and modules
+
+Pick a preset in the UI (Free — Online, Free — Local AI, Fast Draft, Single Narrator, Premium
+Voices, My Hindi SRT) or use `--preset` on the CLI. Options that cannot run on your PC are switched
+off automatically, with the reason and the fix shown. Fallbacks switch on automatically.
+
+The full matrix, the dependency rules and the free / local-AI setup are in
+[modules.md](modules.md). To see what a preset becomes on your PC, run:
+
+```
+cd backend
+python -m dubbing.dialogue modules --preset free-local
+```
+
 ## Options
 
 | Option (API field / CLI flag) | Default | Notes |
