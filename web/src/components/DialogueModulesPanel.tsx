@@ -192,7 +192,7 @@ export default function DialogueModulesPanel({ preset, overrides, onChange, sour
                                 <select className="rounded bg-white/5 border border-border px-1"
                                     value={String(effectiveParams.ollama_model ?? '')}
                                     onChange={(e) => setParam('ollama_model', e.target.value)}>
-                                    <option value="">(auto: first pulled model)</option>
+                                    <option value="">(OLLAMA_MODEL from backend/.env)</option>
                                     {matrix.environment.ollama_models.map((m) => <option key={m} value={m}>{m}</option>)}
                                 </select>
                             ) : (

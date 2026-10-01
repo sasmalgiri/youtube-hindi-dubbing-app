@@ -8,12 +8,13 @@ the internet, an input file) and what it costs (free / free tier / paid).
 `resolve()` takes a preset + the user's overrides + what is actually
 installed on this machine and returns the effective selection:
   * a choice whose hard requirement is missing is deactivated, with the
-    reason and the exact fix;
+    reason and the exact fix; a requirement that cannot be checked (e.g.
+    huggingface.co unreachable) is a warning, not a block;
   * a stage left empty falls back to the first workable choice (recorded as
     an automatic activation);
-  * choices that depend on other stages follow them (e.g. a Hindi SRT input
-    switches speech-to-text and translation off; duration rewrites need an
-    LLM translator);
+  * choices that depend on other stages follow them (e.g. a supplied Hindi
+    SRT switches speech-to-text and translation off, asking for one without
+    the file blocks; duration rewrites need an LLM translator);
   * paid choices are dropped unless "allow_paid" is on;
   * "local_only" drops every cloud AI service.
 Nothing is changed silently: every change is listed with its reason.
@@ -22,10 +23,25 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 FREE, FREE_TIER, PAID = "free", "free_tier", "paid"
+
+# The IndicTrans2 checkpoint the worker loads (workers/indictrans2_worker.py
+# reads the same env var with the same default). Not the distilled 200M repo:
+# it is gated separately and answered 403 for this account, while the 1B repo
+# is accessible.
+INDICTRANS2_DEFAULT_MODEL = "ai4bharat/indictrans2-en-indic-1B"
+# Gated Hugging Face checkpoints whose access is checked: req name -> (env var, default).
+GATED_HF_MODELS = {"indictrans2": ("INDICTRANS2_MODEL", INDICTRANS2_DEFAULT_MODEL)}
+
+# The Ollama translator needs an instruct model that follows the JSON prompt
+# and writes Devanagari Hindi; it is named, never guessed (see _ollama_problem).
+OLLAMA_SUGGESTED_MODEL = "qwen2.5:14b-instruct"
+OLLAMA_MODEL_FIX = (f"set OLLAMA_MODEL in backend/.env to an instruct model that writes Hindi, "
+                    f"e.g. {OLLAMA_SUGGESTED_MODEL} (or pick it under 'Ollama model')")
 
 # Import names used to detect installed packages (no import is performed).
 PKG = {
@@ -44,6 +60,7 @@ PKG = {
 @dataclass(frozen=True)
 class Req:
     kind: str          # package | env | env_any | gpu | internet | service | source | file | refs
+                       # | runtime | hf_model
     name: str
     fix: str = ""
     soft: bool = False  # soft = warning only (e.g. GPU makes it faster)
@@ -112,8 +129,10 @@ STAGES: Tuple[Stage, ...] = (
               Choice("pyannote", "Detect speakers", "pyannote community-1 diarization "
                      "(runs locally; model download needs a free Hugging Face token once).",
                      requires=(_pkg("pyannote.audio"), _pkg("torch"),
-                               Req("env", "HF_TOKEN", "free token from huggingface.co + accept the "
-                                   "pyannote/speaker-diarization-community-1 terms"), _GPU)),
+                               # either name: diarization.hf_token_from_env() reads both
+                               Req("env_any", "HF_TOKEN|HUGGINGFACE_TOKEN",
+                                   "free token from huggingface.co in HF_TOKEN (backend/.env) + "
+                                   "accept the pyannote/speaker-diarization-community-1 terms"), _GPU)),
               Choice("off", "Single voice", "Everything voiced by one voice (narration)."),
           ), default=("pyannote",), fallback_order=("off",)),
 
@@ -131,8 +150,10 @@ STAGES: Tuple[Stage, ...] = (
                      requires=(Req("env", "CEREBRAS_API_KEY", "key from cloud.cerebras.ai"), _NET)),
               Choice("ollama", "Ollama (local LLM)", "Contextual, unlimited, runs on this PC.",
                      tags=("llm",),
-                     requires=(Req("service", "ollama", "install Ollama and `ollama pull <model>`; "
-                                   "set OLLAMA_MODEL or pick the model in options"), _GPU)),
+                     requires=(Req("service", "ollama",
+                                   f"install Ollama (ollama.com), `ollama pull {OLLAMA_SUGGESTED_MODEL}` "
+                                   f"and set OLLAMA_MODEL={OLLAMA_SUGGESTED_MODEL} in backend/.env"),
+                               _GPU)),
               Choice("indictrans2", "IndicTrans2 (local MT)", "AI4Bharat English->Hindi model, "
                      "unlimited and offline; translates line by line (no dialogue context).",
                      requires=(Req("runtime", "indictrans2",
@@ -140,7 +161,12 @@ STAGES: Tuple[Stage, ...] = (
                                    "in a separate venv and set INDICTRANS2_PYTHON (IndicTransToolkit "
                                    "has Linux/macOS wheels only: on Windows use WSL, or Ollama)"),
                                Req("env", "HF_TOKEN", "accept the ai4bharat/indictrans2 model terms on "
-                                   "huggingface.co and set HF_TOKEN"), _GPU)),
+                                   "huggingface.co and set HF_TOKEN"),
+                               # the checkpoint itself is gated per repo: a refused one shows
+                               # up here instead of failing when the job reaches translation
+                               Req("hf_model", "indictrans2", "accept the model's terms on "
+                                   "huggingface.co with the account whose token is in HF_TOKEN"),
+                               _GPU)),
               Choice("google_basic", "Google Translate (basic)", "Free, no key; line by line, "
                      "no context (flagged in the report).", cloud=True,
                      requires=(_pkg("deep_translator"), _NET)),
@@ -222,7 +248,8 @@ PARAMS = {
     "max_stretch": {"label": "Max speed-up of a line", "type": "float", "default": 1.15,
                     "min": 1.0, "max": 1.3},
     "ollama_model": {"label": "Ollama model", "type": "str", "default": "",
-                     "help": "e.g. a model you pulled with `ollama pull`"},
+                     "help": f"an instruct model that writes Hindi, e.g. {OLLAMA_SUGGESTED_MODEL}; "
+                             "empty = OLLAMA_MODEL from backend/.env"},
     "allow_paid": {"label": "Allow paid services", "type": "bool", "default": False},
     "local_only": {"label": "Local AI only (no cloud AI)", "type": "bool", "default": False},
 }
@@ -304,6 +331,11 @@ class Probe:
     indicf5_refs: bool = False
     runtimes: Dict[str, bool] = field(default_factory=dict)
     internet: bool = True     # assumed; failures surface at run time
+    # Hugging Face model access: repo id -> (True / False / None = unknown, why).
+    # Pre-filled entries are used as-is (tests inject them, nothing goes online);
+    # others are asked of huggingface.co only when check_hf is on (detect()).
+    hf_models: Dict[str, Tuple[Optional[bool], str]] = field(default_factory=dict)
+    check_hf: bool = False
 
     def has_pkg(self, name: str) -> bool:
         if name not in self.packages:
@@ -319,14 +351,24 @@ class Probe:
             self.runtimes[name] = runtime_available(name)
         return self.runtimes[name]
 
+    def env_value(self, name: str) -> str:
+        return os.environ.get(name, "").strip()
+
     def has_env(self, name: str) -> bool:
         if name not in self.env:
-            self.env[name] = bool(os.environ.get(name, "").strip())
+            self.env[name] = bool(self.env_value(name))
         return self.env[name]
 
+    def hf_access(self, repo_id: str) -> Tuple[Optional[bool], str]:
+        """Can this PC's token download `repo_id`? (None, "") = not checked."""
+        if repo_id not in self.hf_models:
+            self.hf_models[repo_id] = hf_model_access(repo_id) if self.check_hf else (None, "")
+        return self.hf_models[repo_id]
+
     @classmethod
-    def detect(cls, check_gpu: bool = True, check_ollama: bool = True) -> "Probe":
-        p = cls()
+    def detect(cls, check_gpu: bool = True, check_ollama: bool = True,
+               check_hf: bool = True) -> "Probe":
+        p = cls(check_hf=check_hf)
         if check_gpu and p.has_pkg("torch"):
             try:
                 import torch
@@ -354,6 +396,69 @@ class Probe:
         return p
 
 
+def hf_model_access(repo_id: str, timeout: float = 5.0) -> Tuple[Optional[bool], str]:
+    """Whether this PC's Hugging Face token may download `repo_id`.
+
+    (True, "") it may; (False, why) the Hub refuses it (gated terms not
+    accepted, token rejected, no such repo) and no copy is cached; (None, why)
+    it cannot be told (offline, Hub down or slow, huggingface_hub missing), or
+    a cached copy will be used despite the refusal. Unknown is reported, never
+    treated as blocked. Same token as the workers: HF_TOKEN, else the saved
+    `huggingface-cli login` token (token=None).
+    """
+    if os.path.isdir(repo_id):
+        return True, ""                      # a checkpoint folder on this PC
+    box: Dict[str, Tuple[Optional[bool], str]] = {}
+
+    def check():
+        try:
+            from huggingface_hub import auth_check
+            auth_check(repo_id, token=os.environ.get("HF_TOKEN", "").strip() or None)
+            box["result"] = (True, "")
+        except Exception as e:
+            box["result"] = _hf_refusal(repo_id, e)
+
+    # auth_check has no timeout of its own: a stalled connection must not hang
+    # the preview, nor the job start (which resolves the same way).
+    t = threading.Thread(target=check, name="hf-auth-check", daemon=True)
+    t.start()
+    t.join(timeout)
+    return box.get("result", (None, f"could not confirm access to {repo_id}: huggingface.co "
+                                    f"did not answer within {timeout:g}s; it is tried when the "
+                                    f"job runs"))
+
+
+def _hf_refusal(repo_id: str, err: Exception) -> Tuple[Optional[bool], str]:
+    """Classify an auth_check error: refused (False) or unknown (None)."""
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    kinds = {c.__name__ for c in type(err).__mro__}     # no huggingface_hub import needed
+    if "GatedRepoError" in kinds:        # 403: terms not accepted; 401: no/invalid token
+        why = (f"gated model: accept its terms at https://huggingface.co/{repo_id} with the "
+               f"account whose read token is in HF_TOKEN"
+               + (" (the token was missing or invalid)" if status == 401 else ""))
+    elif "RepositoryNotFoundError" in kinds or status == 404:
+        why = f"no model {repo_id} on huggingface.co that this token can see (check the model id)"
+    elif status in (401, 403):
+        why = f"huggingface.co refused this PC's token for {repo_id} (HTTP {status}): check HF_TOKEN"
+    else:
+        detail = (str(err).strip().splitlines() or [""])[0][:120]
+        return None, (f"could not confirm access to {repo_id} on huggingface.co "
+                      f"({type(err).__name__}: {detail}); it is tried when the job runs")
+    # The Hub refusing does not stop a copy that is already downloaded:
+    # hf_hub_download falls back to the cache on HTTP errors.
+    if _hf_cached(repo_id):
+        return None, f"{why}; the copy already in the local Hugging Face cache will be used"
+    return False, why
+
+
+def _hf_cached(repo_id: str) -> bool:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        return isinstance(try_to_load_from_cache(repo_id, "config.json"), str)
+    except Exception:
+        return False
+
+
 # ── resolver ───────────────────────────────────────────────────────────────
 @dataclass
 class Resolution:
@@ -375,6 +480,42 @@ class Resolution:
                 "ok": self.ok, "config": self.config}
 
 
+def _ollama_problem(req: Req, probe: Probe, params: Dict[str, Any]) -> Optional[Req]:
+    """What stops the Ollama translator here, as the specific requirement (None = nothing).
+
+    The model is never guessed from the pulled list: the first one pulled here
+    was a 1.5B "Translate to Hindi:" fine-tune that cannot return the JSON the
+    dialogue translator needs, so the preview said "will run" and nothing got
+    translated.
+    """
+    if not probe.ollama:
+        return req                                    # not installed / not running
+    model = str(params.get("ollama_model") or "").strip() or probe.env_value("OLLAMA_MODEL")
+    if not model:
+        return Req("env", "OLLAMA_MODEL", OLLAMA_MODEL_FIX)
+    # Ollama reads 'qwen2.5' as 'qwen2.5:latest' and ignores case in names.
+    name = model.lower()
+    want = {name} if ":" in name else {name, name + ":latest"}
+    if not any(m.lower() in want for m in probe.ollama_models):
+        return Req("service", f"{model} (not pulled in Ollama)",
+                   f"`ollama pull {model}`, or set OLLAMA_MODEL to a pulled instruct model "
+                   f"that writes Hindi")
+    return None
+
+
+def _hf_model_problem(req: Req, probe: Probe) -> Optional[Req]:
+    """A refused checkpoint as a hard requirement, an unconfirmed one as a soft
+    one (a warning), None when accessible or not checked."""
+    env, default = GATED_HF_MODELS[req.name]
+    repo = probe.env_value(env) or default
+    access, why = probe.hf_access(repo)
+    if access is False:
+        return Req("hf_model", repo, why or req.fix)
+    if access is None and why:
+        return Req("hf_model", repo, why, soft=True)
+    return None
+
+
 def _unmet(choice: Choice, probe: Probe, ctx: Dict[str, Any], params: Dict[str, Any]
            ) -> Tuple[List[Req], List[Req]]:
     hard, soft = [], []
@@ -391,7 +532,11 @@ def _unmet(choice: Choice, probe: Probe, ctx: Dict[str, Any], params: Dict[str, 
         elif r.kind == "internet":
             ok = probe.internet
         elif r.kind == "service" and r.name == "ollama":
-            ok = bool(probe.ollama) and bool(params.get("ollama_model") or probe.has_env("OLLAMA_MODEL"))
+            problem = _ollama_problem(r, probe, params)
+            ok, r = problem is None, problem or r      # report the specific missing piece
+        elif r.kind == "hf_model":
+            problem = _hf_model_problem(r, probe)
+            ok, r = problem is None, problem or r
         elif r.kind == "source":
             ok = ctx.get("source_kind") == r.name
         elif r.kind == "file":
@@ -470,26 +615,39 @@ def resolve(preset: str = DEFAULT_PRESET, overrides: Optional[Dict[str, Any]] = 
         change("text_source", "activated", "english_srt", "an English SRT was supplied")
         sel["text_source"] = ["english_srt"]
 
-    # Ollama: pick the first pulled model when none is configured.
-    if "ollama" in sel.get("translation", []) and not params.get("ollama_model") \
-            and not probe.has_env("OLLAMA_MODEL") and probe.ollama_models:
-        params["ollama_model"] = probe.ollama_models[0]
-        change("translation", "activated", "ollama",
-               f"no Ollama model set; using your pulled model '{probe.ollama_models[0]}'")
+    # A Hindi SRT asked for but not supplied: there is no Hindi text to voice.
+    # Skipping speech-to-text + translation would dub nothing, and transcribing
+    # instead would quietly ignore the choice -> block with the way out.
+    if sel["text_source"] == ["hindi_srt"] and not files.get("hindi_srt"):
+        if p["id"] == "hindi-srt-revoice":
+            blocking.append("My Hindi SRT → Voices needs a Hindi .srt: switch the input to SRT "
+                            "mode, or pick 'Free — Online'")
+        else:
+            blocking.append("Text source 'My Hindi SRT' needs a Hindi .srt: switch the input to "
+                            "SRT mode, or choose 'Speech-to-text'")
 
     cpu_only: List[str] = []
-    skip: Dict[str, str] = {}
-    if sel["text_source"] == ["hindi_srt"]:
-        skip["asr"] = "Hindi SRT supplied: speech-to-text not needed"
-        skip["translation"] = "Hindi SRT supplied: translation not needed"
+    # Stages a Hindi SRT makes unnecessary, decided from the RESOLVED text source
+    # (text_source is the first stage, so the loop settles it before these): only
+    # a supplied file switches them off, never the request alone.
+    hindi_srt_skips = {"asr": "Hindi SRT supplied: speech-to-text not needed",
+                       "translation": "Hindi SRT supplied: translation not needed"}
     if sel["speakers"] == ["off"]:
         pass  # single voice: nothing depends on it
 
+    def note_soft(stage, c, soft):
+        # also for fallback activations: an unconfirmed requirement is never dropped silently
+        for r in soft:
+            if r.kind == "gpu":
+                cpu_only.append(c.label)
+            else:
+                warnings.append(f"{stage.label} — {c.label}: {r.fix}")
+
     for stage in STAGES:
         sid = stage.id
-        if sid in skip:
+        if sid in hindi_srt_skips and sel["text_source"] == ["hindi_srt"]:
             if sel.get(sid):
-                change(sid, "skipped", ",".join(sel[sid]), skip[sid])
+                change(sid, "skipped", ",".join(sel[sid]), hindi_srt_skips[sid])
             sel[sid] = []
             continue
         kept: List[str] = []
@@ -510,11 +668,7 @@ def resolve(preset: str = DEFAULT_PRESET, overrides: Optional[Dict[str, Any]] = 
                 change(sid, "deactivated", cid, "missing: " + ", ".join(r.name for r in hard),
                        "; ".join(r.fix for r in hard if r.fix))
                 continue
-            for r in soft:
-                if r.kind == "gpu":
-                    cpu_only.append(c.label)
-                else:
-                    warnings.append(f"{stage.label} — {c.label}: {r.fix}")
+            note_soft(stage, c, soft)
             kept.append(cid)
         if not stage.multi:
             kept = kept[:1]
@@ -528,11 +682,13 @@ def resolve(preset: str = DEFAULT_PRESET, overrides: Optional[Dict[str, Any]] = 
                     continue
                 if c.cloud and params.get("local_only") and c.id != "edge":
                     continue
-                if not _unmet(c, probe, ctx, params)[0]:
+                hard, soft = _unmet(c, probe, ctx, params)
+                if not hard:
                     kept = [cid]
                     change(sid, "activated", cid,
                            f"nothing selected for '{stage.label}' could run here; using the "
                            f"first workable option")
+                    note_soft(stage, c, soft)
                     break
         if not kept and stage.required:
             blocking.append(f"{stage.label}: no option can run on this machine — "
