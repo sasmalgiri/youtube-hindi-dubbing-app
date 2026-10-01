@@ -141,6 +141,38 @@ def test_sambanova_retry_keeps_its_own_key(pipe, monkeypatch):
     assert keys == ["Bearer samba"] * 3      # never swapped for a Groq key
 
 
+def test_turbo_retries_an_empty_reply_batch_with_its_other_engine(pipe, monkeypatch):
+    # gpt-oss can answer with no content at all: that is no partial reply, so
+    # Turbo must hand the batch to SambaNova, not voice it line by line.
+    import requests
+    groq_url = Pipeline.TURBO_ENGINE_CONFIG["Groq"][0]
+    asked = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": self.text}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        asked.append("groq" if url == groq_url else "samba")
+        return _Resp(None if url == groq_url else "\n".join(f"{i}. {t}" for i, t in enumerate(HI, 1)))
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(pipeline_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pipeline_mod, "get_groq_key", lambda: "")
+    monkeypatch.setattr(pipe, "_translate_single_fallback", lambda t: pytest.fail("no fallback"))
+    segs = _segs()
+    pipe._translate_segments_turbo(segs, [("Groq", "g"), ("SambaNova", "s")])
+    assert asked == ["groq"] * 3 + ["samba"]
+    assert [s["text_translated"] for s in segs] == HI and pipe.result_warnings == []
+
+
 # ── API / job routing ────────────────────────────────────────────────────────
 
 @pytest.fixture()
@@ -244,6 +276,50 @@ def test_uploaded_transcript_is_not_dropped_by_split_mode(app_mod, monkeypatch):
     assert Path(job.subtitles_path).read_text(encoding="utf-8") == "hindi srt"   # saved folder
 
 
+def test_uploaded_video_job_keeps_the_transcript(app_mod, monkeypatch):
+    # The UI sends the transcript with the video file; the upload endpoint
+    # used to drop the field, so the video was transcribed anyway.
+    from fastapi.testclient import TestClient
+    started = []
+    monkeypatch.setattr(app_mod, "JOBS", {})
+    monkeypatch.setattr(app_mod, "_run_job", lambda job, req: started.append(req))
+    srt = "1\n00:00:00,000 --> 00:00:02,000\nHello there.\n"
+    r = TestClient(app_mod.app).post(
+        "/api/jobs/upload", files={"file": ("clip.mp4", b"video", "video/mp4")},
+        data={"transcript_srt_content": srt, "source_language": "auto"})
+    assert r.status_code == 200, r.text
+    app_mod.JOBS[r.json()["id"]].worker_thread.join(timeout=10)
+    assert started[0].transcript_srt_content == srt and started[0].source_language == "en"
+
+
+def test_cancelled_resume_keeps_the_job_folder_until_its_worker_exits(app_mod, monkeypatch):
+    import threading
+    import time as _time
+    from fastapi.testclient import TestClient
+    release = threading.Event()
+    monkeypatch.setattr(app_mod, "_run_resume", lambda job: release.wait(10))
+    job = app_mod.Job(id="resume000001", state="waiting_for_srt")
+    job.worker_thread = threading.Thread(target=lambda: None)   # the finished phase-1 worker
+    job.worker_thread.start()
+    job.worker_thread.join()
+    job_dir = app_mod.OUTPUTS / job.id
+    (job_dir / "work").mkdir(parents=True)
+    monkeypatch.setitem(app_mod.JOBS, job.id, job)
+    c = TestClient(app_mod.app)
+    r = c.post(f"/api/jobs/{job.id}/resume-with-srt",
+               files={"file": ("hi.srt", "1\n00:00:00,000 --> 00:00:01,000\nनमस्ते\n".encode(), "text/plain")})
+    assert r.status_code == 200, r.text
+    assert c.delete(f"/api/jobs/{job.id}").json() == {"status": "cancelled"}
+    _time.sleep(0.5)
+    assert job_dir.exists()                      # the resume worker is still running
+    release.set()
+    for _ in range(100):
+        if not job_dir.exists():
+            break
+        _time.sleep(0.05)
+    assert not job_dir.exists()                  # removed once it exited
+
+
 def _speakers_json(tmp_path, speakers):
     p = tmp_path / "speakers.json"
     p.write_text(json.dumps({"speakers": speakers}), encoding="utf-8")
@@ -334,3 +410,23 @@ def test_subtitles_and_report_are_served_after_the_job_folder_is_gone(app_mod, m
     r = c.get(f"/api/jobs/{job.id}/report")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/plain")
     assert r.headers["content-disposition"].startswith("inline")   # opens in the tab
+
+
+def test_job_saved_before_subtitles_path_still_offers_its_subtitles(app_mod, monkeypatch, tmp_path):
+    # The job page shows the Subtitles button only when the payload names a
+    # file: a job saved before subtitles_path existed reports its saved SRT.
+    from fastapi.testclient import TestClient
+    folder = tmp_path / "saved" / "Old [HI Dubbed] (old000000001)"
+    folder.mkdir(parents=True)
+    (folder / "transcript_en_speakers.srt").write_text("1\n", encoding="utf-8")   # not the dub
+    srt = folder / "Old - HI Dubbed.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nनमस्ते\n", encoding="utf-8")
+    old = app_mod.Job(id="old000000001", state="done", saved_folder=str(folder))
+    none = app_mod.Job(id="none00000001", state="done")
+    monkeypatch.setitem(app_mod.JOBS, old.id, old)
+    monkeypatch.setitem(app_mod.JOBS, none.id, none)
+    c = TestClient(app_mod.app)
+    assert c.get(f"/api/jobs/{old.id}").json()["subtitles_path"] == str(srt)
+    assert "नमस्ते" in c.get(f"/api/jobs/{old.id}/srt").content.decode("utf-8")
+    assert c.get(f"/api/jobs/{none.id}").json()["subtitles_path"] is None
+    assert c.get(f"/api/jobs/{none.id}/srt").status_code == 404

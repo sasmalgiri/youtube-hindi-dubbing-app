@@ -7682,8 +7682,11 @@ class Pipeline:
     @staticmethod
     def _better_partial(best: Optional[List[str]], exc: Exception) -> Optional[List[str]]:
         """After a failed attempt keep the most complete reply whose numbering
-        can be trusted; its lines are used once the retries run out."""
-        if isinstance(exc, NumberedReplyMismatch) and exc.trusted:
+        can be trusted; its lines are used once the retries run out. A reply
+        with no usable line at all (empty/None content, prose) is never kept:
+        callers must see None so they can try another engine (Turbo retries
+        the batch with its other engine only on None)."""
+        if isinstance(exc, NumberedReplyMismatch) and exc.trusted and any(exc.lines):
             if best is None or sum(1 for x in exc.lines if x) > sum(1 for x in best if x):
                 return exc.lines
         return best

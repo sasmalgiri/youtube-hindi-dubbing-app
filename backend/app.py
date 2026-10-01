@@ -2770,6 +2770,9 @@ async def create_job_upload(
     dialogue_modules_json: str = Form(""),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
+    # "Upload Transcript (Skip Transcription)": the UI sends it with the file;
+    # without this field it was silently dropped and the video transcribed.
+    transcript_srt_content: str = Form(""),
 ):
     """Create a dubbing job from an uploaded video file."""
     _cleanup_old_jobs()
@@ -2849,6 +2852,7 @@ async def create_job_upload(
             dialogue_modules_json=dialogue_modules_json,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
+            transcript_srt_content=transcript_srt_content,
         )
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -3382,6 +3386,7 @@ def get_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    srt = _job_srt(job)
     return {
         "id": job.id,
         "state": job.state,
@@ -3413,7 +3418,8 @@ def get_job(job_id: str):
         "result_status":      job.result_status,
         "status_reasons":     job.status_reasons,
         "report_path":        job.report_path,
-        "subtitles_path":     job.subtitles_path,
+        # The file /srt serves (also for jobs saved before subtitles_path existed)
+        "subtitles_path":     str(srt) if srt else None,
     }
 
 
@@ -3636,21 +3642,33 @@ def get_result(job_id: str):
     )
 
 
+def _job_srt(job: Job) -> Optional[Path]:
+    """The subtitle file /srt serves for this job, or None.
+
+    A finished job's SRT lives in its saved folder (classic jobs delete the
+    job folder once saved); the job-folder path covers runs in progress,
+    and the saved-folder scan covers jobs saved before subtitles_path existed.
+    The status payload reports the same file, so the job page offers the
+    Subtitles button exactly when this finds one.
+    """
+    candidates = [Path(job.subtitles_path)] if job.subtitles_path else []
+    candidates.append(OUTPUTS / job.id / f"subtitles_{job.target_language}.srt")
+    try:   # the job status payload uses this too: a bad drive must not 500 it
+        if job.saved_folder and Path(job.saved_folder) != SAVED_DIR and Path(job.saved_folder).is_dir():
+            candidates += [p for p in sorted(Path(job.saved_folder).glob("*.srt"))
+                           if not p.name.startswith("transcript_")]
+        return next((p for p in candidates if p.is_file()), None)
+    except OSError:
+        return None
+
+
 @app.get("/api/jobs/{job_id}/srt")
 def get_srt(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # A finished job's SRT lives in its saved folder (classic jobs delete the
-    # job folder once saved); the job-folder path covers runs in progress,
-    # and the saved-folder scan covers jobs saved before subtitles_path existed.
-    candidates = [Path(job.subtitles_path)] if job.subtitles_path else []
-    candidates.append(OUTPUTS / job_id / f"subtitles_{job.target_language}.srt")
-    if job.saved_folder and Path(job.saved_folder) != SAVED_DIR and Path(job.saved_folder).is_dir():
-        candidates += [p for p in sorted(Path(job.saved_folder).glob("*.srt"))
-                       if not p.name.startswith("transcript_")]
-    srt_path = next((p for p in candidates if p.is_file()), None)
+    srt_path = _job_srt(job)
     if srt_path is None:
         raise HTTPException(status_code=404, detail="Subtitles not found")
 
@@ -3938,6 +3956,9 @@ async def resume_with_srt(job_id: str, file: UploadFile = File(...)):
 
     t = threading.Thread(target=_run_resume, args=(job,), daemon=True)
     t.start()
+    # Cancel's cleanup waits for THIS worker before deleting the job folder
+    # (the job's original worker exited when it reached waiting_for_srt).
+    job.worker_thread = t
 
     return {"id": job_id, "state": "running"}
 
