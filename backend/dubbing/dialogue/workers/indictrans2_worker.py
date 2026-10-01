@@ -2,10 +2,13 @@
 
 Standalone on purpose (no app imports). IndicTrans2's remote code and
 IndicTransToolkit break on transformers 5.x; use transformers 4.x (>=4.51 per
-the toolkit README; an exact working version must be confirmed on your PC).
+the toolkit README). Confirmed working with the 1B model in the main app's
+Python 3.10: transformers 4.51.3 + IndicTransToolkit 1.1.1, no separate venv.
 
-Model: ai4bharat/indictrans2-en-indic-dist-200M by default (MIT, gated:
-accept conditions + HF_TOKEN); set INDICTRANS2_MODEL for the 1B model.
+Model: ai4bharat/indictrans2-en-indic-1B by default (MIT, gated: accept the
+conditions on huggingface.co + HF_TOKEN). Each checkpoint is gated on its
+own: the distilled 200M repo answers 403 for an account that only accepted
+the 1B terms, so 1B is the default; INDICTRANS2_MODEL overrides it.
 The maintainers advise sentence-level input; callers send one dialogue turn
 per item.
 
@@ -26,6 +29,7 @@ def reply(**kw):
 
 STATE = {}
 SRC, TGT = "eng_Latn", "hin_Deva"
+DEFAULT_MODEL = "ai4bharat/indictrans2-en-indic-1B"
 
 
 def _processor():
@@ -42,8 +46,7 @@ def _processor():
 def init(req):
     import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-    name = req.get("model") or os.environ.get("INDICTRANS2_MODEL",
-                                              "ai4bharat/indictrans2-en-indic-dist-200M")
+    name = req.get("model") or os.environ.get("INDICTRANS2_MODEL", "").strip() or DEFAULT_MODEL
     token = os.environ.get("HF_TOKEN") or None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True, token=token)

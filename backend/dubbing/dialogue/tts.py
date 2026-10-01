@@ -482,6 +482,14 @@ class TTSRouter:
         """If a speaker's clips came from >1 provider, re-voice the whole
         speaker with the fallback provider. Returns unresolved mixes.
 
+        A speaker voiced *entirely* by a fallback provider (every call to the
+        primary failed, e.g. each Indic Parler line fell back to Edge) is
+        consistent already, but it is still pinned to that provider: later
+        regenerations (fit, verification) go to providers_for(speaker)[0]
+        and must use the provider that actually works, not retry the broken
+        one. The orchestrator reports every pinned speaker (speaker_provider)
+        as voiced by a fallback provider.
+
         `synth(turn, reason, provider)` should run the same acceptance checks
         as the first pass; without it clips are accepted unchecked."""
         by_spk: Dict[str, Dict[str, List[str]]] = {}
@@ -490,6 +498,9 @@ class TTSRouter:
         unresolved = []
         for spk, provs in by_spk.items():
             if len(provs) < 2:
+                only = next(iter(provs))
+                if only != self.order[0]:
+                    self.speaker_provider[spk] = only
                 continue
             target = max((p for p in provs if p != self.order[0]),
                          key=lambda p: len(provs[p]), default=None)

@@ -38,13 +38,21 @@ def init(req):
     name = req.get("model") or "ai4bharat/indic-parler-tts"
     token = os.environ.get("HF_TOKEN") or None
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    dtype = (torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported()
+             else torch.float32)
+    # Load, then cast the WHOLE model. from_pretrained(torch_dtype=bf16) only
+    # converts the top-level layers: the text encoder, decoder and DAC are
+    # built from sub-configs that say float32 and stay fp32, so generate()
+    # fails on every line with a dtype mismatch (BFloat16 != float) and
+    # every clip falls back to another voice. The parler-tts README loads
+    # the same way (.to(device, dtype=...)).
     model = ParlerTTSForConditionalGeneration.from_pretrained(
-        name, torch_dtype=dtype, token=token, attn_implementation="eager").to(device)
+        name, token=token, attn_implementation="eager").to(device, dtype=dtype)
     tok = AutoTokenizer.from_pretrained(name, token=token)
     desc_tok = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path, token=token)
     STATE.update(model=model, tok=tok, desc_tok=desc_tok, device=device, torch=torch)
-    return {"model": name, "device": device, "sampling_rate": int(model.config.sampling_rate)}
+    return {"model": name, "device": device, "dtype": str(dtype).replace("torch.", ""),
+            "sampling_rate": int(model.config.sampling_rate)}
 
 
 def tts(req):
