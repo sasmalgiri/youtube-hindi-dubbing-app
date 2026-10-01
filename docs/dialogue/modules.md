@@ -34,17 +34,17 @@ Nothing changes silently. Every change appears in the UI preview, in the job's e
 | --- | --- | --- | --- | --- | --- |
 | Text source | Speech-to-text | free | – | – | – |
 | | My English SRT | free | – | an uploaded English SRT | falls back to speech-to-text |
-| | My Hindi SRT | free | – | an uploaded Hindi SRT | falls back to speech-to-text; when used, **speech-to-text and translation are skipped** |
+| | My Hindi SRT | free | – | an uploaded Hindi SRT | **blocks** the job (switch the input to SRT mode); when used, **speech-to-text and translation are skipped** |
 | Speech-to-text | Automatic | free / free tier | local or cloud | `GROQ_API_KEY` **or** faster-whisper | → Whisper on this PC → Groq |
 | | Whisper on this PC | free | local | faster-whisper (GPU recommended) | → Groq |
 | | Groq Whisper | free tier | cloud | `GROQ_API_KEY` | → Whisper on this PC |
-| Speakers | Detect speakers | free | local | pyannote.audio ≥ 4, torch, `HF_TOKEN` (GPU recommended) | → **Single voice** (reported) |
+| Speakers | Detect speakers | free | local | pyannote.audio ≥ 4, torch, `HF_TOKEN` or `HUGGINGFACE_TOKEN` (GPU recommended) | → **Single voice** (reported) |
 | | Single voice | free | – | – | – |
 | Translation (chain) | Gemini | free tier | cloud | `GEMINI_API_KEY` | next in chain |
 | | Groq LLM | free tier | cloud | `GROQ_API_KEY` | next in chain |
 | | Cerebras | free tier | cloud | `CEREBRAS_API_KEY` | next in chain |
-| | Ollama | free | local | Ollama running + a pulled model | next in chain |
-| | IndicTrans2 | free | local | IndicTransToolkit + transformers 4.x (separate venv), `HF_TOKEN` | next in chain |
+| | Ollama | free | local | Ollama running + a pulled instruct model named in `OLLAMA_MODEL` or the *Ollama model* option (never guessed) | next in chain |
+| | IndicTrans2 | free | local | IndicTransToolkit + transformers 4.x (separate venv), `HF_TOKEN` with access to the model (`INDICTRANS2_MODEL`, default `ai4bharat/indictrans2-en-indic-1B`; checked on huggingface.co, a check that cannot finish is only a warning) | next in chain |
 | | Google basic | free | cloud | deep-translator | next in chain |
 | | OpenAI | **paid** | cloud | `OPENAI_API_KEY` + Allow paid | next in chain |
 | Voices (chain) | Microsoft Edge | free | online | edge-tts | next provider |
@@ -113,13 +113,15 @@ per-turn identity checks, honest draft statuses, and this module matrix.
 
 1. Accept the model terms on Hugging Face with the account whose `HF_TOKEN` you use:
    - `ai4bharat/indic-parler-tts`
-   - `ai4bharat/indictrans2-en-indic-dist-200M` (only for IndicTrans2)
+   - `ai4bharat/indictrans2-en-indic-1B` (only for IndicTrans2). Each checkpoint is gated on its own:
+     if you set `INDICTRANS2_MODEL` to another one, accept that one's terms too.
 2. **Voices:** run `setup_local_ai.bat`. It creates `backend\.venvs\parler` and writes
    `INDIC_PARLER_PYTHON` to `backend\.env`. It was written without a Windows PC; if a step fails, send
    the error.
 3. **Translation:** install Ollama, run `ollama pull gemma3:12b` (about 8 GB, fits a 12 GB GPU) and
-   set `OLLAMA_MODEL=gemma3:12b` in `backend\.env`. If no model is set, the app picks your first pulled
-   model and says so.
+   set `OLLAMA_MODEL=gemma3:12b` in `backend\.env`, or pick the model under *Ollama model*. If none is
+   set, Ollama is switched off and the preview shows that fix. The app never guesses from your pulled
+   models: a small fine-tune that cannot return the translator's JSON would translate nothing.
 4. Check with `python -m dubbing.dialogue modules --preset free-local`.
 
 Background separation runs first, before any local model is loaded, and frees its GPU memory when
