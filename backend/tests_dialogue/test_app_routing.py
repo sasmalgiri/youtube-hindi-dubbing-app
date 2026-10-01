@@ -113,7 +113,8 @@ def test_preset_job_single_narrator_skips_speaker_detection(client, tmp_path):
                          "dialogue_modules_json": json.dumps({"verify": ["off"]})})
     job = _wait(app_mod, r.json()["id"])
     assert "diarize" not in calls
-    assert {s["speaker_id"] for s in job.segments} == {"UNKNOWN"}
+    # one known speaker (its voice is analysed), not the UNKNOWN catch-all
+    assert {s["speaker_id"] for s in job.segments} == {"SPEAKER_00"}
     rep = c.get(f"/api/jobs/{job.id}/report?fmt=json").json()
     assert rep["config"]["modules"]["selections"]["verify"] == ["off"]
     assert rep["config"]["diarization"] is False

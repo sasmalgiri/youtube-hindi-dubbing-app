@@ -3,7 +3,9 @@
 Turns are cut from attributed words at: speaker changes (including
 known <-> unknown), pauses, sentence ends, and a hard duration cap. Two
 different known speakers are never merged into one turn, and short replies
-("Yes.", "No!") survive as their own turns.
+("Yes.", "No!") survive as their own turns. An unattributed fragment of one
+or two words takes the speaker of a neighbouring turn (it is that line's
+missed edge word); only longer unattributed speech becomes an UNKNOWN turn.
 
 Text sources:
   * ASR words (word timestamps)                       -> words_from_asr_segments
@@ -178,9 +180,49 @@ def _spk(w: WordRecord) -> str:
 
 def build_turns(words: Sequence[WordRecord], max_pause: float = 0.7,
                 sentence_split_min_s: float = 3.0, sentence_pause_s: float = 0.3,
-                max_turn_s: float = 10.0) -> List[Turn]:
+                max_turn_s: float = 10.0, max_fragment_words: int = 2) -> List[Turn]:
     """Group attributed words into dialogue turns (see module docstring)."""
     words = sorted(words, key=lambda w: (w.start, w.end))
+    groups = _group_words(words, max_pause, sentence_split_min_s, sentence_pause_s)
+    if _adopt_unknown_fragments(groups, max_fragment_words, max_pause):
+        groups = _group_words(words, max_pause, sentence_split_min_s, sentence_pause_s)
+
+    final: List[List[WordRecord]] = []
+    for g in groups:
+        final += _split_long(g, max_turn_s)
+
+    turns: List[Turn] = []
+    for n, g in enumerate(final, 1):
+        spk = _spk(g[0])
+        assert all(_spk(w) == spk for w in g), "turn spans multiple speakers"
+        for w in g:
+            if NONLEXICAL.match(w.text):
+                w.nonlexical = True
+        lexical = [w for w in g if not w.nonlexical]
+        t = Turn(turn_id=f"t{n:04d}", speaker_id=spk,
+                 source_start=round(g[0].start, 3),
+                 source_end=round(max(w.end for w in g), 3),
+                 word_ids=[w.word_id for w in g],
+                 source_text=" ".join(w.text for w in g).strip(),
+                 required=bool(lexical))
+        if not lexical:
+            t.add_flag("nonlexical")
+        if spk == UNKNOWN_SPEAKER:
+            t.add_flag("speaker_unknown")
+        if any(w.attribution.get("method") == "adjacent_turn" for w in g):
+            t.add_flag("speaker_from_adjacent_turn")
+        if any(w.overlap for w in g):
+            t.add_flag("contains_overlap")
+        if any(w.timing_estimated for w in g):
+            t.add_flag("timing_estimated")
+        turns.append(t)
+    mark_overlaps(turns)
+    return turns
+
+
+def _group_words(words: Sequence[WordRecord], max_pause: float, sentence_split_min_s: float,
+                 sentence_pause_s: float) -> List[List[WordRecord]]:
+    """Time-sorted words -> single-speaker word groups, in start order."""
     groups: List[List[WordRecord]] = []
     # One open turn per speaker. A non-overlapped word from another speaker
     # closes every other open turn (a real speaker change); words inside
@@ -205,36 +247,53 @@ def build_turns(words: Sequence[WordRecord], max_pause: float = 0.7,
         open_turns.setdefault(spk, []).append(w)
     groups += list(open_turns.values())
     groups.sort(key=lambda g: (g[0].start, g[0].end))
+    return groups
 
-    final: List[List[WordRecord]] = []
-    for g in groups:
-        final += _split_long(g, max_turn_s)
 
-    turns: List[Turn] = []
-    for n, g in enumerate(final, 1):
-        spk = _spk(g[0])
-        assert all(_spk(w) == spk for w in g), "turn spans multiple speakers"
+def _adopt_unknown_fragments(groups: List[List[WordRecord]], max_words: int,
+                             max_pause: float) -> bool:
+    """Give each unattributed fragment of <= max_words words the speaker of a
+    neighbouring turn (in place). Returns True if any word changed speaker.
+
+    Such a fragment ("I", "So,", "home.") is nearly always the first or last
+    word of a neighbouring line whose edge the diarization segment missed. As
+    its own UNKNOWN turn it is spoken in a voice no character has, and the
+    neighbour's translation repeats it ("मैं" twice). It takes the speaker of
+    the next turn, or of the previous one when it ends a sentence -- unless
+    that one is more than a pause away and the other is not. The caller then
+    regroups, so the words join that speaker's turn by the usual pause and
+    sentence rules. Longer unattributed speech keeps the UNKNOWN voice.
+    """
+    speech = [any(not NONLEXICAL.match(w.text) for w in g) for g in groups]
+    frag = [speech[i] and _spk(g[0]) == UNKNOWN_SPEAKER and len(g) <= max_words
+            for i, g in enumerate(groups)]
+    # neighbours are real lines: not other fragments, not "[music]"-only groups
+    line = [speech[i] and not frag[i] for i in range(len(groups))]
+    changed = False
+    for i, g in enumerate(groups):
+        if not frag[i]:
+            continue
+        prev_i = next((j for j in range(i - 1, -1, -1) if line[j]), None)
+        next_i = next((j for j in range(i + 1, len(groups)) if line[j]), None)
+        gap: Dict[int, float] = {}
+        if prev_i is not None:
+            gap[prev_i] = g[0].start - max(w.end for w in groups[prev_i])
+        if next_i is not None:
+            gap[next_i] = groups[next_i][0].start - max(w.end for w in g)
+        pick, other = (prev_i, next_i) if _sentence_end(g[-1].text) else (next_i, prev_i)
+        if pick is None or (other is not None and gap[pick] > max_pause >= gap[other]):
+            pick = other
+        if pick is None:
+            continue                     # nothing else was said: stays unknown
+        spk = groups[pick][0].speaker_id
+        if spk is None:
+            continue                     # neighbour is unattributed speech itself
         for w in g:
-            if NONLEXICAL.match(w.text):
-                w.nonlexical = True
-        lexical = [w for w in g if not w.nonlexical]
-        t = Turn(turn_id=f"t{n:04d}", speaker_id=spk,
-                 source_start=round(g[0].start, 3),
-                 source_end=round(max(w.end for w in g), 3),
-                 word_ids=[w.word_id for w in g],
-                 source_text=" ".join(w.text for w in g).strip(),
-                 required=bool(lexical))
-        if not lexical:
-            t.add_flag("nonlexical")
-        if spk == UNKNOWN_SPEAKER:
-            t.add_flag("speaker_unknown")
-        if any(w.overlap for w in g):
-            t.add_flag("contains_overlap")
-        if any(w.timing_estimated for w in g):
-            t.add_flag("timing_estimated")
-        turns.append(t)
-    mark_overlaps(turns)
-    return turns
+            w.attribution = {"method": "adjacent_turn", "speaker": spk,
+                             "previous": w.attribution}
+            w.speaker_id = spk
+        changed = True
+    return changed
 
 
 def _split_long(g: List[WordRecord], max_turn_s: float) -> List[List[WordRecord]]:
@@ -276,12 +335,15 @@ def mark_overlaps(turns: List[Turn], min_overlap_s: float = 0.1):
 # ── pre-translated Hindi cues ──────────────────────────────────────────────
 def turns_from_translated_cues(cues: Sequence[Dict], diar: Optional[DiarizationResult],
                                text_key: str = "text_translated",
-                               second_speaker_share: float = 0.25) -> List[Turn]:
+                               second_speaker_share: float = 0.25,
+                               default_speaker: str = UNKNOWN_SPEAKER) -> List[Turn]:
     """One turn per Hindi cue; speaker from audio diarization over the cue span.
 
     A Hindi cue cannot be split word-by-word against English audio, so cues
     spanning a speaker change are flagged `multi_speaker_cue` instead.
     SRT [SPEAKER_XX] labels are used only when diarization is unavailable.
+    A cue with neither gets `default_speaker` (one known speaker when speaker
+    detection is switched off, so the narrator's voice is still analysed).
     """
     excl = []
     if diar is not None:
@@ -306,8 +368,8 @@ def turns_from_translated_cues(cues: Sequence[Dict], diar: Optional[DiarizationR
             spk = c["speaker_id"]
             flags.append("speaker_from_srt_label")
         else:
-            spk = UNKNOWN_SPEAKER
-            flags.append("speaker_unknown")
+            spk = default_speaker
+            flags.append("speaker_unknown" if spk == UNKNOWN_SPEAKER else "single_voice")
         t = Turn(turn_id=f"t{n:04d}", speaker_id=spk, source_start=s, source_end=e,
                  source_text=c.get("text_source", ""), hi_raw=text, hi_fit=text,
                  hi_display=text, required=bool(text))

@@ -10,6 +10,8 @@ Backends (tried in order of `model` preference):
 Both the regular (overlap-aware) and the exclusive track are kept: the
 exclusive track drives word attribution, the regular track flags simultaneous
 speech. Words that cannot be attributed stay unknown (speaker_id=None).
+With speaker detection switched off the whole video is one speaker
+(assign_single_speaker), which is a choice, not an unknown attribution.
 """
 from __future__ import annotations
 
@@ -110,7 +112,8 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
                  max_speakers: Optional[int] = None,
                  heartbeat: Optional[Callable[[float], None]] = None,
                  timeout: float = 3600.0,
-                 seg_bounds: Optional[Sequence[Tuple[float, float]]] = None) -> DiarizationResult:
+                 seg_bounds: Optional[Sequence[Tuple[float, float]]] = None,
+                 cancel_check: Optional[Callable[[], bool]] = None) -> DiarizationResult:
     """Run pyannote with the requested model, falling back to the other one.
 
     Each attempt runs in a spawned CHILD process (_pyannote_child): a native
@@ -118,7 +121,8 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
     the child can hide NeMo (pyannote imports it optionally, and NeMo 2.7
     crashes at import on torch 2.4 with an AttributeError pyannote does not
     catch). Raises DiarizationUnavailable with an actionable message if
-    neither model runs.
+    neither model runs. ``cancel_check()`` returning True kills the child and
+    raises RuntimeError('Job cancelled by user') (no fallback model is tried).
     """
     if not hf_token:
         raise DiarizationUnavailable(
@@ -149,8 +153,11 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
         if key == "community-1" and major < 4:
             errors.append(f"{model_id} needs pyannote.audio>=4 (installed {version})")
             continue
+        if cancel_check and cancel_check():
+            raise RuntimeError("Job cancelled by user")
         try:
-            data = _run_child(wav_path, hf_token, key, kwargs, heartbeat, timeout, seg_bounds)
+            data = _run_child(wav_path, hf_token, key, kwargs, heartbeat, timeout, seg_bounds,
+                              cancel_check)
             return DiarizationResult(
                 [tuple(x) for x in data["regular"]], [tuple(x) for x in data["exclusive"]],
                 data.get("embeddings") or {}, backend=f"pyannote-{key}",
@@ -158,14 +165,19 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
         except DiarizationUnavailable:
             raise
         except Exception as e:  # try next backend
+            if cancel_check and cancel_check():
+                raise   # a cancel is not a model failure: do not start the next model
             errors.append(_hf_error_message(e, model_id))
     raise DiarizationUnavailable("; ".join(errors) or "diarization failed")
 
 
 def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
                heartbeat: Optional[Callable[[float], None]], timeout: float,
-               seg_bounds=None) -> Dict:
-    """Spawn _pyannote_child; heartbeat every 10 s; returns its JSON result."""
+               seg_bounds=None, cancel_check: Optional[Callable[[], bool]] = None) -> Dict:
+    """Spawn _pyannote_child; heartbeat every 10 s; cancel polled every second
+    (kills the child at once: pyannote on a long video runs for minutes and
+    would otherwise keep the GPU busy after the user cancelled); returns its
+    JSON result."""
     import json
     import multiprocessing as mp
     import tempfile
@@ -183,6 +195,10 @@ def _run_child(wav_path: Path, hf_token: str, key: str, kwargs: Dict,
         next_beat = t0 + 10.0
         while p.is_alive():
             p.join(1.0)
+            if cancel_check and cancel_check():
+                p.kill()
+                p.join(5)
+                raise RuntimeError("Job cancelled by user")
             now = time.time()
             if now - t0 > timeout:
                 p.kill()
@@ -428,12 +444,18 @@ def _dedupe(segs: List[Seg]) -> List[Seg]:
 # ── word attribution ───────────────────────────────────────────────────────
 def assign_words(words: List[WordRecord], diar: Optional[DiarizationResult],
                  min_share: float = 0.5, nearest_tol: float = 0.3,
-                 overlap_share: float = 0.3) -> Dict[str, int]:
+                 overlap_share: float = 0.3, single_share: float = 0.05) -> Dict[str, int]:
     """Assign speaker_id per word in place. Returns attribution statistics.
 
     * Primary evidence: overlap with the exclusive track (share of the word).
-    * A word with little overlap may take the nearest exclusive segment within
-      `nearest_tol` seconds; otherwise it stays unknown (speaker_id=None).
+      Under several speakers the word needs a clear majority (`min_share`);
+      under exactly one it is theirs from `single_share` on: ASR word edges
+      are loose, so the first/last word of a line often sticks out of the
+      diarization segment, and an orphaned word gets a voice nobody has.
+    * Otherwise the word may take the nearest exclusive segment within
+      `nearest_tol` seconds of the word's EDGES (a long word's midpoint can be
+      far from a segment its edge touches); else it stays unknown
+      (speaker_id=None).
     * A word covered by >=2 speakers in the regular track is flagged overlap.
     """
     stats = {"attributed": 0, "nearest": 0, "unknown": 0, "overlap": 0}
@@ -461,18 +483,19 @@ def assign_words(words: List[WordRecord], diar: Optional[DiarizationResult],
             stats["overlap"] += 1
         if shares:
             best = max(shares, key=shares.get)
-            if shares[best] >= min_share or (len(shares) == 1 and shares[best] >= 0.2):
+            if shares[best] >= min_share or (len(shares) == 1 and shares[best] >= single_share):
                 w.speaker_id = best
                 w.attribution = {"method": "exclusive_overlap",
                                  "share": round(min(1.0, shares[best]), 3)}
                 stats["attributed"] += 1
                 continue
-        # nearest segment within tolerance
+        # nearest segment within tolerance, measured from the word's edges;
+        # segments under the word (distance 0) are ranked by their overlap
         best_k, best_d = None, nearest_tol
-        mid = (w.start + w.end) / 2
         for s, e, k in excl:
-            d = 0.0 if s <= mid <= e else min(abs(mid - s), abs(mid - e))
-            if d <= best_d:
+            d = max(0.0, s - w.end, w.start - e)
+            if d < best_d or (d == best_d and (best_k is None
+                                              or shares.get(k, 0.0) > shares.get(best_k, 0.0))):
                 best_k, best_d = k, d
         if best_k is not None:
             w.speaker_id = best_k
@@ -484,6 +507,17 @@ def assign_words(words: List[WordRecord], diar: Optional[DiarizationResult],
                              "shares": {k: round(v, 3) for k, v in shares.items()}}
             stats["unknown"] += 1
     return stats
+
+
+def assign_single_speaker(words: List[WordRecord], speaker_id: str = "SPEAKER_00") -> Dict[str, int]:
+    """Speaker detection switched off (Single Narrator, or no HF token): the
+    whole video is one known speaker, not an unknown one, so voice analysis
+    still picks the narrator's register (a woman narrator gets a female voice
+    instead of the unknown-speaker default)."""
+    for w in words:
+        w.speaker_id = speaker_id
+        w.attribution = {"method": "single_voice", "reason": "speaker_detection_off"}
+    return {"attributed": len(words), "nearest": 0, "unknown": 0, "overlap": 0}
 
 
 def hf_token_from_env() -> str:
