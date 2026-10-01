@@ -601,7 +601,7 @@ export default function JobPage() {
                         />
 
                         {/* Transcript */}
-                        <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} />
+                        <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} showSrtLink={hasSubtitles} />
 
                     </div>
                 )}
@@ -637,7 +637,7 @@ export default function JobPage() {
                                     : 'Review the translated Hindi text below. If it looks good, click Continue to proceed to TTS synthesis.'}
                             </p>
                         </div>
-                        <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} />
+                        <TranscriptViewer jobId={jobId} targetLanguage={status?.target_language} showSrtLink={hasSubtitles} />
                     </div>
                 )}
 

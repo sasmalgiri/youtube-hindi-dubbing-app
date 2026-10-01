@@ -275,6 +275,11 @@ def default_components(cfg: DialogueConfig) -> Components:
 
     def fetch_subs(url: str, cancel_check: Optional[Callable[[], bool]] = None,
                    on_legacy_pipeline: Optional[Callable[[Any], None]] = None):
+        from pipeline import Pipeline
+        if not hasattr(Pipeline, "_fetch_youtube_subtitles"):
+            # YouTube-subtitle input was removed from the legacy pipeline
+            # (092e758): speech recognition is the text source, as for files.
+            return None
         p = _legacy_pipeline(cfg, cancel_check=cancel_check)
         if on_legacy_pipeline:
             on_legacy_pipeline(p)
@@ -1142,6 +1147,13 @@ class DialogueOrchestrator:
         r.voice_reuse = reuse
         for k, v in self.c.notes.items():
             r.model_versions.setdefault(k, v)
+        # translate() handed over only the warnings that existed when it
+        # returned; the fit stage's rewrites can add more (an engine marked
+        # down, an API key refused) and those belong in the report too.
+        tr = getattr(self, "translator", None)
+        if tr is not None:
+            have = {id(w) for w in r.translation_warnings}
+            r.translation_warnings += [w for w in tr.warnings if id(w) not in have]
         r.final_status, r.status_reasons = derive_status(r, aborted)
         write_report(r, out)
 

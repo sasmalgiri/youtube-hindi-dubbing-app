@@ -157,9 +157,9 @@ STAGES: Tuple[Stage, ...] = (
               Choice("indictrans2", "IndicTrans2 (local MT)", "AI4Bharat English->Hindi model, "
                      "unlimited and offline; translates line by line (no dialogue context).",
                      requires=(Req("runtime", "indictrans2",
-                                   "pip install indictranstoolkit \"transformers>=4.51,<5\" torch "
-                                   "in a separate venv and set INDICTRANS2_PYTHON (IndicTransToolkit "
-                                   "has Linux/macOS wheels only: on Windows use WSL, or Ollama)"),
+                                   "python -m pip install -c backend/constraints.txt indictranstoolkit "
+                                   "(runs in the app's own Python 3.10 on Windows too), or install it "
+                                   "in a separate venv and set INDICTRANS2_PYTHON"),
                                Req("env", "HF_TOKEN", "accept the ai4bharat/indictrans2 model terms on "
                                    "huggingface.co and set HF_TOKEN"),
                                # the checkpoint itself is gated per repo: a refused one shows
