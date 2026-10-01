@@ -11,6 +11,9 @@
   token or the rewrite is rejected.
 * A per-turn non-contextual fallback (Google via deep-translator) is used
   only if no LLM engine works, and every such turn is flagged.
+* An engine that fails a whole retry cycle (5xx, 429 on every key, network)
+  is marked down for ENGINE_DOWN_S and skipped by batches, retries, rewrites
+  and the brief; both are recorded in the warnings.
 """
 from __future__ import annotations
 
@@ -55,9 +58,57 @@ class TranslationEngineError(RuntimeError):
     pass
 
 
+class EngineUnavailableError(TranslationEngineError):
+    """The engine itself is out (5xx/overloaded, rate-limited on every key,
+    unreachable, every key rejected), not just one bad request. The
+    translator then skips it for ENGINE_DOWN_S instead of paying the whole
+    retry cycle again on every batch."""
+
+
+class TranslationCancelled(BaseException):
+    """The job was cancelled while an engine was backing off. A BaseException
+    (like asyncio.CancelledError) so the per-engine `except Exception`
+    fallbacks don't take it for an engine failure and call the next engine;
+    the orchestrator recognises the "cancelled by user" message."""
+
+
+# An engine that failed a whole retry cycle is skipped this long: an outage
+# then costs one retry cycle, not one per batch, retry, rewrite and brief
+# (Gemini 503s stretched 84 lines to 8.5 min), and a long job still gives
+# it another chance later.
+ENGINE_DOWN_S = 600.0
+
+
+def _retry_after_s(r) -> float:
+    """Seconds the server asked us to wait: the Retry-After header (seconds or
+    an HTTP date), else the "retryDelay" Gemini puts in its error body; 0 if none."""
+    v = str(r.headers.get("Retry-After") or "").strip()
+    if v:
+        try:
+            return max(0.0, float(v))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                return max(0.0, parsedate_to_datetime(v).timestamp() - time.time())
+            except Exception:
+                pass
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', r.text or "")
+    return float(m.group(1)) if m else 0.0
+
+
+def _key_rejected(r) -> bool:
+    """This key (not the request) was refused: 401/403, or Gemini's 400
+    API_KEY_INVALID. Another key of the same provider may still work."""
+    if r.status_code in (401, 403):
+        return True
+    text = r.text or ""
+    return r.status_code == 400 and ("API_KEY_INVALID" in text or "API key not valid" in text)
+
+
 # ── LLM clients ────────────────────────────────────────────────────────────
 class OpenAICompatClient:
-    """Minimal chat-completions client for OpenAI-compatible endpoints."""
+    """Minimal chat client for OpenAI-compatible chat-completions endpoints,
+    and for Ollama's native /api/chat (see OLLAMA_NUM_CTX)."""
 
     ENDPOINTS = {
         "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -68,28 +119,50 @@ class OpenAICompatClient:
                      "CEREBRAS_API_KEY", "DIALOGUE_CEREBRAS_MODEL", "llama-3.3-70b"),
         "openai": ("https://api.openai.com/v1/chat/completions",
                    "OPENAI_API_KEY", "DIALOGUE_OPENAI_MODEL", "gpt-4o"),
-        "ollama": ("http://localhost:11434/v1/chat/completions",
+        "ollama": ("http://localhost:11434/api/chat",
                    "", "OLLAMA_MODEL", ""),
     }
+    # Ollama's OpenAI-compatible endpoint cannot raise the context window, and
+    # model defaults (2048; 1024 in hinglish-translator) are smaller than the
+    # ~480-token system prompt plus a 20-turn JSON batch: Ollama then silently
+    # drops the start of the prompt and the reply loses ids / breaks the JSON.
+    OLLAMA_NUM_CTX = 8192
+    ROUNDS = 3                  # retry rounds for 5xx / network / every key rate-limited
+    MAX_RETRY_AFTER_S = 60.0    # asked to wait longer = quota spent: give up, don't stall the job
 
-    def __init__(self, name: str, timeout: float = 120.0, model: Optional[str] = None):
+    def __init__(self, name: str, timeout: Optional[float] = None, model: Optional[str] = None):
         if name not in self.ENDPOINTS:
             raise ValueError(f"Unknown engine {name}")
         url, key_env, model_env, default_model = self.ENDPOINTS[name]
         self.name = name
         if name == "ollama":
             host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-            url = (host if host.startswith("http") else "http://" + host) + "/v1/chat/completions"
+            url = (host if host.startswith("http") else "http://" + host) + "/api/chat"
         self.url = url
-        self.key = os.environ.get(key_env, "").strip() if key_env else ""
+        # Every non-empty KEY, KEY_2 .. KEY_19, the .env keys the classic
+        # pipeline rotates: one free-tier key's rate limit must not stall the job.
+        self.needs_key = bool(key_env)
+        self.keys: List[str] = []
+        self.key_envs: List[str] = []       # names only, for reports -- never the keys
+        for env in ([key_env] + [f"{key_env}_{i}" for i in range(2, 20)]) if key_env else []:
+            k = os.environ.get(env, "").strip()
+            if k and k not in self.keys:
+                self.keys.append(k)
+                self.key_envs.append(env)
+        self._next_key = 0
         self.model = (model or "").strip() or os.environ.get(model_env, "").strip() or default_model
-        self.timeout = timeout
+        # A local model on a 12 GB GPU can need minutes for a 20-turn batch.
+        self.timeout = timeout if timeout is not None else (600.0 if name == "ollama" else 120.0)
+        # Set by DialogueTranslator: waits / rejected keys become progress lines
+        # and warnings, and a cancelled job stops backing off at once.
+        self.on_event: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.cancel_check: Optional[Callable[[], bool]] = None
 
     @property
     def available(self) -> bool:
         if self.name == "ollama":
             return bool(self.model)
-        return bool(self.key)
+        return bool(self.keys)
 
     @property
     def model_id(self) -> str:
@@ -97,31 +170,96 @@ class OpenAICompatClient:
 
     def complete(self, system: str, user: str) -> str:
         import requests
-        headers = {"Content-Type": "application/json"}
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
-        body = {"model": self.model, "temperature": 0.2,
-                "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": user}]}
-        if self.name in ("openai", "groq", "gemini"):
-            body["response_format"] = {"type": "json_object"}
-        last = None
-        for attempt in range(3):
-            try:
-                r = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
-            except Exception as e:  # network error
-                last = f"network: {type(e).__name__}"
-                time.sleep(2 * (attempt + 1))
-                continue
-            if r.status_code == 429 or r.status_code >= 500:
-                last = f"HTTP {r.status_code}"
-                time.sleep(3 * (attempt + 1))
-                continue
-            if r.status_code != 200:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        if self.name == "ollama":
+            body = {"model": self.model, "messages": messages, "stream": False, "format": "json",
+                    "options": {"temperature": 0.2, "num_ctx": self.OLLAMA_NUM_CTX}}
+        else:
+            body = {"model": self.model, "temperature": 0.2, "messages": messages}
+            if self.name in ("openai", "groq", "gemini"):
+                body["response_format"] = {"type": "json_object"}
+        last = ""
+        for rnd in range(self.ROUNDS):
+            if self.needs_key and not self.keys:
+                raise EngineUnavailableError(f"{self.name}: every API key was rejected")
+            wait = 0.0
+            for _ in range(max(1, len(self.keys))):     # each key at most once per round
+                idx = self._next_key % len(self.keys) if self.keys else -1
+                headers = {"Content-Type": "application/json"}
+                if idx >= 0:
+                    headers["Authorization"] = f"Bearer {self.keys[idx]}"
+                try:
+                    r = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
+                except Exception as e:  # network error: not key-specific, back off
+                    last = f"network: {type(e).__name__}"
+                    if self.name == "ollama" and isinstance(e, requests.exceptions.ReadTimeout):
+                        # a local generation this slow is as slow again: don't re-send it
+                        raise EngineUnavailableError(
+                            f"ollama gave no answer within {self.timeout:.0f}s") from e
+                    break
+                if r.status_code == 200:
+                    if self.keys:   # spread calls over the keys: each has its own quota
+                        self._next_key = (idx + 1) % len(self.keys)
+                    return self._content(r)
+                if r.status_code == 429:
+                    # this key's quota: the next key has its own, so retry at once
+                    last = "HTTP 429" + (f" on all {len(self.keys)} keys" if len(self.keys) > 1 else "")
+                    wait = max(wait, _retry_after_s(r))
+                    if self.keys:
+                        self._next_key = (idx + 1) % len(self.keys)
+                    continue
+                if r.status_code >= 500:
+                    last = f"HTTP {r.status_code}"
+                    wait = max(wait, _retry_after_s(r))
+                    break   # server side: another key will not help
+                if idx >= 0 and _key_rejected(r):
+                    env = self.key_envs.pop(idx)
+                    self.keys.pop(idx)
+                    self._emit(type="llm_key_rejected", key=env, status=r.status_code)
+                    if not self.keys:
+                        raise EngineUnavailableError(
+                            f"{self.name}: every API key was rejected (last {env}: HTTP {r.status_code})")
+                    self._next_key = idx % len(self.keys)   # the slot now holds the next key
+                    continue
                 raise TranslationEngineError(f"{self.name} HTTP {r.status_code}: {r.text[:200]}")
+            if rnd == self.ROUNDS - 1:
+                break
+            delay = wait or 3.0 * (rnd + 1)
+            if delay > self.MAX_RETRY_AFTER_S:
+                raise EngineUnavailableError(f"{self.name}: {last}; server asks to wait {delay:.0f}s")
+            self._emit(type="llm_wait", seconds=delay, reason=last)
+            self._sleep(delay)
+        raise EngineUnavailableError(f"{self.name} failed after retries ({last})")
+
+    def _content(self, r) -> str:
+        try:
             data = r.json()
-            return data["choices"][0]["message"]["content"] or ""
-        raise TranslationEngineError(f"{self.name} failed after retries ({last})")
+            msg = data["message"] if self.name == "ollama" else data["choices"][0]["message"]
+            content = msg["content"] or ""
+        except Exception as e:
+            raise TranslationEngineError(f"{self.name}: unexpected response ({type(e).__name__}): "
+                                         f"{(r.text or '')[:200]}") from e
+        if self.name == "ollama" and data.get("done_reason") == "length":
+            # cut-off JSON would only surface as a confusing parse error
+            raise TranslationEngineError(f"ollama reply cut off at the length limit "
+                                         f"(num_ctx {self.OLLAMA_NUM_CTX})")
+        return content
+
+    def _emit(self, **ev):
+        if self.on_event:
+            try:
+                self.on_event(dict(ev, engine=self.model_id))
+            except Exception:
+                pass
+
+    def _sleep(self, seconds: float):
+        """Back off in <= 1 s slices so a cancelled job stops waiting at once."""
+        while seconds > 0:
+            if self.cancel_check and self.cancel_check():
+                raise TranslationCancelled("Job cancelled by user")
+            step = min(1.0, seconds)
+            time.sleep(step)
+            seconds -= step
 
 
 def default_llm_clients(order: Sequence[str], ollama_model: str = "") -> List[OpenAICompatClient]:
@@ -146,6 +284,16 @@ def google_basic_translate(text: str) -> str:
 
 
 # ── validation ─────────────────────────────────────────────────────────────
+_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+
+
+def _not_hindi(text: str) -> bool:
+    """Letters but no Devanagari: the model answered in English/Latin (or
+    another script), useless to a Hindi voice. Digits/punctuation only
+    ("3... 2... 1...") has no wrong-language text and passes."""
+    return not _DEVANAGARI.search(text) and any(ch.isalpha() for ch in text)
+
+
 def parse_json_object(raw: str) -> Dict:
     s = (raw or "").strip()
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL).strip()   # reasoning models
@@ -190,8 +338,12 @@ def validate_translations(payload: Dict, expected_ids: Sequence[str],
         if len(lst) > 1:
             errors.append({"type": "duplicate_id_identical", "id": tid})
         item = lst[0]
-        if not str(item.get("hi", "")).strip():
+        hi = str(item.get("hi", "")).strip()
+        if not hi:
             errors.append({"type": "empty_translation", "id": tid})
+            continue
+        if _not_hindi(hi):      # retried like an empty line
+            errors.append({"type": "empty_translation", "id": tid, "detail": "no Devanagari"})
             continue
         good[tid] = item
     for tid in expected_ids:
@@ -230,6 +382,76 @@ class DialogueTranslator:
         self.brief: Dict[str, Any] = {}
         self.warnings: List[Dict] = []
         self.engines_used: set = set()
+        # Engine health, keyed by id(client): (down until, reason), failed
+        # retry cycles, and the one "engine_skipped" warning per engine.
+        self._down: Dict[int, Tuple[float, str]] = {}
+        self._failures: Dict[int, int] = {}
+        self._skipped: Dict[int, Dict] = {}
+        self._clock = time.monotonic
+        self._frac = 0.0
+        self._in_translate = False
+        for c in self.clients:
+            if hasattr(c, "on_event"):      # OpenAICompatClient
+                c.on_event = self._client_event
+                c.cancel_check = self.cancel_check
+
+    # ── engine health ─────────────────────────────────────────────────
+    def _call(self, client, system: str, user: str) -> str:
+        try:
+            return client.complete(system, user)
+        except EngineUnavailableError as e:
+            self._mark_down(client, str(e))
+            raise
+
+    def _mark_down(self, client, reason: str):
+        k = id(client)
+        self._failures[k] = self._failures.get(k, 0) + 1
+        self._down[k] = (self._clock() + ENGINE_DOWN_S, reason[:200])
+        self.warnings.append({"type": "engine_marked_down", "engine": client.model_id,
+                              "detail": reason[:200], "down_for_s": int(ENGINE_DOWN_S),
+                              "failures": self._failures[k]})
+        self._note(f"{client.model_id} unavailable ({reason[:80]}); "
+                   f"skipping it for {int(ENGINE_DOWN_S // 60)} min")
+
+    def _skip_if_down(self, client, where: str) -> bool:
+        """True (and counted in one warning per engine) while marked down."""
+        down = self._down.get(id(client))
+        if not down or down[0] <= self._clock():
+            return False
+        w = self._skipped.get(id(client))
+        if w is None:
+            w = self._skipped[id(client)] = {"type": "engine_skipped", "engine": client.model_id,
+                                             "reason": "", "skipped_calls": 0, "where": []}
+            self.warnings.append(w)
+        w["reason"] = down[1]
+        w["skipped_calls"] += 1
+        if where not in w["where"]:
+            w["where"].append(where)
+        return True
+
+    def _first_healthy(self, where: str) -> List:
+        """[the first engine not marked down], or [] if all are down."""
+        for c in self.clients:
+            if not self._skip_if_down(c, where):
+                return [c]
+        return []
+
+    def _progress(self, frac: float, msg: str):
+        self._frac = frac
+        self.on_progress(frac, msg)
+
+    def _note(self, msg: str):
+        # Only while translate() runs: from rewrite_shorter (fit stage) the
+        # line would show up under the translate step.
+        if self._in_translate:
+            self.on_progress(self._frac, msg)
+
+    def _client_event(self, ev: Dict[str, Any]):
+        if ev.get("type") == "llm_key_rejected":
+            self.warnings.append({k: ev.get(k) for k in ("type", "engine", "key", "status")})
+        elif ev.get("type") == "llm_wait":
+            self._note(f"{ev.get('engine')}: {ev.get('reason')}; "
+                       f"retrying in {float(ev.get('seconds') or 0):.0f}s")
 
     # prompt payload
     def _turn_payload(self, t: Turn, speaker_hints: Dict[str, str]) -> Dict:
@@ -262,46 +484,65 @@ class DialogueTranslator:
             user = {"story_brief": self.brief, **user}
         if note:
             user["reviewer_note"] = note
-        raw = client.complete(SYSTEM_PROMPT, json.dumps(user, ensure_ascii=False))
+        raw = self._call(client, SYSTEM_PROMPT, json.dumps(user, ensure_ascii=False))
         payload = parse_json_object(raw)
         names = payload.get("names")
         if isinstance(names, dict):
             for k, v in names.items():
-                if isinstance(k, str) and isinstance(v, str) and k not in self.name_map:
+                # Devanagari only, as for the brief's names: a Latin spelling would
+                # be pushed into every later batch as the one to reuse.
+                if isinstance(k, str) and isinstance(v, str) and k not in self.name_map \
+                        and _DEVANAGARI.search(v):
                     self.name_map[k] = v
         ctx_ids = [t.turn_id for t in before + after]
         return validate_translations(payload, [t.turn_id for t in batch], ctx_ids)
 
     def translate(self, turns: List[Turn], speaker_hints: Optional[Dict[str, str]] = None) -> List[Dict]:
         """Fill hi_raw/hi_fit/hi_display on required turns. Returns warnings."""
-        speaker_hints = speaker_hints or {}
+        self._in_translate = True
+        try:
+            self._translate_turns(turns, speaker_hints or {})
+        finally:
+            self._in_translate = False
+        return self.warnings
+
+    def _translate_turns(self, turns: List[Turn], speaker_hints: Dict[str, str]):
         todo = [t for t in turns if t.required and t.source_text.strip() and not t.hi_raw]
         for t in todo:
             t.protected_terms = extract_protected_terms(t.source_text, self.glossary)
         order = {t.turn_id: i for i, t in enumerate(turns)}
         if self.story_brief and self.clients and len(todo) >= 2 and not self.brief:
-            self.build_brief(turns)
+            # one whole-transcript LLM call: say so, or the step looks frozen
+            self._progress(0.0, "Building story brief...")
+            brief = self.build_brief(turns)
+            self._progress(0.0, f"Story brief ready ({brief['engine']})" if brief else
+                           "No story brief (see translation warnings); using local context only")
         done = 0
         for b0 in range(0, len(todo), self.batch_size):
             if self.cancel_check():
                 raise RuntimeError("Job cancelled by user")
             batch = todo[b0:b0 + self.batch_size]
+            self._progress(done / max(1, len(todo)),
+                           f"Translating turns {done + 1}-{done + len(batch)} of {len(todo)}...")
             first, last = order[batch[0].turn_id], order[batch[-1].turn_id]
             before = [t for t in turns[max(0, first - self.context_before):first] if t.hi_raw]
             after = turns[last + 1:last + 1 + self.context_after]
             self._translate_batch(batch, before, after, speaker_hints)
             done += len(batch)
-            self.on_progress(done / max(1, len(todo)), f"Translated {done}/{len(todo)} turns")
+            self._progress(done / max(1, len(todo)), f"Translated {done}/{len(todo)} turns")
         self._critical_pass(todo, turns, speaker_hints)
         for t in todo:
             if t.hi_raw:
                 t.hi_fit = t.hi_fit or t.hi_raw
                 t.hi_display = t.hi_display or t.hi_raw
-        return self.warnings
 
     def _translate_batch(self, batch, before, after, speaker_hints):
         pending = list(batch)
         for client in self.clients:
+            if not pending:
+                return
+            if self._skip_if_down(client, "translation"):
+                continue
             for attempt in range(self.max_attempts):
                 if not pending:
                     return
@@ -339,9 +580,16 @@ class DialogueTranslator:
                 self.warnings.append({"type": "engine_error", "engine": engine.name,
                                       "detail": str(e)[:200]})
                 continue
+            # A partial failure (e.g. Google 429 mid-batch) is recorded per turn
+            # with the engine's first error, not left as silent blanks.
+            err = getattr(engine, "last_error", "") or ""
+            missed = 0
             for t, out in zip(pending, outs):
                 out = (out or "").strip()
                 if not out:
+                    missed += 1
+                    t.translation_attempts.append({"engine": engine.name, "ok": False,
+                                                   "error": (err or "no output")[:200]})
                     continue
                 t.hi_raw = out
                 t.add_flag(engine.flag)
@@ -349,6 +597,9 @@ class DialogueTranslator:
                 self.engines_used.add(engine.name)
                 if engine.warn_per_turn:
                     self.warnings.append({"type": engine.flag, "id": t.turn_id})
+            if missed and err:
+                self.warnings.append({"type": "engine_error", "engine": engine.name,
+                                      "detail": f"{missed} line(s) not translated: {err}"[:200]})
             pending = [t for t in pending if not t.hi_raw]
         for t in batch:
             if not t.hi_raw:
@@ -365,9 +616,14 @@ class DialogueTranslator:
             if issues:
                 failing.append((t, issues))
         order = {t.turn_id: i for i, t in enumerate(turns)}
-        for t, issues in failing:
+        for k, (t, issues) in enumerate(failing, 1):
+            if self.cancel_check():
+                raise RuntimeError("Job cancelled by user")
             fixed = False
-            for client in self.clients[:1]:
+            # the first engine NOT marked down (clients[0] kept retrying a dead Gemini)
+            for client in self._first_healthy("critical-token retry"):
+                self._progress(1.0, f"Re-translating line {k}/{len(failing)} "
+                                    f"(dropped name/number/negation)")
                 i = order[t.turn_id]
                 note = ("Previous attempt had these problems, fix them: "
                         + json.dumps(issues, ensure_ascii=False) + f". Previous: {t.hi_raw}")
@@ -412,8 +668,10 @@ class DialogueTranslator:
         speakers = sorted({t.speaker_id for t in turns})
         user = json.dumps({"transcript": "\n".join(lines), "speaker_ids": speakers}, ensure_ascii=False)
         for client in self.clients:
+            if self._skip_if_down(client, "story brief"):
+                continue
             try:
-                data = parse_json_object(client.complete(BRIEF_PROMPT, user))
+                data = parse_json_object(self._call(client, BRIEF_PROMPT, user))
             except Exception as e:
                 self.warnings.append({"type": "story_brief_failed", "engine": client.model_id,
                                       "detail": str(e)[:160]})
@@ -439,11 +697,17 @@ class DialogueTranslator:
                            "target_words": target_words, "protected": t.protected_terms,
                            "known_names": self.name_map}, ensure_ascii=False)
         for client in self.clients:
+            if self._skip_if_down(client, "line shortening"):
+                continue
             try:
-                cand = str(parse_json_object(client.complete(REWRITE_PROMPT, user)).get("hi", "")).strip()
+                cand = str(parse_json_object(self._call(client, REWRITE_PROMPT, user)).get("hi", "")).strip()
             except Exception:
                 continue
             if not cand or len(cand) >= len(current_hi):
+                continue
+            if _not_hindi(cand):
+                t.translation_attempts.append({"engine": client.model_id, "ok": False,
+                                               "reason": "rewrite_not_devanagari"})
                 continue
             after = critical_tokens_hindi(cand)
             if after["numbers"] != before["numbers"] or after["negations"] < before["negations"]:
