@@ -423,3 +423,13 @@ def test_story_brief_failure_is_non_fatal():
     warnings = tr.translate(turns)
     assert all(t.hi_raw for t in turns) and tr.brief == {}
     assert any(w["type"] == "story_brief_failed" for w in warnings)
+
+
+def test_pipe_becomes_danda_and_first_turn_at_zero_is_not_delayed(tmp_path):
+    from dubbing.dialogue.tts import tts_sanitize
+    assert tts_sanitize("मैं आ गया | चलो") == "मैं आ गया। चलो"
+    router = TTSRouter({"mock": MockProvider()}, _reg(), ["mock"], tmp_path)
+    t = Turn("t1", "M", 0.0, 2.0, hi_fit="हाँ")
+    clips = {"t1": router.synthesize(t)}
+    devs = fit.fit_all([t], clips, 5.0, lambda tt, r: router.synthesize(tt, r), None, fit.FitConfig())
+    assert clips["t1"].scheduled_start == 0.0 and not devs

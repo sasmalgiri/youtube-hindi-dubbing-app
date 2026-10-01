@@ -45,7 +45,8 @@ def tts_sanitize(text: str) -> str:
     """
     if not text:
         return text
-    t = _BRACKETED.sub(" ", text)
+    t = re.sub(r"\s*\|\s*", "। ", text)   # LLMs often type "|" for the danda
+    t = _BRACKETED.sub(" ", t)
     t = _SYMBOLS.sub(" ", t)
     t = t.replace("\u201c", "").replace("\u201d", "").replace('"', "")
     t = re.sub(r"\s*[—–]\s*", ", ", t)

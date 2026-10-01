@@ -90,6 +90,7 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
     deviations: List[Dict] = []
     ordered = sorted([t for t in turns if t.turn_id in clips], key=lambda t: t.source_start)
     last_end = 0.0
+    placed = False          # a previous non-overlap clip exists (delay only behind a real clip)
     for n, t in enumerate(ordered):
         if cancel_check():
             raise RuntimeError("Job cancelled by user")
@@ -97,7 +98,7 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
         start, avail_end = windows.get(t.turn_id, (t.source_start, t.source_end))
         sched = start
         delayed = 0.0
-        if not t.overlaps_with and last_end + cfg.guard_s > start + 1e-3:
+        if not t.overlaps_with and placed and last_end + cfg.guard_s > start + 1e-3:
             sched = min(last_end + cfg.guard_s, start + cfg.max_delay_s)
             delayed = sched - start
         slack = avail_end - sched
@@ -167,7 +168,9 @@ def fit_all(turns: Sequence[Turn], clips: Dict[str, Clip], media_duration: float
                 overflow -= shift
         clip.scheduled_start = round(sched, 3)
         clip.scheduled_end = round(sched + clip.final_duration, 3)
-        last_end = max(last_end, clip.scheduled_end) if not t.overlaps_with else last_end
+        if not t.overlaps_with:
+            last_end = max(last_end, clip.scheduled_end)
+            placed = True
         rec = {"turn_id": t.turn_id, "speaker_id": t.speaker_id,
                "source_start": t.source_start, "source_end": t.source_end,
                "scheduled_start": clip.scheduled_start, "scheduled_end": clip.scheduled_end,

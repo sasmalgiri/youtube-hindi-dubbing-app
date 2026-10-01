@@ -133,8 +133,15 @@ def _audio_separator(original: Path, work: Path, model: str) -> Dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     sep = Separator(output_dir=str(out_dir), output_format="WAV",
                     model_file_dir=str(backend_dir / "models" / "separation"))
-    sep.load_model(model_filename=model)
-    files = [Path(f) if Path(f).is_absolute() else out_dir / f for f in sep.separate(str(original))]
+    try:
+        sep.load_model(model_filename=model)
+        names = sep.separate(str(original))
+    finally:
+        # Separation now runs first: release the model so its VRAM is free
+        # for Whisper, pyannote and the local TTS/MT workers.
+        del sep
+        _free_gpu()
+    files = [Path(f) if Path(f).is_absolute() else out_dir / f for f in names]
     voc = next((f for f in files if "(vocals)" in f.name.lower()), None)
     bed = next((f for f in files if "(instrumental)" in f.name.lower()
                 or "(no_vocals)" in f.name.lower() or "(no vocals)" in f.name.lower()), None)
@@ -146,7 +153,6 @@ def _audio_separator(original: Path, work: Path, model: str) -> Dict:
     if voc is not None and voc.exists():
         vocals = work / "vocals_estimate.wav"
         audio.to_wav(voc, vocals, channels=2)
-    _free_gpu()
     return {"status": "ok", "background": str(background),
             "vocals": str(vocals) if vocals else None,
             "detail": f"audio-separator {model}"}
@@ -219,12 +225,14 @@ def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
     """
     pre = out.with_name("mix_pre_norm.wav")
     dur = f"{duration:.3f}"
+    duck_residue = False
     if background:
         inputs = ["-i", str(dialogue_bus), "-i", str(background)]
         bg = "bg"
+        duck_residue = bool(vocals_key and Path(vocals_key).exists())
         flt = (f"[0:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},asplit=2[dlg][sc];"
                f"[1:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur},volume={bg_gain}[bg];")
-        if vocals_key and Path(vocals_key).exists():
+        if duck_residue:
             inputs += ["-i", str(vocals_key)]
             flt += (f"[2:a]aformat=channel_layouts=stereo,apad,atrim=0:{dur}[vk];"
                     f"[bg][vk]sidechaincompress=threshold=0.03:ratio=2.5:attack=10:release=250[bgv];")
@@ -243,7 +251,7 @@ def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
     info.update({"duration": round(st["duration"], 3), "peak": round(st["peak"], 4),
                  "clip_fraction": st["clip_fraction"], "channels": st["channels"],
                  "sample_rate": st["sample_rate"], "background": bool(background),
-                 "residue_duck": bool(background and vocals_key)})
+                 "residue_duck": duck_residue})
     return info
 
 
