@@ -7,12 +7,16 @@ Background policy (dialogue profile):
   * "none"  : Hindi-only audio (no background bed).
 The original English audio is never used as a "background" stand-in.
 Separation is an *estimate* of the non-speech bed, not a clean M&E track.
+The dialogue path separates in a child process (separate_in_child), so a
+cancel stops it at once.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from . import audio
 from .contracts import Clip, Turn
@@ -77,16 +81,24 @@ SEPARATOR_MODELS = (
 )
 
 
-def separate_background(original: Path, work: Path, policy: str = "auto") -> Dict:
+def separate_background(original: Path, work: Path, policy: str = "auto",
+                        cancel_check: Optional[Callable[[], bool]] = None) -> Dict:
     """Split the original audio into a background bed and a vocals stem.
 
     Returns {"status", "background": path|None, "vocals": path|None,
     "detail"}. The vocals stem is used for speaker detection / voice
     analysis (music and effects otherwise create false speakers); the
     background is mixed under the Hindi dialogue. Separation is an estimate.
+    ``cancel_check`` is polled between separator attempts (each one runs for
+    about the length of the video); a cancel raises RuntimeError.
     """
     if policy == "none":
         return {"status": "disabled", "background": None, "vocals": None, "detail": "policy=none"}
+
+    def check_cancel():
+        if cancel_check and cancel_check():
+            raise RuntimeError("Job cancelled by user")
+
     errors = []
     try:
         import audio_separator  # noqa: F401
@@ -94,10 +106,10 @@ def separate_background(original: Path, work: Path, policy: str = "auto") -> Dic
     except ImportError:
         has_as = False
     if has_as:
-        import os
         models = [m for m in [os.environ.get("DIALOGUE_SEPARATOR_MODEL", "").strip()] if m] \
             + list(SEPARATOR_MODELS)
         for model in models:
+            check_cancel()
             try:
                 return _audio_separator(original, work, model)
             except Exception as e:
@@ -112,9 +124,11 @@ def separate_background(original: Path, work: Path, policy: str = "auto") -> Dic
         return {"status": "unavailable" if not errors else "failed", "background": None,
                 "vocals": None, "detail": detail}
     out = work / "background_estimate.wav"
+    check_cancel()
     try:
         res = _demucs_api(original, out, work)
     except Exception as api_err:
+        check_cancel()
         try:
             res = _demucs_cli(original, out, work)
         except Exception as cli_err:
@@ -124,6 +138,113 @@ def separate_background(original: Path, work: Path, policy: str = "auto") -> Dic
     if errors:
         res["detail"] += " (audio-separator failed: " + "; ".join(errors) + ")"
     return res
+
+
+def separate_in_child(original: Path, work: Path, policy: str = "auto",
+                      cancel_check: Optional[Callable[[], bool]] = None,
+                      timeout: Optional[float] = None) -> Dict:
+    """separate_background in a spawned child process (the dialogue default).
+
+    Separation runs for about the length of the video. In a child, a cancel
+    kills it within a second instead of after the whole video, a native crash
+    or CUDA OOM kills only the child (reported as a failed separation), and
+    all of its VRAM is back before Whisper and pyannote start. Same result
+    dict as separate_background.
+    """
+    if policy == "none" or not (_installed("audio_separator") or _installed("demucs")):
+        return separate_background(original, work, policy)   # nothing heavy to isolate
+    import json
+    import multiprocessing as mp
+    import tempfile
+    import time
+
+    if cancel_check and cancel_check():
+        raise RuntimeError("Job cancelled by user")
+
+    if timeout is None:   # bounds a hang only; a cancel ends it at any time
+        try:
+            timeout = max(3600.0, 10.0 * audio.probe_duration(original))
+        except Exception:
+            timeout = 6 * 3600.0
+    fd, result_path = tempfile.mkstemp(suffix=".json", prefix="dlg_separate_")
+    os.close(fd)
+    try:
+        p = mp.get_context("spawn").Process(
+            target=_separation_child, args=(str(original), str(work), policy, result_path),
+            daemon=True)
+        p.start()
+        t0 = time.time()
+        while p.is_alive():
+            p.join(1.0)
+            if cancel_check and cancel_check():
+                p.kill()
+                p.join(5)
+                raise RuntimeError("Job cancelled by user")
+            if time.time() - t0 > timeout:
+                p.kill()
+                p.join(5)
+                return {"status": "failed", "background": None, "vocals": None,
+                        "detail": f"separation timed out after {int(timeout)}s; "
+                                  f"output is Hindi dialogue only"}
+        data: Dict = {}
+        try:
+            with open(result_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+        if data.get("status"):
+            return data
+        return {"status": "failed", "background": None, "vocals": None,
+                "detail": "separation process failed ("
+                          + str(data.get("error") or f"exit code {p.exitcode}")[:200]
+                          + "); output is Hindi dialogue only"}
+    finally:
+        try:
+            Path(result_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _installed(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _separation_child(original: str, work: str, policy: str, result_path: str) -> None:
+    """Child-process body of separate_in_child (top level so spawn can pickle it)."""
+    import json
+    import sys
+
+    def finish(code: int):
+        # The result is on disk: skip interpreter teardown, where Windows CUDA
+        # libraries can fail-fast while unloading (as in _pyannote_child).
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(code)
+
+    try:
+        try:
+            # torch (and its cuDNN) before anything that could load
+            # CTranslate2, as in every process that runs Roformer/Demucs.
+            importlib.import_module("torch")
+        except Exception:
+            pass
+        res = separate_background(Path(original), Path(work), policy)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(res, f)
+    except BaseException as e:
+        try:
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump({"error": f"{type(e).__name__}: {e}"}, f)
+        except Exception:
+            pass
+        finish(1)
+    finish(0)
 
 
 def _audio_separator(original: Path, work: Path, model: str) -> Dict:

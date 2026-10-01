@@ -12,12 +12,14 @@ the legacy cross-job ASR cache is bypassed).
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import platform
 import re
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -29,7 +31,8 @@ from . import audio, fit, mix, verify
 from .contracts import (STATUS_CANCELLED, STATUS_FAILED, UNKNOWN_SPEAKER,
                         CATEGORY_FEMALE, CATEGORY_MALE, CATEGORY_UNKNOWN, Clip, JobReport, Turn)
 from .diarization import (DiarizationResult, DiarizationUnavailable,
-                          assign_words, hf_token_from_env, run_pyannote)
+                          assign_single_speaker, assign_words, hf_token_from_env,
+                          run_pyannote)
 from .report import derive_status, write_report
 from .speaker_registry import SpeakerRegistry, ensure_unknown_speaker
 from .translation import (DialogueTranslator, build_mt_engines,
@@ -42,6 +45,15 @@ from .voice_analysis import MIN_CONFIDENCE, analyze_speaker, classify_gender_ml
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 ProgressCB = Callable[[str, float, str], None]
+
+# The one speaker of a single-voice run (speaker detection off): a known
+# speaker, not UNKNOWN, so the narrator's voice is still analysed.
+SINGLE_SPEAKER = "SPEAKER_00"
+# Below this share of required lines with Hindi text the job fails before
+# TTS: a dub of the background alone is not a draft worth producing.
+MIN_TRANSLATED_SHARE = 0.1
+_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+_PCT_PREFIX = re.compile(r"^\[\d+%\]\s*")
 
 
 @dataclass
@@ -133,8 +145,12 @@ def _is_url(s: str) -> bool:
 
 
 # ── default components ────────────────────────────────────────────────────
-def _legacy_pipeline(cfg: DialogueConfig):
-    """A legacy Pipeline instance used only for link download/subtitles/local ASR."""
+def _legacy_pipeline(cfg: DialogueConfig, on_progress: Optional[ProgressCB] = None,
+                     cancel_check: Optional[Callable[[], bool]] = None):
+    """A legacy Pipeline instance used only for link download/subtitles/local ASR.
+
+    With the job's cancel_check its subprocesses (yt-dlp, ffmpeg) are killed
+    on cancel; on_progress receives its (step, fraction, message) reports."""
     if str(BACKEND_DIR) not in sys.path:
         sys.path.insert(0, str(BACKEND_DIR))
     from pipeline import Pipeline, PipelineConfig
@@ -142,14 +158,16 @@ def _legacy_pipeline(cfg: DialogueConfig):
                         output_path=cfg.output_dir / "dubbed.mp4",
                         source_language="en", target_language="hi",
                         asr_model=cfg.asr_model, use_whisperx=False)
-    return Pipeline(pc)
+    return Pipeline(pc, on_progress=on_progress, cancel_check=cancel_check)
 
 
 class AcquireError(RuntimeError):
     pass
 
 
-def default_acquire(cfg: DialogueConfig, work: Path) -> Path:
+def default_acquire(cfg: DialogueConfig, work: Path, on_progress: Optional[ProgressCB] = None,
+                    cancel_check: Optional[Callable[[], bool]] = None,
+                    on_legacy_pipeline: Optional[Callable[[Any], None]] = None) -> Path:
     src = Path(cfg.source)
     if not _is_url(cfg.source):
         if not src.exists():
@@ -162,10 +180,17 @@ def default_acquire(cfg: DialogueConfig, work: Path) -> Path:
                 shutil.copy2(src, dst)
         return dst
     try:
-        p = _legacy_pipeline(cfg)
+        p = _legacy_pipeline(cfg, on_progress=on_progress, cancel_check=cancel_check)
+        if on_legacy_pipeline:
+            on_legacy_pipeline(p)
         p._ensure_ffmpeg()
-        return Path(p._ingest_source(cfg.source))
+        video = Path(p._ingest_source(cfg.source))
+    except Cancelled:
+        raise
     except Exception as e:
+        if cancel_check and cancel_check():
+            # yt-dlp was killed by the cancel: not a download problem
+            raise Cancelled("Job cancelled by user") from e
         msg = str(e)
         hint = ("The link could not be downloaded. If the video is private, age-restricted, "
                 "members-only or region-locked, export YouTube cookies to backend/cookies.txt "
@@ -173,6 +198,21 @@ def default_acquire(cfg: DialogueConfig, work: Path) -> Path:
                 "Some links cannot be supported at all.")
         detail = re.sub(r"https?://\S+", "<url>", msg)[:300]
         raise AcquireError(f"{hint} Detail: {detail}") from e
+    _write_source_title(work, getattr(p, "video_title", ""))
+    return video
+
+
+def _write_source_title(work: Path, title: str) -> None:
+    """The downloaded video's title as one line in work/source_title.txt:
+    app.py names the job and its output folder from it."""
+    title = " ".join((title or "").split())
+    if not title:
+        return   # yt-dlp gave no title: app.py names the job from the link
+    try:
+        (work / "source_title.txt").write_text(title, encoding="utf-8")
+    except OSError as e:
+        print(f"[hindi_dialogue] could not write source_title.txt ({e}); "
+              f"the job is named from the link", flush=True)
 
 
 WHISPER_PUNCT_PROMPT = "Hello. Yes, I know! What did you say? Okay, let's go."
@@ -207,7 +247,9 @@ def _groq_word_asr(wav: Path) -> List[Dict]:
 def default_components(cfg: DialogueConfig) -> Components:
     notes: Dict[str, str] = {}
 
-    def asr(wav: Path) -> List[Dict]:
+    def asr(wav: Path, on_progress: Optional[ProgressCB] = None,
+            cancel_check: Optional[Callable[[], bool]] = None,
+            on_legacy_pipeline: Optional[Callable[[Any], None]] = None) -> List[Dict]:
         mode = cfg.asr
         if mode in ("auto", "groq") and os.environ.get("GROQ_API_KEY"):
             try:
@@ -218,18 +260,24 @@ def default_components(cfg: DialogueConfig) -> Components:
                 if mode == "groq":
                     raise
                 notes["asr_fallback"] = f"groq failed ({str(e)[:100]}); used local faster-whisper"
-        p = _legacy_pipeline(cfg)
+        p = _legacy_pipeline(cfg, on_progress=on_progress, cancel_check=cancel_check)
+        if on_legacy_pipeline:
+            on_legacy_pipeline(p)
         segs = p._transcribe_local(wav, decode=cfg.asr_decode)  # child process, no cache
         notes["asr"] = f"local faster-whisper {p.cfg.asr_model if p.cfg.asr_model not in ('groq-whisper','groq','parakeet') else 'medium'}"
         return segs
 
-    def diarize(wav: Path, seg_bounds=None) -> DiarizationResult:
+    def diarize(wav: Path, seg_bounds=None, heartbeat: Optional[Callable[[float], None]] = None,
+                cancel_check: Optional[Callable[[], bool]] = None) -> DiarizationResult:
         return run_pyannote(wav, hf_token_from_env(), cfg.diarization_model,
                             cfg.num_speakers, cfg.min_speakers, cfg.max_speakers,
-                            seg_bounds=seg_bounds)
+                            heartbeat=heartbeat, seg_bounds=seg_bounds, cancel_check=cancel_check)
 
-    def fetch_subs(url: str):
-        p = _legacy_pipeline(cfg)
+    def fetch_subs(url: str, cancel_check: Optional[Callable[[], bool]] = None,
+                   on_legacy_pipeline: Optional[Callable[[Any], None]] = None):
+        p = _legacy_pipeline(cfg, cancel_check=cancel_check)
+        if on_legacy_pipeline:
+            on_legacy_pipeline(p)
         return p._fetch_youtube_subtitles(url)
 
     def content_asr():
@@ -247,36 +295,178 @@ def default_components(cfg: DialogueConfig) -> Components:
         llm_clients=default_llm_clients(cfg.translation_engines, ollama_model=cfg.ollama_model),
         tts_providers=build_providers(cfg.tts_providers),
         content_asr_factory=content_asr if has_fw else None,
-        separate=mix.separate_background, notes=notes,
+        separate=mix.separate_in_child, notes=notes,
         mt_engines=build_mt_engines(cfg.mt_engines))
+
+
+def _supported_kwargs(fn: Callable, **kw) -> Dict[str, Any]:
+    """The keyword arguments `fn` accepts: the default stage components take
+    the progress/cancel hooks, injected ones may keep the bare signature."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _new_children_killer() -> Callable[[], None]:
+    """Returns a function that kills the multiprocessing children started
+    after this call. The legacy local-Whisper child and the gender-classifier
+    child are waited on with a plain join() that polls no cancel flag; killing
+    the child ends that wait, and the cancel checkpoint after it ends the job."""
+    import multiprocessing as mp
+    before = set(mp.active_children())
+
+    def kill():
+        for child in mp.active_children():
+            if child not in before:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+    return kill
+
+
+def _speakers_off_reason(cfg: DialogueConfig) -> str:
+    """Why the module resolver -- not the user -- switched speaker detection
+    off (e.g. no HF token), or "" when one voice was the user's choice."""
+    for ch in (cfg.modules or {}).get("changes") or []:
+        if ch.get("stage") == "speakers" and ch.get("action") == "deactivated" \
+                and ch.get("choice") == "pyannote":
+            fix = f"; fix: {ch['fix']}" if ch.get("fix") else ""
+            return f"{ch.get('reason') or 'cannot run here'}{fix}"
+    return ""
+
+
+def _translation_errors(tr: DialogueTranslator) -> str:
+    """Why the translation engines produced no Hindi, one entry per engine."""
+    seen: Dict[str, str] = {}
+    for w in tr.warnings:
+        eng = w.get("engine")
+        if not eng or eng in seen:
+            continue
+        if w.get("type") == "engine_error":
+            seen[eng] = str(w.get("detail", ""))[:160]
+        elif w.get("type") in ("malformed", "malformed_item", "empty_translation", "missing_id"):
+            seen[eng] = w["type"].replace("_", " ")
+    if seen:
+        return "; ".join(f"{k}: {v}" for k, v in seen.items())
+    if not tr.clients and not tr.mt_engines:
+        return "no translation engine is available"
+    return "the engines returned no Hindi text"
 
 
 # ── orchestrator ──────────────────────────────────────────────────────────
 class DialogueOrchestrator:
-    STEP_MAP = {"acquire": "download", "extract": "extract", "transcribe": "transcribe",
-                "diarize": "transcribe", "turns": "transcribe", "speakers": "transcribe",
-                "translate": "translate", "synthesize": "synthesize", "fit": "synthesize",
-                "verify": "synthesize", "mix": "assemble"}
+    # dialogue stage -> UI step (app.py STEP_ORDER). A stage missing here is
+    # passed through under its own name, which the UI counts as 100%.
+    STEP_MAP = {"acquire": "download", "extract": "extract", "separate": "extract",
+                "transcribe": "transcribe", "diarize": "transcribe", "turns": "transcribe",
+                "speakers": "transcribe", "translate": "translate", "synthesize": "synthesize",
+                "fit": "synthesize", "verify": "synthesize", "mix": "assemble"}
+    # Stages sharing a UI step each get a slice of it, so the bar only moves
+    # forward (a stage restarting at 0% would drag it back to the step start).
+    STAGE_SPAN = {"extract": (0.0, 0.1), "separate": (0.1, 1.0),
+                  "transcribe": (0.0, 0.45), "diarize": (0.45, 0.85), "turns": (0.85, 0.9),
+                  "speakers": (0.9, 1.0),
+                  "synthesize": (0.0, 0.6), "fit": (0.6, 0.8), "verify": (0.8, 1.0)}
+    HEARTBEAT_S = 5.0   # elapsed-time report interval during long blocking calls
 
     def __init__(self, cfg: DialogueConfig, components: Optional[Components] = None,
                  on_progress: Optional[ProgressCB] = None,
-                 cancel_check: Optional[Callable[[], bool]] = None):
+                 cancel_check: Optional[Callable[[], bool]] = None,
+                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None):
         self.cfg = cfg
         self.c = components or default_components(cfg)
         self.on_progress = on_progress or (lambda s, p, m: None)
         self.cancel_check = cancel_check or (lambda: False)
+        self.on_legacy_pipeline = on_legacy_pipeline
         self.report = JobReport()
         self.turns: List[Turn] = []
         self.clips: Dict[str, Clip] = {}
         self.all_clips: List[Clip] = []
         self.registry = SpeakerRegistry(unknown_default_category=cfg.unknown_voice_category)
+        self._stage_frac: Dict[str, float] = {}
+        self._progress_lock = threading.Lock()
 
     # helpers
     def _progress(self, stage: str, frac: float, msg: str):
+        """Report `frac` of a dialogue stage as progress of its UI step, never
+        lower than already shown (heartbeats and legacy reports interleave),
+        with the [N%] prefix every status message carries."""
+        lo, hi = self.STAGE_SPAN.get(stage, (0.0, 1.0))
+        with self._progress_lock:
+            frac = max(self._stage_frac.get(stage, 0.0), max(0.0, min(1.0, frac)))
+            self._stage_frac[stage] = frac
+            p = lo + (hi - lo) * frac
+            if msg and "%" not in msg:
+                msg = f"[{int(round(p * 100))}%] {msg}"
+            try:
+                self.on_progress(self.STEP_MAP.get(stage, stage), p, msg)
+            except Exception:
+                pass
+
+    def _legacy_progress(self, stage: str) -> ProgressCB:
+        """Progress callback for a legacy Pipeline working inside `stage`. Its
+        step names and [N%] prefix are its own, so the report is re-based on
+        the stage and held below 100% until the stage really ends. It is also
+        a cancel checkpoint: raising here stops the legacy Whisper fallback
+        ladder from loading the next model after a cancel."""
+        def cb(_step: str, frac: float, msg: str):
+            if self.cancel_check():
+                raise Cancelled("Job cancelled by user")
+            self._progress(stage, min(0.95, float(frac)), _PCT_PREFIX.sub("", msg or ""))
+        return cb
+
+    def _register_legacy(self, pipeline) -> None:
+        """Hand each legacy Pipeline to the caller: app.py keeps it as
+        job.pipeline_ref, so its cancel handler kills yt-dlp/ffmpeg at once."""
+        if self.on_legacy_pipeline is None:
+            return
         try:
-            self.on_progress(self.STEP_MAP.get(stage, stage), max(0.0, min(1.0, frac)), msg)
+            self.on_legacy_pipeline(pipeline)
         except Exception:
             pass
+
+    @contextmanager
+    def _heartbeat(self, stage: str, label: str, expected_s: float = 0.0,
+                   on_cancel: Optional[Callable[[], None]] = None):
+        """While a long blocking call runs (separation, ASR, the gender model,
+        the final mix), report "<label>... Ns" every HEARTBEAT_S, paced toward
+        95% of the stage over `expected_s` (an estimate; 0 = keep the bar):
+        a bar that sits still for minutes looks like a crash. With `on_cancel`
+        the cancel flag is polled every second and, once set, on_cancel runs
+        at every poll (it kills child processes that poll no cancel flag
+        themselves, including a fallback started after the first kill)."""
+        stop = threading.Event()
+        t0 = time.time()
+
+        def run():
+            next_beat = t0 + self.HEARTBEAT_S
+            cancelled = False
+            while not stop.wait(min(1.0, self.HEARTBEAT_S)):
+                now = time.time()
+                if on_cancel is not None and (cancelled or self.cancel_check()):
+                    cancelled = True
+                    try:
+                        on_cancel()
+                    except Exception:
+                        pass
+                if now >= next_beat:
+                    next_beat = now + self.HEARTBEAT_S
+                    el = now - t0
+                    frac = min(0.95, el / expected_s) if expected_s > 0 else 0.0
+                    self._progress(stage, frac, f"{label}... {el:.0f}s")
+
+        th = threading.Thread(target=run, name=f"dialogue-heartbeat-{stage}", daemon=True)
+        th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            th.join(timeout=2.0)
 
     def _check_cancel(self):
         if self.cancel_check():
@@ -315,7 +505,9 @@ class DialogueOrchestrator:
         except Cancelled:
             aborted = STATUS_CANCELLED
         except BaseException as e:  # noqa: BLE001 - record and keep partial assets
-            if "cancelled by user" in str(e).lower():
+            # A stage whose child process the cancel killed may fail with its
+            # own error: the user's cancel is still the reason it stopped.
+            if "cancelled by user" in str(e).lower() or self.cancel_check():
                 aborted = STATUS_CANCELLED
             else:
                 aborted = STATUS_FAILED
@@ -334,7 +526,9 @@ class DialogueOrchestrator:
         cfg, r, w = self.cfg, self.report, self.cfg.work_dir
 
         with self._stage("acquire") as st:
-            video = self.c.acquire(cfg, w)
+            video = self.c.acquire(cfg, w, **_supported_kwargs(
+                self.c.acquire, on_progress=self._legacy_progress("acquire"),
+                cancel_check=self.cancel_check, on_legacy_pipeline=self._register_legacy))
             st.detail = video.name
             r.input_identity = {"source": _redact(cfg.source), "file": video.name,
                                 "bytes": video.stat().st_size}
@@ -350,8 +544,10 @@ class DialogueOrchestrator:
                                   "-c", "copy", str(cut)])
                 video = cut
                 r.limitations.append(f"only the first {cfg.limit_seconds:.0f}s were dubbed (limit_seconds)")
-            audio_48k = audio.to_wav(video, w / "original_48k.wav", sr=48000, channels=2)
-            audio_16k = audio.to_wav(video, w / "original_16k_mono.wav", sr=16000, channels=1)
+            with self._heartbeat("extract", "Extracting audio",
+                                 expected_s=10.0 + 0.02 * float(info.get("duration") or 0)):
+                audio_48k = audio.to_wav(video, w / "original_48k.wav", sr=48000, channels=2)
+                audio_16k = audio.to_wav(video, w / "original_16k_mono.wav", sr=16000, channels=1)
             media_dur = audio.probe_duration(audio_48k)
             vinfo = audio.probe_streams(video)
             if vinfo.get("video"):
@@ -368,7 +564,13 @@ class DialogueOrchestrator:
         self.vocals_16k = self.vocals_48k = None
         if cfg.background != "none":
             with self._stage("separate") as st:
-                sep = self.c.separate(audio_48k, w, cfg.background)
+                # About as long as the video on this GPU: the heartbeat keeps
+                # the bar alive, and the default separator runs in a child
+                # process that a cancel kills within a second.
+                with self._heartbeat("separate", "Separating voice from music",
+                                     expected_s=1.2 * media_dur):
+                    sep = self.c.separate(audio_48k, w, cfg.background, **_supported_kwargs(
+                        self.c.separate, cancel_check=self.cancel_check))
                 self.sep = sep
                 st.detail = f"{sep.get('status')}: {str(sep.get('detail', ''))[:160]}"
                 if sep.get("status") != "ok":
@@ -400,15 +602,23 @@ class DialogueOrchestrator:
                     r.limitations.append("ASR unavailable: subtitle words timed by cue interpolation")
                 else:
                     try:
-                        segs = self.c.asr(self.vocals_16k if (cfg.asr_on_vocals and self.vocals_16k)
-                                          else audio_16k)
+                        wav = self.vocals_16k if (cfg.asr_on_vocals and self.vocals_16k) else audio_16k
+                        # Local Whisper runs in a child that reports nothing
+                        # until it is done: heartbeat, and kill it on cancel.
+                        with self._heartbeat("transcribe", "Transcribing speech",
+                                             expected_s=30.0 + 0.25 * media_dur,
+                                             on_cancel=_new_children_killer()):
+                            segs = self.c.asr(wav, **_supported_kwargs(
+                                self.c.asr, on_progress=self._legacy_progress("transcribe"),
+                                cancel_check=self.cancel_check,
+                                on_legacy_pipeline=self._register_legacy))
                         asr_segs = segs
                         asr_words = words_from_asr_segments(segs)
                         st.detail = f"{len(asr_words)} words; " + self.c.notes.get("asr", "")
                         if self.c.notes.get("asr_fallback"):
                             r.limitations.append(self.c.notes["asr_fallback"])
                     except Exception as e:
-                        if mode == "asr":
+                        if mode == "asr" or isinstance(e, Cancelled) or self.cancel_check():
                             raise
                         st.status = "degraded"
                         st.detail = f"ASR failed ({str(e)[:120]}); subtitle timing estimated"
@@ -423,18 +633,32 @@ class DialogueOrchestrator:
                 st.status = "skipped"
                 st.detail = "single voice selected (speaker detection off)"
                 r.limitations.append("speaker detection was switched off: one voice for all lines")
+                why = _speakers_off_reason(cfg)
+                if why:
+                    # Multi-speaker was asked for but cannot run on this PC:
+                    # one voice is a degraded result, not a clean "completed".
+                    st.status = "degraded"
+                    st.detail = f"speaker detection could not run on this PC ({why})"
+                    r.unresolved_failures.append(
+                        f"speaker detection could not run on this PC ({why}): every line is "
+                        f"voiced by one voice")
             elif self.c.diarize is None:
                 st.status = "skipped"
                 st.detail = "no diarization backend"
             else:
                 try:
                     # Transcript line boundaries let diarization re-check each
-                    # line (minor characters); passed only to backends that take them.
-                    import inspect as _inspect
-                    _kw = {}
-                    if asr_segs and "seg_bounds" in _inspect.signature(self.c.diarize).parameters:
-                        _kw["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
-                    diar = self.c.diarize(self._analysis_16k(), **_kw)
+                    # line (minor characters); every hook is passed only to
+                    # backends that take it.
+                    expected = 60.0 + 0.15 * media_dur
+                    hooks: Dict[str, Any] = {
+                        "heartbeat": lambda el: self._progress(
+                            "diarize", min(0.95, el / expected), f"Detecting speakers... {el:.0f}s"),
+                        "cancel_check": self.cancel_check}
+                    if asr_segs:
+                        hooks["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
+                    diar = self.c.diarize(self._analysis_16k(),
+                                          **_supported_kwargs(self.c.diarize, **hooks))
                     st.detail = f"{diar.backend}: {len(diar.speakers)} speakers"
                     r.model_versions["diarization"] = diar.backend
                 except DiarizationUnavailable as e:
@@ -448,16 +672,26 @@ class DialogueOrchestrator:
         self._check_cancel()
 
         with self._stage("turns") as st:
+            # Speaker detection off: the whole video is one known speaker, so
+            # the registry still analyses that voice (a woman narrator gets a
+            # female voice, not the unknown-speaker default).
             if mode == "translated_srt":
-                self.turns = turns_from_translated_cues(cues, diar)
+                self.turns = turns_from_translated_cues(
+                    cues, diar, default_speaker=UNKNOWN_SPEAKER if cfg.diarization else SINGLE_SPEAKER)
             else:
                 if mode == "asr":
                     words = asr_words
                 else:
                     words = align_text_to_words(cues, asr_words) if asr_words else words_from_cues(cues)
-                stats = assign_words(words, diar)
+                if cfg.diarization:
+                    stats = assign_words(words, diar)
+                else:
+                    stats = assign_single_speaker(words, SINGLE_SPEAKER)
                 st.data["attribution"] = stats
                 self.turns = build_turns(words)
+                # unknown one/two-word fragments given to a neighbouring line
+                stats["joined_adjacent_turn"] = sum(
+                    1 for x in words if x.attribution.get("method") == "adjacent_turn")
                 (w / "words.json").write_text(json.dumps([x.to_dict() for x in words],
                                                          ensure_ascii=False), encoding="utf-8")
             req = [t for t in self.turns if t.required]
@@ -472,7 +706,10 @@ class DialogueOrchestrator:
         self._check_cancel()
 
         with self._stage("speakers") as st:
-            self._build_registry()
+            # The gender classifier loads a 1 GB model in a child process.
+            with self._heartbeat("speakers", "Analysing each speaker's voice", expected_s=45.0,
+                                 on_cancel=_new_children_killer()):
+                self._build_registry()
             st.detail = f"{len(self.registry.speakers)} speakers"
         self._check_cancel()
 
@@ -508,6 +745,14 @@ class DialogueOrchestrator:
                     r.limitations.append(f"{n} line(s) translated line by line by IndicTrans2 "
                                          f"(no dialogue context: check gendered verb forms)")
                 st.detail = f"engines: {', '.join(sorted(tr.engines_used)) or 'none'}"
+                # With (almost) no Hindi there is nothing to voice: fail here
+                # with the engines' errors instead of mixing a background-only
+                # "draft" that hides why the translation failed.
+                req = [t for t in self.turns if t.required]
+                usable = [t for t in req if _DEVANAGARI.search(t.speech_text)]
+                if req and len(usable) < max(1.0, MIN_TRANSLATED_SHARE * len(req)):
+                    raise RuntimeError(f"Translation failed for {len(req) - len(usable)}/{len(req)} "
+                                       f"lines: {_translation_errors(tr)}")
         self._check_cancel()
 
         with self._stage("synthesize") as st:
@@ -543,7 +788,9 @@ class DialogueOrchestrator:
         self._close_local_models()
 
         with self._stage("mix") as st:
-            self._mix_and_mux(st)
+            with self._heartbeat("mix", "Mixing the Hindi audio and writing the video",
+                                 expected_s=30.0 + 0.1 * media_dur):
+                self._mix_and_mux(st)
 
     def _text_source(self):
         cfg = self.cfg
@@ -560,9 +807,15 @@ class DialogueOrchestrator:
             return "english_srt", cues
         if cfg.use_youtube_subs and _is_url(cfg.source) and self.c.fetch_subtitles:
             try:
-                subs = self.c.fetch_subtitles(cfg.source)
-            except Exception:
+                subs = self.c.fetch_subtitles(cfg.source, **_supported_kwargs(
+                    self.c.fetch_subtitles, cancel_check=self.cancel_check,
+                    on_legacy_pipeline=self._register_legacy))
+            except Exception as e:
+                self._check_cancel()
                 subs = None
+                self.report.limitations.append(
+                    f"YouTube subtitles could not be read ({str(e)[:120]}); "
+                    f"the text comes from speech recognition")
             if subs:
                 cues = cues_from_turn_like(subs)
                 if cfg.limit_seconds:
@@ -606,11 +859,15 @@ class DialogueOrchestrator:
                 conf = ml_conf
             else:
                 ev = dict(ev, classifier="unavailable (F0 decision used)")
+            origin = ""
+            if not diar:
+                single = not self.cfg.diarization and spk == SINGLE_SPEAKER
+                origin = "single_voice" if single else "srt_label"
             rec = self.registry.register(
                 spk, voice_category=cat, category_confidence=conf, category_evidence=ev,
                 total_speech_s=round(speech.get(spk, sum(e - s for s, e in ranges)), 2),
                 embedding_provenance=(diar.backend if diar and spk in diar.embeddings else None),
-                mapping_origin=("srt_label" if not diar else ""))
+                mapping_origin=origin)
             self._save_reference(rec, ranges, refs)
         for prov in self.c.tts_providers:
             self.registry.bind_provider(prov)
@@ -891,8 +1148,15 @@ class DialogueOrchestrator:
 
 def run_dialogue(cfg: DialogueConfig, on_progress: Optional[ProgressCB] = None,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 components: Optional[Components] = None) -> DialogueResult:
-    return DialogueOrchestrator(cfg, components, on_progress, cancel_check).run()
+                 components: Optional[Components] = None,
+                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None) -> DialogueResult:
+    """`on_legacy_pipeline` is called with every legacy pipeline.Pipeline the
+    run creates (link download, subtitles, local Whisper); app.py keeps it as
+    job.pipeline_ref so a cancel can kill its subprocesses at once."""
+    orch = DialogueOrchestrator(cfg, components, on_progress, cancel_check)
+    # Set after construction: wrappers of __init__ keep the 4-argument call.
+    orch.on_legacy_pipeline = on_legacy_pipeline
+    return orch.run()
 
 
 # ── environment / resource helpers ────────────────────────────────────────
