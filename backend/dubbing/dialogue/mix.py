@@ -16,7 +16,7 @@ import importlib.util
 import os
 import shutil
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import audio
 from .contracts import Clip, Turn
@@ -377,17 +377,90 @@ def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
 
 
 def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
-        subtitles: Optional[Path] = None) -> Path:
+        subtitles: Optional[Path] = None, *, original_audio: bool = False,
+        extra_subtitles: Optional[List[Tuple[Path, str, str]]] = None,
+        burn_subtitles: Optional[Path] = None, container: str = "mp4") -> Path:
+    """Video + Hindi mix -> ``out``, with optional extra tracks.
+
+    * Hindi audio is always the first, default audio track; with
+      ``original_audio`` the source's first audio stream follows as a
+      second, non-default track ("Original").
+    * ``subtitles`` (Hindi) is the first, default subtitle stream;
+      ``extra_subtitles`` [(srt, ISO 639-2 language, title)] follow it and
+      are never default (FFmpeg's mp4 muxer still enables the first
+      subtitle track it writes). mp4 stores them as mov_text, mkv as SRT.
+    * ``burn_subtitles`` draws that SRT into the picture (the video is
+      re-encoded); otherwise the video stream is copied untouched.
+    * ``container`` "mp4" (+faststart) or "mkv" sets the format whatever
+      the file name says.
+    An SRT with no cues is left out rather than failing the mux.
+    """
+    mkv = str(container or "mp4").lower() == "mkv"
+    # (path, language, title, default) per soft subtitle stream, in order
+    subs: List[Tuple[Path, str, str, bool]] = []
+    if subtitles and _has_cues(subtitles):
+        subs.append((Path(subtitles), "hin", "Hindi", True))
+    for path, lang, title in extra_subtitles or []:
+        if _has_cues(path):
+            subs.append((Path(path), lang or "und", title or "", False))
+    keep_original = bool(original_audio and audio.probe_streams(video).get("audio"))
+    burn = burn_subtitles if burn_subtitles and _has_cues(burn_subtitles) else None
+    if burn and not audio.has_filter("subtitles"):
+        raise RuntimeError("this FFmpeg build has no 'subtitles' filter (libass), "
+                           "so subtitles cannot be burned into the video")
+
     args = ["-i", str(video), "-i", str(mix_wav)]
-    if subtitles:
-        args += ["-i", str(subtitles)]
+    for path, *_ in subs:
+        args += ["-i", str(path)]
     args += ["-map", "0:v:0", "-map", "1:a:0"]
-    if subtitles:
-        args += ["-map", "2:s:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=hin"]
-    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", bitrate,
-             "-metadata:s:a:0", "language=hin", "-movflags", "+faststart", str(out)]
+    if keep_original:
+        args += ["-map", "0:a:0"]
+    for i in range(len(subs)):
+        args += ["-map", f"{i + 2}:s:0"]
+    if burn:
+        # even dimensions first: libx264 cannot encode an odd-sized yuv420p frame
+        args += ["-vf", f"scale=trunc(iw/2)*2:trunc(ih/2)*2,subtitles=filename={_filter_path(burn)}",
+                 "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
+                 "-max_muxing_queue_size", "9999"]
+    else:
+        args += ["-c:v", "copy"]
+    args += ["-c:a", "aac", "-b:a", bitrate]
+    if subs:
+        args += ["-c:s", "srt" if mkv else "mov_text"]
+    tracks = [("a", 0, "hin", "Hindi", True)]
+    if keep_original:
+        tracks.append(("a", 1, "eng", "Original", False))
+    tracks += [("s", i, lang, title, default) for i, (_, lang, title, default) in enumerate(subs)]
+    for kind, i, lang, title, default in tracks:
+        args += [f"-metadata:s:{kind}:{i}", f"language={lang}",
+                 f"-disposition:{kind}:{i}", "default" if default else "0"]
+        if title:
+            args += [f"-metadata:s:{kind}:{i}", f"title={title}"]
+            if not mkv:  # mp4 players show the handler name as the track name
+                args += [f"-metadata:s:{kind}:{i}", f"handler_name={title}"]
+    if mkv:
+        args += ["-f", "matroska", str(out)]
+    else:
+        args += ["-movflags", "+faststart", "-f", "mp4", str(out)]
     audio.run_ffmpeg(args)
     return out
+
+
+def _has_cues(srt: Path) -> bool:
+    return "-->" in Path(srt).read_text(encoding="utf-8", errors="ignore")
+
+
+def _filter_path(path, windows: Optional[bool] = None) -> str:
+    """Escape a file path as an FFmpeg filter option value
+    (``subtitles=filename=<this>``). Two levels: first for the option
+    parser (\\ ' :), then for the filtergraph parser (\\ ' [ ] , ;).
+    Windows paths get forward slashes, so only the drive colon is escaped:
+    C:\\Users\\me\\subs.srt -> C\\\\:/Users/me/subs.srt"""
+    s = str(path)
+    if (os.name == "nt") if windows is None else windows:
+        s = s.replace("\\", "/")
+    s = "".join("\\" + ch if ch in "\\':" else ch for ch in s)
+    return "".join("\\" + ch if ch in "\\'[],;" else ch for ch in s)
 
 
 # ── subtitles ─────────────────────────────────────────────────────────────
