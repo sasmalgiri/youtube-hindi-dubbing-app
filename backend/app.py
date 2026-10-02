@@ -444,6 +444,9 @@ MAX_JOBS = 200
 # Only run one pipeline at a time to avoid resource contention
 _pipeline_semaphore = threading.Semaphore(1)
 BASE_DIR = Path(__file__).resolve().parent
+# Job history (jobs.db) and the saved/completed link lists. Overridable so
+# the test suite never writes its throwaway jobs into the real history.
+STATE_DIR = Path(os.environ.get("VOICEDUB_STATE_DIR") or BASE_DIR)
 # Use a short temp path on Windows to avoid 260-char path limit (WinError 206)
 if os.name == "nt":
     _short_root = Path(os.environ.get("VOICEDUB_WORK", "C:/tmp/vd"))
@@ -469,7 +472,7 @@ SAVED_DIR.mkdir(parents=True, exist_ok=True)
 # Supabase secondary writer was removed because it added no value for a
 # single-machine workflow and the supabase package's websockets dependency
 # was broken on this Python install.
-_store = JobStore(BASE_DIR / "jobs.db")
+_store = JobStore(STATE_DIR / "jobs.db")
 _store.load_all(JOBS)
 
 # ── App ──────────────────────────────────────────────────────────────────────
@@ -4236,8 +4239,8 @@ def delete_job(job_id: str):
 
 # ── Saved Links (persistent) ─────────────────────────────────────────────────
 
-LINKS_FILE = BASE_DIR / "saved_links.json"
-COMPLETED_FILE = BASE_DIR / "completed_urls.json"
+LINKS_FILE = STATE_DIR / "saved_links.json"
+COMPLETED_FILE = STATE_DIR / "completed_urls.json"
 _links_lock = threading.Lock()
 
 

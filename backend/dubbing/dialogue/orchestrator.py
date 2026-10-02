@@ -35,7 +35,7 @@ from .diarization import (DiarizationResult, DiarizationUnavailable,
                           run_pyannote)
 from .report import derive_status, write_report
 from .speaker_registry import SpeakerRegistry, ensure_unknown_speaker
-from .translation import (DialogueTranslator, build_mt_engines,
+from .translation import (DialogueTranslator, _not_hindi, build_mt_engines,
                           default_llm_clients, load_glossary)
 from .tts import TTSFailure, TTSRouter, build_providers
 from .turns import (align_text_to_words, build_turns, cues_from_turn_like,
@@ -235,12 +235,29 @@ def _groq_word_asr(wav: Path) -> List[Dict]:
                           files={"file": (wav.name, f, "audio/wav")}, timeout=600)
     r.raise_for_status()
     data = r.json()
-    words = data.get("words") or []
-    segs = []
-    for s in data.get("segments", []):
-        segs.append({"start": float(s["start"]), "end": float(s["end"]), "text": s["text"].strip(),
-                     "words": [{"word": w["word"], "start": float(w["start"]), "end": float(w["end"])}
-                               for w in words if s["start"] - 0.01 <= w["start"] < s["end"] + 0.01]})
+    return _words_into_segments(data.get("segments", []), data.get("words") or [])
+
+
+def _words_into_segments(segments: List[Dict], words: List[Dict], tol: float = 0.01) -> List[Dict]:
+    """Attach Groq's flat word list to its segments, each word to exactly ONE
+    segment: the one whose [start, end) holds the word's start, else the
+    nearest within `tol`. A ±tol window on both ends put a word starting
+    exactly on a boundary into both neighbours, so turns read "That's That's
+    convenient." and the translator kept the doubled English word."""
+    segs = [{"start": float(s["start"]), "end": float(s["end"]), "text": s["text"].strip(),
+             "words": []} for s in segments]
+    for w in words:
+        ws = float(w["start"])
+        best, best_d = None, tol
+        for i, s in enumerate(segs):
+            if s["start"] <= ws < s["end"]:
+                best = i
+                break
+            d = min(abs(ws - s["start"]), abs(ws - s["end"]))
+            if d <= best_d:
+                best, best_d = i, d
+        if best is not None:
+            segs[best]["words"].append({"word": w["word"], "start": ws, "end": float(w["end"])})
     return segs
 
 
@@ -352,8 +369,10 @@ def _translation_errors(tr: DialogueTranslator) -> str:
         eng = w.get("engine")
         if not eng or eng in seen:
             continue
-        if w.get("type") == "engine_error":
+        if w.get("type") in ("engine_error", "engine_marked_down", "story_brief_failed"):
             seen[eng] = str(w.get("detail", ""))[:160]
+        elif w.get("type") == "engine_skipped":
+            seen[eng] = ("skipped: " + str(w.get("reason") or "marked down"))[:160]
         elif w.get("type") in ("malformed", "malformed_item", "empty_translation", "missing_id"):
             seen[eng] = w["type"].replace("_", " ")
     if seen:
@@ -736,6 +755,7 @@ class DialogueOrchestrator:
                     r.limitations.append("no LLM translation engine available; "
                                          "line-by-line (non-contextual) translation used")
                 hints = {sid: rec.voice_category for sid, rec in self.registry.speakers.items()}
+                self.translator = tr       # before translate(): _finalise reports its warnings
                 r.translation_warnings += tr.translate(self.turns, hints)
                 for t in self.turns:
                     if "translation_uncertain" in t.flags:
@@ -754,7 +774,10 @@ class DialogueOrchestrator:
                 # with the engines' errors instead of mixing a background-only
                 # "draft" that hides why the translation failed.
                 req = [t for t in self.turns if t.required]
-                usable = [t for t in req if _DEVANAGARI.search(t.speech_text)]
+                # The translator's own acceptance rule: a line of digits or
+                # punctuation ("3... 2... 1...") is a valid translation.
+                usable = [t for t in req if t.speech_text and not _not_hindi(t.speech_text)
+                          and "translation_failed" not in t.flags]
                 if req and len(usable) < max(1.0, MIN_TRANSLATED_SHARE * len(req)):
                     raise RuntimeError(f"Translation failed for {len(req) - len(usable)}/{len(req)} "
                                        f"lines: {_translation_errors(tr)}")
