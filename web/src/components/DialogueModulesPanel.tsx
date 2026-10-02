@@ -7,6 +7,8 @@
  * Every change is previewed through /api/dialogue/resolve, which shows what
  * this PC will actually run: options that cannot run are switched off (with
  * the exact fix) and the first workable fallback is switched on.
+ * Below it: the pause-to-review toggle and the output options, which travel
+ * as their own request fields (dialogue_review, dialogue_container, ...).
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -14,11 +16,44 @@ import {
     type DialogueMatrix, type DialogueOverrides, type DialoguePreset, type DialogueResolution,
 } from '@/lib/api';
 
+// Job options outside the module matrix (same names as the request fields).
+export interface DialogueRunOptions {
+    dialogue_review: boolean;
+    dialogue_keep_original_audio: boolean;
+    dialogue_english_subtitles: boolean;
+    dialogue_burn_subtitles: boolean;
+    dialogue_container: 'mp4' | 'mkv';
+}
+// The backend defaults: a job with these runs exactly as before.
+export const DEFAULT_DIALOGUE_RUN_OPTIONS: DialogueRunOptions = {
+    dialogue_review: false,
+    dialogue_keep_original_audio: false,
+    dialogue_english_subtitles: true,
+    dialogue_burn_subtitles: false,
+    dialogue_container: 'mp4',
+};
+export const DIALOGUE_RUN_OPTION_KEYS = Object.keys(DEFAULT_DIALOGUE_RUN_OPTIONS) as (keyof DialogueRunOptions)[];
+
+/** The run options found on a settings object, defaults for the rest. */
+export function pickDialogueRunOptions(src: Record<string, unknown> | null | undefined): DialogueRunOptions {
+    const o = src || {};
+    const bool = (k: keyof DialogueRunOptions) => (typeof o[k] === 'boolean' ? o[k] as boolean : DEFAULT_DIALOGUE_RUN_OPTIONS[k] as boolean);
+    return {
+        dialogue_review: bool('dialogue_review'),
+        dialogue_keep_original_audio: bool('dialogue_keep_original_audio'),
+        dialogue_english_subtitles: bool('dialogue_english_subtitles'),
+        dialogue_burn_subtitles: bool('dialogue_burn_subtitles'),
+        dialogue_container: o.dialogue_container === 'mkv' ? 'mkv' : 'mp4',
+    };
+}
+
 interface Props {
     preset: string;
     overrides: DialogueOverrides;
     onChange: (preset: string, overrides: DialogueOverrides) => void;
     sourceKind: 'url' | 'file';
+    runOptions?: DialogueRunOptions;
+    onRunOptionsChange?: (options: DialogueRunOptions) => void;
 }
 
 const COST_BADGE: Record<string, string> = {
@@ -34,7 +69,7 @@ const COST_LABEL: Record<string, string> = { free: 'free', free_tier: 'free tier
 const SRT_MODE_HINT = 'Needs SRT mode: upload your Hindi SRT in the SRT Dub tab.';
 const needsHindiSrt = (p: DialoguePreset) => (p.selections?.text_source ?? []).includes('hindi_srt');
 
-export default function DialogueModulesPanel({ preset, overrides, onChange, sourceKind }: Props) {
+export default function DialogueModulesPanel({ preset, overrides, onChange, sourceKind, runOptions, onRunOptionsChange }: Props) {
     const [matrix, setMatrix] = useState<DialogueMatrix | null>(null);
     const [presets, setPresets] = useState<DialoguePreset[]>([]);
     const [resolution, setResolution] = useState<DialogueResolution | null>(null);
@@ -82,6 +117,8 @@ export default function DialogueModulesPanel({ preset, overrides, onChange, sour
     };
 
     const changedCount = useMemo(() => Object.keys(overrides).length, [overrides]);
+    const run = runOptions || DEFAULT_DIALOGUE_RUN_OPTIONS;
+    const setRun = (patch: Partial<DialogueRunOptions>) => onRunOptionsChange?.({ ...run, ...patch });
 
     if (error && !matrix) {
         return <div className="glass-card p-3 text-xs text-red-400">Dialogue modules unavailable: {error}</div>;
@@ -134,6 +171,51 @@ export default function DialogueModulesPanel({ preset, overrides, onChange, sour
                     ))}
                     {resolution.warnings.map((w, i) => <div key={i} className="text-text-muted">! {w}</div>)}
                     {resolution.blocking.map((b, i) => <div key={i} className="text-red-400">✕ {b}</div>)}
+                </div>
+            )}
+
+            {/* Review pause + output options */}
+            {onRunOptionsChange && (
+                <div className="rounded-lg border border-border px-3 py-2 space-y-2 text-xs">
+                    <label className="flex items-start gap-2">
+                        <input type="checkbox" className="mt-0.5" checked={run.dialogue_review}
+                            onChange={(e) => setRun({ dialogue_review: e.target.checked })} />
+                        <span>
+                            <span className="text-text-primary">Pause to review the Hindi lines and voices before voicing</span>
+                            <span className="block text-[11px] text-text-muted leading-snug">
+                                The job stops after translation: fix lines, speakers and voices on the job page, then continue.
+                                Finished jobs can always be re-voiced from the job page.
+                            </span>
+                        </span>
+                    </label>
+                    <div>
+                        <div className="font-semibold text-text-primary mb-1">Output</div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                            <label className="flex items-center gap-2">
+                                <input type="checkbox" checked={run.dialogue_keep_original_audio}
+                                    onChange={(e) => setRun({ dialogue_keep_original_audio: e.target.checked })} />
+                                Keep the English audio as a 2nd track
+                            </label>
+                            <label className="flex items-center gap-2">
+                                <input type="checkbox" checked={run.dialogue_english_subtitles}
+                                    onChange={(e) => setRun({ dialogue_english_subtitles: e.target.checked })} />
+                                English subtitles track
+                            </label>
+                            <label className="flex items-center gap-2">
+                                <input type="checkbox" checked={run.dialogue_burn_subtitles}
+                                    onChange={(e) => setRun({ dialogue_burn_subtitles: e.target.checked })} />
+                                <span>Burn the Hindi subtitles into the picture <span className="text-text-muted">(re-encodes, slower)</span></span>
+                            </label>
+                            <label className="flex items-center gap-2">
+                                Container
+                                <select className="rounded bg-white/5 border border-border px-1" value={run.dialogue_container}
+                                    onChange={(e) => setRun({ dialogue_container: e.target.value === 'mkv' ? 'mkv' : 'mp4' })}>
+                                    <option value="mp4">MP4 (plays everywhere)</option>
+                                    <option value="mkv">MKV</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
                 </div>
             )}
 
