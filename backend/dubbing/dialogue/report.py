@@ -74,6 +74,9 @@ def render_markdown(r: JobReport) -> str:
     if r.status_reasons:
         L += ["**Why:**"] + [f"- {x}" for x in r.status_reasons] + [""]
     L += ["## Input", ""] + [f"- {k}: {v}" for k, v in r.input_identity.items()] + [""]
+    if r.resumed_from_checkpoint:
+        L += ["**Resumed run:** these stages were taken from this job's own checkpoint (nothing "
+              "from other jobs): " + ", ".join(r.resumed_from_checkpoint) + ".", ""]
     L += ["## Stages", "", "| Stage | Status | Seconds | Detail |", "| --- | --- | --- | --- |"]
     for s in r.stages:
         L.append(f"| {s.name} | {s.status} | {s.seconds:.1f} | {s.detail.replace('|', '/')} |")
@@ -103,6 +106,7 @@ def render_markdown(r: JobReport) -> str:
             if len(items) > 100:
                 L.append(f"- ... {len(items) - 100} more in report.json")
 
+    section("Edits applied (review / re-voice)", r.applied_edits)
     section("Identity problems", r.identity_violations)
     section("Timing (non-info)", [d for d in r.timing_deviations if d.get("severity") != "info"])
     section("Translation warnings", r.translation_warnings)

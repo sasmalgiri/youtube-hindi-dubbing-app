@@ -4,11 +4,18 @@ URL/file -> acquire -> extract -> text source (ASR / YouTube subs / SRT)
 -> audio diarization (always, whatever the text source) -> word attribution
 -> speaker-aware turns -> speaker registry + voice bindings -> contextual
 translation -> TTS via the resolver -> bounded fit -> verification ->
-multi-track mix -> mux -> MP4 + SRT/VTT + report.
+multi-track mix -> mux -> MP4/MKV + SRT/VTT + report.
 
 Every stage records its outcome in the JobReport. Partial assets are kept on
 failure. Nothing is reused across jobs (each job works in its own work_dir;
 the legacy cross-job ASR cache is bypassed).
+
+Review and re-voicing: with review_before_voice the run pauses after
+"translate" (the `review` hook gets the review packet and returns edits:
+changed Hindi lines, relabelled/deleted turns, merged speakers, other
+voices). The stages up to "translate" are checkpointed in the job's own
+work_dir, so a re-voice run of the SAME job (resume=True) skips them and,
+with the within-job TTS / rewrite caches, only re-voices what changed.
 """
 from __future__ import annotations
 
@@ -27,14 +34,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import audio, fit, mix, verify
+from . import audio, checkpoint, fit, mix, verify
 from .contracts import (STATUS_CANCELLED, STATUS_FAILED, UNKNOWN_SPEAKER,
                         CATEGORY_FEMALE, CATEGORY_MALE, CATEGORY_UNKNOWN, Clip, JobReport, Turn)
 from .diarization import (DiarizationResult, DiarizationUnavailable,
                           assign_single_speaker, assign_words, hf_token_from_env,
                           run_pyannote)
 from .report import derive_status, write_report
-from .speaker_registry import SpeakerRegistry, ensure_unknown_speaker
+from .speaker_registry import (SpeakerRegistry, VoiceResolutionError,
+                               ensure_unknown_speaker)
 from .translation import (DialogueTranslator, _not_hindi, build_mt_engines,
                           default_llm_clients, load_glossary)
 from .tts import TTSFailure, TTSRouter, build_providers
@@ -54,6 +62,11 @@ SINGLE_SPEAKER = "SPEAKER_00"
 MIN_TRANSLATED_SHARE = 0.1
 _DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 _PCT_PREFIX = re.compile(r"^\[\d+%\]\s*")
+# Synthesis reasons that ask for NEW audio of the same text: they bypass the
+# within-job TTS cache (which would only hand back the rejected clip).
+_REGEN_REASONS = ("cheap_check_regen", "content_mismatch")
+RESUMED_DETAIL = "resumed from this job's checkpoint"
+ReviewHook = Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
 
 
 @dataclass
@@ -99,6 +112,18 @@ class DialogueConfig:
     limit_seconds: float = 0.0               # >0: dub only the first N seconds (trims media)
     embed_subtitles: bool = True
     modules: Optional[Dict[str, Any]] = None  # resolved module matrix (recorded in the report)
+    # Review / re-voice (docs/dialogue/README.md "Review, voices and re-voicing").
+    review_before_voice: bool = False        # pause after translate: the review hook gets the packet
+    turn_edits: Dict[str, Dict] = field(default_factory=dict)       # turn_id -> {"hi", "speaker_id", "delete"}
+    voice_overrides: Dict[str, Dict] = field(default_factory=dict)  # speaker_id -> {"provider","voice","pitch"} | {"category"}
+    speaker_merges: Dict[str, str] = field(default_factory=dict)    # from speaker_id -> into speaker_id
+    resume: bool = False                     # reuse THIS job's own checkpoint in work_dir (never another job's)
+    # Output options
+    keep_original_audio: bool = False        # original audio as a second, non-default track
+    english_subtitles: bool = True           # subtitles_en.srt (+ an English subtitle stream)
+    burn_subtitles: bool = False             # burn the Hindi subtitles into the picture
+    container: str = "mp4"                   # mp4 | mkv
+    voice_match: str = "off"                 # off | openvoice (sound like the original speaker)
 
     def public(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -123,6 +148,10 @@ class Components:
     basic_translate: Optional[Callable[[str], str]] = None
     notes: Dict[str, str] = field(default_factory=dict)
     mt_engines: Optional[List[Any]] = None   # sentence-level MT engines (name + translate_batch)
+    # Optional voice conversion toward each original speaker: name; prepare(
+    # speaker_id, reference_wavs) -> bool; convert(in_wav, out_wav, speaker_id)
+    # -> bool (False = clip unchanged); close(). Failures never stop a job.
+    voice_matcher: Optional[Any] = None
 
 
 @dataclass
@@ -174,6 +203,16 @@ def default_acquire(cfg: DialogueConfig, work: Path, on_progress: Optional[Progr
             raise AcquireError(f"Input file not found: {src}")
         dst = work / f"source{src.suffix.lower() or '.mp4'}"
         if src.resolve() != dst.resolve():
+            if dst.exists():
+                # a second run in this work folder (a re-voice that had to start
+                # over): the earlier hard link IS the source; anything else is stale
+                try:
+                    same = os.path.samefile(src, dst)
+                except OSError:
+                    same = False
+                if same:
+                    return dst
+                dst.unlink()
             try:
                 os.link(src, dst)
             except OSError:
@@ -311,6 +350,20 @@ def default_components(cfg: DialogueConfig) -> Components:
     except ImportError:
         has_fw = False
 
+    voice_matcher = None
+    if cfg.voice_match == "openvoice":
+        # Not available -> the reason is reported as a limitation and the
+        # stock voices are used; the job goes on either way.
+        try:
+            from .voice_match import make_voice_matcher
+            voice_matcher = make_voice_matcher(cfg)
+            notes["voice_match"] = (getattr(voice_matcher, "name", "openvoice") if voice_matcher
+                                    else "openvoice cannot run on this PC")
+        except ImportError as e:
+            notes["voice_match"] = f"openvoice not installed ({str(e)[:100]})"
+        except Exception as e:
+            notes["voice_match"] = f"openvoice could not start ({type(e).__name__}: {str(e)[:100]})"
+
     return Components(
         acquire=default_acquire, asr=asr, diarize=diarize if cfg.diarization else None,
         fetch_subtitles=fetch_subs,
@@ -318,7 +371,7 @@ def default_components(cfg: DialogueConfig) -> Components:
         tts_providers=build_providers(cfg.tts_providers),
         content_asr_factory=content_asr if has_fw else None,
         separate=mix.separate_in_child, notes=notes,
-        mt_engines=build_mt_engines(cfg.mt_engines))
+        mt_engines=build_mt_engines(cfg.mt_engines), voice_matcher=voice_matcher)
 
 
 def _supported_kwargs(fn: Callable, **kw) -> Dict[str, Any]:
@@ -401,19 +454,33 @@ class DialogueOrchestrator:
     def __init__(self, cfg: DialogueConfig, components: Optional[Components] = None,
                  on_progress: Optional[ProgressCB] = None,
                  cancel_check: Optional[Callable[[], bool]] = None,
-                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None):
+                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None,
+                 review: Optional[ReviewHook] = None):
         self.cfg = cfg
         self.c = components or default_components(cfg)
         self.on_progress = on_progress or (lambda s, p, m: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.on_legacy_pipeline = on_legacy_pipeline
+        # Blocking review hook (job thread): packet in, edits dict or None out.
+        self.review = review
         self.report = JobReport()
         self.turns: List[Turn] = []
         self.clips: Dict[str, Clip] = {}
         self.all_clips: List[Clip] = []
         self.registry = SpeakerRegistry(unknown_default_category=cfg.unknown_voice_category)
+        self.speaker_ranges: Dict[str, List] = {}   # speaker -> clean (start, end) ranges
         self._stage_frac: Dict[str, float] = {}
         self._progress_lock = threading.Lock()
+        # checkpoint / resume
+        self._identity: Dict[str, Any] = {}
+        self._restored: set = set()                 # checkpointed stages restored by a resume
+        self._ckpt_stages: Dict[str, Dict] = {}     # their report entries from the first run
+        self._ckpt_error = ""
+        # voice matching (optional)
+        self._vm_ready: set = set()
+        self._vm_lock = threading.Lock()
+        self._vm_errors: List[str] = []
+        self._vm_closed = False
 
     # helpers
     def _progress(self, stage: str, frac: float, msg: str):
@@ -548,244 +615,267 @@ class DialogueOrchestrator:
     # ── stages ─────────────────────────────────────────────────────────
     def _run_stages(self):
         cfg, r, w = self.cfg, self.report, self.cfg.work_dir
+        # A resume restores what THIS job's checkpoint holds: each stage it
+        # covers is reported as skipped instead of being run again.
+        self._resume()
 
-        with self._stage("acquire") as st:
-            video = self.c.acquire(cfg, w, **_supported_kwargs(
-                self.c.acquire, on_progress=self._legacy_progress("acquire"),
-                cancel_check=self.cancel_check, on_legacy_pipeline=self._register_legacy))
-            st.detail = video.name
-            r.input_identity = {"source": _redact(cfg.source), "file": video.name,
-                                "bytes": video.stat().st_size}
-        self._check_cancel()
+        if not self._resumed("extract", "acquire"):
+            with self._stage("acquire") as st:
+                video = self.c.acquire(cfg, w, **_supported_kwargs(
+                    self.c.acquire, on_progress=self._legacy_progress("acquire"),
+                    cancel_check=self.cancel_check, on_legacy_pipeline=self._register_legacy))
+                st.detail = video.name
+                r.input_identity = {"source": _redact(cfg.source), "file": video.name,
+                                    "bytes": video.stat().st_size}
+            self._check_cancel()
 
-        with self._stage("extract") as st:
-            info = audio.probe_streams(video)
-            if not info.get("audio"):
-                raise RuntimeError("input has no audio stream")
-            if cfg.limit_seconds and info.get("duration", 0) > cfg.limit_seconds:
-                cut = w / f"source_first{int(cfg.limit_seconds)}s{video.suffix}"
-                audio.run_ffmpeg(["-i", str(video), "-t", f"{cfg.limit_seconds:.3f}",
-                                  "-c", "copy", str(cut)])
-                video = cut
-                r.limitations.append(f"only the first {cfg.limit_seconds:.0f}s were dubbed (limit_seconds)")
-            with self._heartbeat("extract", "Extracting audio",
-                                 expected_s=10.0 + 0.02 * float(info.get("duration") or 0)):
-                audio_48k = audio.to_wav(video, w / "original_48k.wav", sr=48000, channels=2)
-                audio_16k = audio.to_wav(video, w / "original_16k_mono.wav", sr=16000, channels=1)
-            media_dur = audio.probe_duration(audio_48k)
-            vinfo = audio.probe_streams(video)
-            if vinfo.get("video"):
-                media_dur = vinfo.get("duration", media_dur)
-            r.input_identity.update({"duration_s": round(media_dur, 3), "has_video": vinfo.get("video")})
-            st.detail = f"{media_dur:.1f}s"
-        self.video, self.audio_48k, self.audio_16k, self.media_dur = video, audio_48k, audio_16k, media_dur
-        self._check_cancel()
+            with self._stage("extract") as st:
+                info = audio.probe_streams(video)
+                if not info.get("audio"):
+                    raise RuntimeError("input has no audio stream")
+                if cfg.limit_seconds and info.get("duration", 0) > cfg.limit_seconds:
+                    cut = w / f"source_first{int(cfg.limit_seconds)}s{video.suffix}"
+                    audio.run_ffmpeg(["-i", str(video), "-t", f"{cfg.limit_seconds:.3f}",
+                                      "-c", "copy", str(cut)])
+                    video = cut
+                    r.limitations.append(f"only the first {cfg.limit_seconds:.0f}s were dubbed (limit_seconds)")
+                with self._heartbeat("extract", "Extracting audio",
+                                     expected_s=10.0 + 0.02 * float(info.get("duration") or 0)):
+                    audio_48k = audio.to_wav(video, w / "original_48k.wav", sr=48000, channels=2)
+                    audio_16k = audio.to_wav(video, w / "original_16k_mono.wav", sr=16000, channels=1)
+                media_dur = audio.probe_duration(audio_48k)
+                vinfo = audio.probe_streams(video)
+                if vinfo.get("video"):
+                    media_dur = vinfo.get("duration", media_dur)
+                r.input_identity.update({"duration_s": round(media_dur, 3), "has_video": vinfo.get("video")})
+                st.detail = f"{media_dur:.1f}s"
+            self.video, self.audio_48k, self.audio_16k, self.media_dur = video, audio_48k, audio_16k, media_dur
+            self._save_checkpoint("extract")
+            self._check_cancel()
+        audio_48k, audio_16k, media_dur = self.audio_48k, self.audio_16k, self.media_dur
 
         # Separate once, up front: the vocals stem feeds speaker detection,
         # gender/pitch analysis and reference clips; the background bed is
         # reused by the final mix (no second separation pass).
-        self.sep = None
-        self.vocals_16k = self.vocals_48k = None
-        if cfg.background != "none":
-            with self._stage("separate") as st:
-                # About as long as the video on this GPU: the heartbeat keeps
-                # the bar alive, and the default separator runs in a child
-                # process that a cancel kills within a second.
-                with self._heartbeat("separate", "Separating voice from music",
-                                     expected_s=1.2 * media_dur):
-                    sep = self.c.separate(audio_48k, w, cfg.background, **_supported_kwargs(
-                        self.c.separate, cancel_check=self.cancel_check))
-                self.sep = sep
-                st.detail = f"{sep.get('status')}: {str(sep.get('detail', ''))[:160]}"
-                if sep.get("status") != "ok":
-                    st.status = "degraded"
-                voc = sep.get("vocals")
-                if voc and Path(voc).exists():
-                    try:
-                        self.vocals_48k = Path(voc)
-                        self.vocals_16k = audio.to_wav(self.vocals_48k, w / "vocals_16k_mono.wav",
-                                                       sr=16000, channels=1)
-                    except Exception as e:
-                        self.vocals_48k = self.vocals_16k = None
-                        st.data["vocals_error"] = str(e)[:200]
-                st.data["analysis_audio"] = "vocals" if self._use_vocals() else "mix"
-            self._check_cancel()
+        if not self._resumed("separate"):
+            self.sep = None
+            self.vocals_16k = self.vocals_48k = None
+            if cfg.background != "none":
+                with self._stage("separate") as st:
+                    # About as long as the video on this GPU: the heartbeat keeps
+                    # the bar alive, and the default separator runs in a child
+                    # process that a cancel kills within a second.
+                    with self._heartbeat("separate", "Separating voice from music",
+                                         expected_s=1.2 * media_dur):
+                        sep = self.c.separate(audio_48k, w, cfg.background, **_supported_kwargs(
+                            self.c.separate, cancel_check=self.cancel_check))
+                    self.sep = sep
+                    st.detail = f"{sep.get('status')}: {str(sep.get('detail', ''))[:160]}"
+                    if sep.get("status") != "ok":
+                        st.status = "degraded"
+                    voc = sep.get("vocals")
+                    if voc and Path(voc).exists():
+                        try:
+                            self.vocals_48k = Path(voc)
+                            self.vocals_16k = audio.to_wav(self.vocals_48k, w / "vocals_16k_mono.wav",
+                                                           sr=16000, channels=1)
+                        except Exception as e:
+                            self.vocals_48k = self.vocals_16k = None
+                            st.data["vocals_error"] = str(e)[:200]
+                    st.data["analysis_audio"] = "vocals" if self._use_vocals() else "mix"
+                self._save_checkpoint("separate")
+                self._check_cancel()
+            else:
+                self._save_checkpoint("separate")
 
         # text source
-        mode, cues = self._text_source()
-        asr_words = []
-        asr_segs = []
-        with self._stage("transcribe") as st:
-            st.data["text_source"] = mode
-            if mode != "translated_srt":
-                if self.c.asr is None:
-                    if mode == "asr":
-                        raise RuntimeError("no ASR backend available (install faster-whisper or set GROQ_API_KEY)")
-                    st.status = "degraded"
-                    st.detail = "no ASR: subtitle timing estimated from cue times"
-                    r.limitations.append("ASR unavailable: subtitle words timed by cue interpolation")
+        if not self._resumed("transcribe"):
+            mode, cues = self._text_source()
+            asr_words = []
+            asr_segs = []
+            with self._stage("transcribe") as st:
+                st.data["text_source"] = mode
+                if mode != "translated_srt":
+                    if self.c.asr is None:
+                        if mode == "asr":
+                            raise RuntimeError("no ASR backend available (install faster-whisper or set GROQ_API_KEY)")
+                        st.status = "degraded"
+                        st.detail = "no ASR: subtitle timing estimated from cue times"
+                        r.limitations.append("ASR unavailable: subtitle words timed by cue interpolation")
+                    else:
+                        try:
+                            wav = self.vocals_16k if (cfg.asr_on_vocals and self.vocals_16k) else audio_16k
+                            # Local Whisper runs in a child that reports nothing
+                            # until it is done: heartbeat, and kill it on cancel.
+                            with self._heartbeat("transcribe", "Transcribing speech",
+                                                 expected_s=30.0 + 0.25 * media_dur,
+                                                 on_cancel=_new_children_killer()):
+                                segs = self.c.asr(wav, **_supported_kwargs(
+                                    self.c.asr, on_progress=self._legacy_progress("transcribe"),
+                                    cancel_check=self.cancel_check,
+                                    on_legacy_pipeline=self._register_legacy))
+                            asr_segs = segs
+                            asr_words = words_from_asr_segments(segs)
+                            st.detail = f"{len(asr_words)} words; " + self.c.notes.get("asr", "")
+                            if self.c.notes.get("asr_fallback"):
+                                r.limitations.append(self.c.notes["asr_fallback"])
+                        except Exception as e:
+                            if mode == "asr" or isinstance(e, Cancelled) or self.cancel_check():
+                                raise
+                            st.status = "degraded"
+                            st.detail = f"ASR failed ({str(e)[:120]}); subtitle timing estimated"
+                            r.limitations.append("ASR failed: subtitle words timed by cue interpolation")
+                if mode == "asr" and not asr_words:
+                    raise RuntimeError("No speech detected in the audio")
+            self.mode, self.cues, self.asr_words, self.asr_segs = mode, cues, asr_words, asr_segs
+            self._save_checkpoint("transcribe")
+            self._check_cancel()
+        mode, cues, asr_words, asr_segs = self.mode, self.cues, self.asr_words, self.asr_segs
+
+        if not self._resumed("diarize"):
+            with self._stage("diarize") as st:
+                diar = None
+                if not cfg.diarization:
+                    st.status = "skipped"
+                    st.detail = "single voice selected (speaker detection off)"
+                    r.limitations.append("speaker detection was switched off: one voice for all lines")
+                    why = _speakers_off_reason(cfg)
+                    if why:
+                        # Multi-speaker was asked for but cannot run on this PC:
+                        # one voice is a degraded result, not a clean "completed".
+                        st.status = "degraded"
+                        st.detail = f"speaker detection could not run on this PC ({why})"
+                        r.unresolved_failures.append(
+                            f"speaker detection could not run on this PC ({why}): every line is "
+                            f"voiced by one voice")
+                elif self.c.diarize is None:
+                    st.status = "skipped"
+                    st.detail = "no diarization backend"
                 else:
                     try:
-                        wav = self.vocals_16k if (cfg.asr_on_vocals and self.vocals_16k) else audio_16k
-                        # Local Whisper runs in a child that reports nothing
-                        # until it is done: heartbeat, and kill it on cancel.
-                        with self._heartbeat("transcribe", "Transcribing speech",
-                                             expected_s=30.0 + 0.25 * media_dur,
-                                             on_cancel=_new_children_killer()):
-                            segs = self.c.asr(wav, **_supported_kwargs(
-                                self.c.asr, on_progress=self._legacy_progress("transcribe"),
-                                cancel_check=self.cancel_check,
-                                on_legacy_pipeline=self._register_legacy))
-                        asr_segs = segs
-                        asr_words = words_from_asr_segments(segs)
-                        st.detail = f"{len(asr_words)} words; " + self.c.notes.get("asr", "")
-                        if self.c.notes.get("asr_fallback"):
-                            r.limitations.append(self.c.notes["asr_fallback"])
-                    except Exception as e:
-                        if mode == "asr" or isinstance(e, Cancelled) or self.cancel_check():
-                            raise
+                        # Transcript line boundaries let diarization re-check each
+                        # line (minor characters); every hook is passed only to
+                        # backends that take it.
+                        expected = 60.0 + 0.15 * media_dur
+                        hooks: Dict[str, Any] = {
+                            "heartbeat": lambda el: self._progress(
+                                "diarize", min(0.95, el / expected), f"Detecting speakers... {el:.0f}s"),
+                            "cancel_check": self.cancel_check}
+                        if asr_segs:
+                            hooks["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
+                        diar = self.c.diarize(self._analysis_16k(),
+                                              **_supported_kwargs(self.c.diarize, **hooks))
+                        st.detail = f"{diar.backend}: {len(diar.speakers)} speakers"
+                        r.model_versions["diarization"] = diar.backend
+                    except DiarizationUnavailable as e:
                         st.status = "degraded"
-                        st.detail = f"ASR failed ({str(e)[:120]}); subtitle timing estimated"
-                        r.limitations.append("ASR failed: subtitle words timed by cue interpolation")
-            if mode == "asr" and not asr_words:
-                raise RuntimeError("No speech detected in the audio")
-        self._check_cancel()
-
-        with self._stage("diarize") as st:
-            diar = None
-            if not cfg.diarization:
-                st.status = "skipped"
-                st.detail = "single voice selected (speaker detection off)"
-                r.limitations.append("speaker detection was switched off: one voice for all lines")
-                why = _speakers_off_reason(cfg)
-                if why:
-                    # Multi-speaker was asked for but cannot run on this PC:
-                    # one voice is a degraded result, not a clean "completed".
-                    st.status = "degraded"
-                    st.detail = f"speaker detection could not run on this PC ({why})"
+                        st.detail = str(e)[:300]
+                if diar is None and cfg.diarization:
                     r.unresolved_failures.append(
-                        f"speaker detection could not run on this PC ({why}): every line is "
-                        f"voiced by one voice")
-            elif self.c.diarize is None:
-                st.status = "skipped"
-                st.detail = "no diarization backend"
-            else:
-                try:
-                    # Transcript line boundaries let diarization re-check each
-                    # line (minor characters); every hook is passed only to
-                    # backends that take it.
-                    expected = 60.0 + 0.15 * media_dur
-                    hooks: Dict[str, Any] = {
-                        "heartbeat": lambda el: self._progress(
-                            "diarize", min(0.95, el / expected), f"Detecting speakers... {el:.0f}s"),
-                        "cancel_check": self.cancel_check}
-                    if asr_segs:
-                        hooks["seg_bounds"] = [(float(x["start"]), float(x["end"])) for x in asr_segs]
-                    diar = self.c.diarize(self._analysis_16k(),
-                                          **_supported_kwargs(self.c.diarize, **hooks))
-                    st.detail = f"{diar.backend}: {len(diar.speakers)} speakers"
-                    r.model_versions["diarization"] = diar.backend
-                except DiarizationUnavailable as e:
-                    st.status = "degraded"
-                    st.detail = str(e)[:300]
-            if diar is None and cfg.diarization:
-                r.unresolved_failures.append(
-                    "speaker diarization unavailable: all dialogue voiced by the default voice "
-                    "(speakers not separated)")
-        self.diar = diar
-        self._check_cancel()
+                        "speaker diarization unavailable: all dialogue voiced by the default voice "
+                        "(speakers not separated)")
+            self.diar = diar
+            self._save_checkpoint("diarize")
+            self._check_cancel()
+        diar = self.diar
 
-        with self._stage("turns") as st:
-            # Speaker detection off: the whole video is one known speaker, so
-            # the registry still analyses that voice (a woman narrator gets a
-            # female voice, not the unknown-speaker default).
-            if mode == "translated_srt":
-                self.turns = turns_from_translated_cues(
-                    cues, diar, default_speaker=UNKNOWN_SPEAKER if cfg.diarization else SINGLE_SPEAKER)
-            else:
-                if mode == "asr":
-                    words = asr_words
+        if not self._resumed("turns"):
+            with self._stage("turns") as st:
+                # Speaker detection off: the whole video is one known speaker, so
+                # the registry still analyses that voice (a woman narrator gets a
+                # female voice, not the unknown-speaker default).
+                if mode == "translated_srt":
+                    self.turns = turns_from_translated_cues(
+                        cues, diar, default_speaker=UNKNOWN_SPEAKER if cfg.diarization else SINGLE_SPEAKER)
                 else:
-                    words = align_text_to_words(cues, asr_words) if asr_words else words_from_cues(cues)
-                if cfg.diarization:
-                    stats = assign_words(words, diar)
-                else:
-                    stats = assign_single_speaker(words, SINGLE_SPEAKER)
-                st.data["attribution"] = stats
-                self.turns = build_turns(words)
-                # unknown one/two-word fragments given to a neighbouring line
-                stats["joined_adjacent_turn"] = sum(
-                    1 for x in words if x.attribution.get("method") == "adjacent_turn")
-                (w / "words.json").write_text(json.dumps([x.to_dict() for x in words],
-                                                         ensure_ascii=False), encoding="utf-8")
-            req = [t for t in self.turns if t.required]
-            st.detail = f"{len(self.turns)} turns ({len(req)} required)"
-            for t in self.turns:
-                if t.overlaps_with and t.turn_id < min(t.overlaps_with):
-                    r.unresolved_overlaps.append({
-                        "turn_ids": [t.turn_id] + t.overlaps_with,
-                        "start": t.source_start, "end": t.source_end,
-                        "note": "simultaneous speech detected; each side is voiced on its own track "
-                                "but overlapped words may be missing from the transcript"})
-        self._check_cancel()
-
-        with self._stage("speakers") as st:
-            # The gender classifier loads a 1 GB model in a child process.
-            with self._heartbeat("speakers", "Analysing each speaker's voice", expected_s=45.0,
-                                 on_cancel=_new_children_killer()):
-                self._build_registry()
-            st.detail = f"{len(self.registry.speakers)} speakers"
-        self._check_cancel()
-
-        with self._stage("translate") as st:
-            if mode == "translated_srt":
-                st.status = "skipped"
-                st.detail = "Hindi SRT supplied"
-            else:
-                glossary = load_glossary(BACKEND_DIR / "translation_glossary.json")
-                tr = DialogueTranslator(
-                    self.c.llm_clients, glossary=glossary,
-                    allow_basic_fallback=cfg.allow_basic_translation_fallback,
-                    basic_fallback=self.c.basic_translate,
-                    mt_engines=self.c.mt_engines,
-                    on_progress=lambda p, m: self._progress("translate", p, m),
-                    cancel_check=self.cancel_check, story_brief=cfg.story_brief)
-                if not self.c.llm_clients:
-                    st.status = "degraded"
-                    r.limitations.append("no LLM translation engine available; "
-                                         "line-by-line (non-contextual) translation used")
-                hints = {sid: rec.voice_category for sid, rec in self.registry.speakers.items()}
-                self.translator = tr       # before translate(): _finalise reports its warnings
-                r.translation_warnings += tr.translate(self.turns, hints)
-                for t in self.turns:
-                    if "translation_uncertain" in t.flags:
-                        r.translation_warnings.append({"type": "translation_uncertain", "id": t.turn_id})
-                self.translator = tr
-                if tr.brief:
-                    st.data["story_brief"] = tr.brief
-                    self._check_brief_genders(tr.brief)
-                r.model_versions["translation"] = sorted(tr.engines_used)
-                if "indictrans2" in tr.engines_used:
-                    n = sum(1 for t in self.turns if "sentence_level_mt" in t.flags)
-                    r.limitations.append(f"{n} line(s) translated line by line by IndicTrans2 "
-                                         f"(no dialogue context: check gendered verb forms)")
-                st.detail = f"engines: {', '.join(sorted(tr.engines_used)) or 'none'}"
-                # With (almost) no Hindi there is nothing to voice: fail here
-                # with the engines' errors instead of mixing a background-only
-                # "draft" that hides why the translation failed.
+                    if mode == "asr":
+                        words = asr_words
+                    else:
+                        words = align_text_to_words(cues, asr_words) if asr_words else words_from_cues(cues)
+                    if cfg.diarization:
+                        stats = assign_words(words, diar)
+                    else:
+                        stats = assign_single_speaker(words, SINGLE_SPEAKER)
+                    st.data["attribution"] = stats
+                    self.turns = build_turns(words)
+                    # unknown one/two-word fragments given to a neighbouring line
+                    stats["joined_adjacent_turn"] = sum(
+                        1 for x in words if x.attribution.get("method") == "adjacent_turn")
+                    (w / "words.json").write_text(json.dumps([x.to_dict() for x in words],
+                                                             ensure_ascii=False), encoding="utf-8")
                 req = [t for t in self.turns if t.required]
-                # The translator's own acceptance rule: a line of digits or
-                # punctuation ("3... 2... 1...") is a valid translation.
-                usable = [t for t in req if t.speech_text and not _not_hindi(t.speech_text)
-                          and "translation_failed" not in t.flags]
-                if req and len(usable) < max(1.0, MIN_TRANSLATED_SHARE * len(req)):
-                    raise RuntimeError(f"Translation failed for {len(req) - len(usable)}/{len(req)} "
-                                       f"lines: {_translation_errors(tr)}")
-        self._check_cancel()
+                st.detail = f"{len(self.turns)} turns ({len(req)} required)"
+                for t in self.turns:
+                    if t.overlaps_with and t.turn_id < min(t.overlaps_with):
+                        r.unresolved_overlaps.append({
+                            "turn_ids": [t.turn_id] + t.overlaps_with,
+                            "start": t.source_start, "end": t.source_end,
+                            "note": "simultaneous speech detected; each side is voiced on its own track "
+                                    "but overlapped words may be missing from the transcript"})
+            self._save_checkpoint("turns")
+            self._check_cancel()
+
+        if not self._resumed("speakers"):
+            with self._stage("speakers") as st:
+                # The gender classifier loads a 1 GB model in a child process.
+                with self._heartbeat("speakers", "Analysing each speaker's voice", expected_s=45.0,
+                                     on_cancel=_new_children_killer()):
+                    self._build_registry()
+                st.detail = f"{len(self.registry.speakers)} speakers"
+            self._save_checkpoint("speakers")
+            self._check_cancel()
+
+        if not self._resumed("translate"):
+            with self._stage("translate") as st:
+                if mode == "translated_srt":
+                    st.status = "skipped"
+                    st.detail = "Hindi SRT supplied"
+                else:
+                    tr = self._new_translator()
+                    if not self.c.llm_clients:
+                        st.status = "degraded"
+                        r.limitations.append("no LLM translation engine available; "
+                                             "line-by-line (non-contextual) translation used")
+                    hints = {sid: rec.voice_category for sid, rec in self.registry.speakers.items()}
+                    self.translator = tr       # before translate(): _finalise reports its warnings
+                    r.translation_warnings += tr.translate(self.turns, hints)
+                    for t in self.turns:
+                        if "translation_uncertain" in t.flags:
+                            r.translation_warnings.append({"type": "translation_uncertain", "id": t.turn_id})
+                    self.translator = tr
+                    if tr.brief:
+                        st.data["story_brief"] = tr.brief
+                        self._check_brief_genders(tr.brief)
+                    r.model_versions["translation"] = sorted(tr.engines_used)
+                    if "indictrans2" in tr.engines_used:
+                        n = sum(1 for t in self.turns if "sentence_level_mt" in t.flags)
+                        r.limitations.append(f"{n} line(s) translated line by line by IndicTrans2 "
+                                             f"(no dialogue context: check gendered verb forms)")
+                    st.detail = f"engines: {', '.join(sorted(tr.engines_used)) or 'none'}"
+                    # With (almost) no Hindi there is nothing to voice: fail here
+                    # with the engines' errors instead of mixing a background-only
+                    # "draft" that hides why the translation failed.
+                    req = [t for t in self.turns if t.required]
+                    # The translator's own acceptance rule: a line of digits or
+                    # punctuation ("3... 2... 1...") is a valid translation.
+                    usable = [t for t in req if t.speech_text and not _not_hindi(t.speech_text)
+                              and "translation_failed" not in t.flags]
+                    if req and len(usable) < max(1.0, MIN_TRANSLATED_SHARE * len(req)):
+                        raise RuntimeError(f"Translation failed for {len(req) - len(usable)}/{len(req)} "
+                                           f"lines: {_translation_errors(tr)}")
+            self._save_checkpoint("translate")
+            self._check_cancel()
+
+        # Requested edits (a re-voice run), then the reviewer's, before any voice is made.
+        self._review_and_edit()
 
         with self._stage("synthesize") as st:
+            self._prepare_voice_match()
             self._synthesize_all()
             st.detail = f"{sum(1 for c in self.clips.values() if c.accepted)} clips accepted"
+            if self.router.cache_hits:
+                st.data["tts_cache_hits"] = self.router.cache_hits
+                st.detail += f" ({self.router.cache_hits} unchanged line(s) reused from this job's cache)"
         self._check_cancel()
 
         with self._stage("fit") as st:
@@ -795,6 +885,8 @@ class DialogueOrchestrator:
             if rewrite is None:
                 r.limitations.append("line shortening off (disabled or no LLM): overlong "
                                      "turns are only sped up (max %.2fx)" % cfg.max_stretch)
+            else:
+                rewrite = self._cached_rewrite(rewrite)
             accepted = {k: v for k, v in self.clips.items() if v.accepted}
             r.timing_deviations = fit.fit_all(
                 self.turns, accepted, self.media_dur, self._resynth, rewrite,
@@ -819,6 +911,164 @@ class DialogueOrchestrator:
             with self._heartbeat("mix", "Mixing the Hindi audio and writing the video",
                                  expected_s=30.0 + 0.1 * media_dur):
                 self._mix_and_mux(st)
+
+    # ── checkpoint / resume ────────────────────────────────────────────
+    def _resume(self):
+        """With cfg.resume, restore this job's checkpoint when it is usable
+        for the same source; otherwise (and on every fresh run) clear the
+        checkpoint and the within-job caches so nothing earlier is reused."""
+        cfg, r, w = self.cfg, self.report, self.cfg.work_dir
+        self._identity = checkpoint.source_identity(cfg.source, cfg.limit_seconds,
+                                                    cfg.source_srt, cfg.translated_srt)
+        if not cfg.resume:
+            checkpoint.clear(w)
+            return
+        state, why = checkpoint.load(w)
+        if state is not None:
+            why = checkpoint.unusable_reason(state, self._identity, w)
+        if not why:
+            try:
+                self._restore(state)
+            except Exception as e:  # noqa: BLE001 - a damaged checkpoint means a full run
+                why = f"the checkpoint could not be read back ({type(e).__name__}: {str(e)[:100]})"
+        if why:
+            r.limitations.append(f"resume was asked for but {why}: every stage ran again")
+            checkpoint.clear(w)
+            return
+        self._restored = set(checkpoint.completed_prefix(state))
+        self._ckpt_stages = {s["name"]: s for s in state.get("stages") or [] if s.get("name")}
+
+    def _restore(self, state: Dict[str, Any]):
+        """Parse everything first, then assign: a damaged checkpoint leaves
+        the orchestrator untouched for the full run that follows."""
+        w, r = self.cfg.work_dir, self.report
+        files = {k: checkpoint.resolve(v, w) for k, v in (state.get("files") or {}).items()}
+        sep = state.get("sep")
+        if sep:
+            sep = dict(sep)
+            for k in ("background", "vocals"):
+                if sep.get(k):
+                    sep[k] = str(checkpoint.resolve(sep[k], w))
+        turns = checkpoint.turns_from_list(state.get("turns"))
+        words = checkpoint.words_from_list(state.get("asr_words"))
+        diar = checkpoint.diar_from_dict(state.get("diar"))
+        registry = SpeakerRegistry.from_dict(state["registry"]) if state.get("registry") else None
+        ranges = {k: [tuple(x) for x in v] for k, v in (state.get("speaker_ranges") or {}).items()}
+        tr = None
+        if state.get("translator") is not None:
+            tr = self._new_translator()
+            tr.restore_state(state["translator"])
+        if registry is not None:
+            for prov in self.c.tts_providers:
+                registry.bind_provider(prov)
+        rep = state.get("report") or {}
+
+        self.video, self.audio_48k = files.get("video"), files.get("audio_48k")
+        self.audio_16k = files.get("audio_16k")
+        self.vocals_48k, self.vocals_16k = files.get("vocals_48k"), files.get("vocals_16k")
+        self.media_dur = float(state.get("media_dur") or 0.0)
+        self.sep = sep
+        self.mode, self.cues = state.get("mode"), state.get("cues") or []
+        self.asr_words, self.asr_segs = words, state.get("asr_segs") or []
+        self.diar = diar
+        self.turns = turns
+        if registry is not None:
+            self.registry = registry
+        self.speaker_ranges = ranges
+        if tr is not None:
+            self.translator = tr
+        r.input_identity = dict(rep.get("input_identity") or {})
+        r.model_versions.update(rep.get("model_versions") or {})
+        for k in ("limitations", "unresolved_failures", "unresolved_overlaps",
+                  "translation_warnings", "content_warnings", "applied_edits"):
+            getattr(r, k)[:0] = list(rep.get(k) or [])
+        for k, v in (state.get("notes") or {}).items():
+            self.c.notes.setdefault(k, v)
+
+    def _resumed(self, stage: str, *also: str) -> bool:
+        """True when `stage` was restored from the checkpoint: it (and the
+        stages in `also`, reported first) are then recorded as skipped."""
+        if stage not in self._restored:
+            return False
+        for name in also + (stage,):
+            prev = self._ckpt_stages.get(name)
+            if prev is None:
+                continue        # it did not run in the checkpointed run either
+            st = self.report.stage(name)
+            st.status = "skipped"
+            st.detail = RESUMED_DETAIL
+            st.data = {"checkpoint": {k: prev.get(k) for k in ("status", "detail", "data")}}
+            if name not in self.report.resumed_from_checkpoint:
+                self.report.resumed_from_checkpoint.append(name)
+            self._progress(name, 1.0, f"{name}: {RESUMED_DETAIL}")
+        return True
+
+    def _save_checkpoint(self, stage: str):
+        """Atomically write everything the stages up to `stage` produced.
+        A failure only costs the ability to resume; it is reported once."""
+        r, w = self.report, self.cfg.work_dir
+        idx = checkpoint.STAGES.index(stage)
+        names = ("acquire",) + checkpoint.STAGES
+        stages = []
+        for s in r.stages:
+            if s.name not in names:
+                continue
+            # a stage this run took from the checkpoint keeps its original entry
+            prev = self._ckpt_stages.get(s.name) if s.name in r.resumed_from_checkpoint else None
+            stages.append(prev or asdict(s))
+        sep = getattr(self, "sep", None)
+        if sep:
+            sep = dict(sep)
+            for k in ("background", "vocals"):
+                if sep.get(k):
+                    sep[k] = checkpoint.rel(Path(sep[k]), w)
+        tr = getattr(self, "translator", None)
+        state = {
+            "identity": self._identity,
+            "completed": list(checkpoint.STAGES[:idx + 1]),
+            "files": {k: checkpoint.rel(getattr(self, k, None), w)
+                      for k in ("video", "audio_48k", "audio_16k", "vocals_48k", "vocals_16k")},
+            "media_dur": getattr(self, "media_dur", 0.0),
+            "sep": sep,
+            "mode": getattr(self, "mode", None),
+            "cues": getattr(self, "cues", None) or [],
+            "asr_words": [x.to_dict() for x in getattr(self, "asr_words", None) or []],
+            "asr_segs": getattr(self, "asr_segs", None) or [],
+            "diar": checkpoint.diar_to_dict(getattr(self, "diar", None)),
+            "turns": [t.to_dict() for t in self.turns],
+            "registry": (self.registry.to_dict()
+                         if idx >= checkpoint.STAGES.index("speakers") else None),
+            "speaker_ranges": {k: [list(x) for x in v] for k, v in self.speaker_ranges.items()},
+            "translator": tr.export_state() if tr is not None else None,
+            "notes": dict(self.c.notes),
+            "stages": stages,
+            "report": {k: getattr(r, k) for k in (
+                "input_identity", "model_versions", "limitations", "unresolved_failures",
+                "unresolved_overlaps", "translation_warnings", "content_warnings", "applied_edits")},
+        }
+        try:
+            checkpoint.save(w, state)
+        except Exception as e:  # noqa: BLE001
+            if not self._ckpt_error:
+                self._ckpt_error = str(e)[:160]
+                r.limitations.append(f"could not save the resume checkpoint ({self._ckpt_error}): "
+                                     f"a re-voice of this job would redo every stage")
+
+    def _cached_rewrite(self, rewrite):
+        """translator.rewrite_shorter through this job's rewrite cache."""
+        cache = checkpoint.RewriteCache(checkpoint.rewrite_cache_path(self.cfg.work_dir))
+
+        def cached(t: Turn, current_hi: str, ratio: float) -> Optional[str]:
+            hit = cache.get(t.turn_id, current_hi, ratio)
+            if hit:
+                t.translation_attempts.append({"engine": "rewrite_cache", "ok": True,
+                                               "reason": "duration_rewrite"})
+                return hit
+            new = rewrite(t, current_hi, ratio)
+            if new:
+                cache.put(t.turn_id, current_hi, ratio, new)
+            return new
+        return cached
 
     def _text_source(self):
         cfg = self.cfg
@@ -865,6 +1115,7 @@ class DialogueOrchestrator:
                 ranges = [(t.source_start, t.source_end) for t in self.turns
                           if t.speaker_id == spk and "multi_speaker_cue" not in t.flags]
             speaker_ranges[spk] = ranges
+        self.speaker_ranges = speaker_ranges    # also the voice matcher's reference ranges
         # Gender: wav2vec2 classifier first (one isolated child for all
         # speakers); F0 is kept as evidence and is the explicit, reported
         # fallback only when the classifier cannot run.
@@ -902,6 +1153,319 @@ class DialogueOrchestrator:
         for t in self.turns:
             t.voice_category_hint = self.registry.speakers[t.speaker_id].voice_category
         self.registry.save(self.cfg.work_dir / "speakers.json")
+
+    def _new_translator(self) -> DialogueTranslator:
+        cfg = self.cfg
+        glossary = load_glossary(BACKEND_DIR / "translation_glossary.json")
+        return DialogueTranslator(
+            self.c.llm_clients, glossary=glossary,
+            allow_basic_fallback=cfg.allow_basic_translation_fallback,
+            basic_fallback=self.c.basic_translate,
+            mt_engines=self.c.mt_engines,
+            on_progress=lambda p, m: self._progress("translate", p, m),
+            cancel_check=self.cancel_check, story_brief=cfg.story_brief)
+
+    # ── review / edits ─────────────────────────────────────────────────
+    def _review_and_edit(self):
+        """Before any voice is made: apply the edits the run was started
+        with (a re-voice), then, with review_before_voice, write the review
+        packet to work_dir/review.json and hand it to the review hook, whose
+        edits are applied too. The checkpoint is then saved again, so a
+        later re-voice continues from the reviewed lines and voices."""
+        cfg, r, w = self.cfg, self.report, self.cfg.work_dir
+        t0 = time.time()
+        applied = 0
+        requested = {"turn_edits": cfg.turn_edits, "voice_overrides": cfg.voice_overrides,
+                     "speaker_merges": cfg.speaker_merges}
+        if any(requested.values()):
+            applied += self.apply_edits(requested, via="request")
+        hooked = False
+        if cfg.review_before_voice:
+            packet = self.build_review_packet("before_voice")
+            try:
+                checkpoint.write_json_atomic(w / "review.json", packet)
+            except OSError as e:
+                r.limitations.append(f"could not write review.json ({str(e)[:120]})")
+            edits = None
+            if self.review is not None:
+                hooked = True
+                try:
+                    edits = self.review(packet)
+                except Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - the dub goes on without review edits
+                    r.limitations.append(f"the review step failed ({type(e).__name__}: {str(e)[:120]}); "
+                                         f"the lines were voiced without review edits")
+            self._check_cancel()
+            if edits:
+                applied += self.apply_edits(edits, via="review")
+        if applied or cfg.review_before_voice:
+            st = r.stage("review")
+            st.status = "ok"
+            st.seconds = round(time.time() - t0, 2)
+            st.detail = f"{applied} edit(s) applied"
+            if cfg.review_before_voice and not hooked:
+                st.detail += "; review.json written (no reviewer attached)"
+            self._save_checkpoint("translate")
+
+    def apply_edits(self, edits: Optional[Dict[str, Any]], via: str = "review") -> int:
+        """Apply reviewer edits to the lines, speakers and voices (shared by
+        the review hook and re-voice runs). Turn edits come first, then
+        speaker merges (which also sweep up turns just relabelled to the
+        merged speaker), then voice overrides. Every edit, applied or ignored
+        with its reason, is recorded in report.applied_edits. Returns the
+        number applied."""
+        if not isinstance(edits, dict):
+            return 0
+        log: List[Dict[str, Any]] = []
+        turn_edits = edits.get("turn_edits") or {}
+        merges = edits.get("speaker_merges") or {}
+        overrides = edits.get("voice_overrides") or {}
+        for tid, ed in (turn_edits.items() if isinstance(turn_edits, dict) else []):
+            log.append(self._edit_turn(str(tid), ed))
+        for src, dst in (merges.items() if isinstance(merges, dict) else []):
+            log.append(self._merge_speakers(str(src), str(dst)))
+        for sid, ov in (overrides.items() if isinstance(overrides, dict) else []):
+            log.append(self._override_voice(str(sid), ov))
+        log = [dict(e, via=via) for e in log]
+        self.report.applied_edits += log
+        return sum(1 for e in log if not e.get("ignored"))
+
+    def _edit_turn(self, tid: str, ed: Any) -> Dict[str, Any]:
+        rec: Dict[str, Any] = {"kind": "turn_edit", "turn_id": tid}
+        t = next((x for x in self.turns if x.turn_id == tid), None)
+        if t is None or not isinstance(ed, dict):
+            return dict(rec, ignored="no such line" if t is None else "malformed edit")
+        changes: Dict[str, Any] = {}
+        notes: List[str] = []
+        new_spk = ed.get("speaker_id")
+        if new_spk and new_spk != t.speaker_id:
+            if not isinstance(new_spk, str) or new_spk not in self.registry.speakers:
+                notes.append(f"speaker {new_spk} does not exist (a line can only move to an existing speaker)")
+            else:
+                changes["speaker_id"] = {"from": t.speaker_id, "to": new_spk}
+                t.speaker_id = new_spk
+                t.voice_category_hint = self.registry.speakers[new_spk].voice_category
+        if isinstance(ed.get("hi"), str):
+            hi = ed["hi"].strip()
+            if not hi:
+                notes.append("empty Hindi line ignored (delete the line instead)")
+            elif hi != t.speech_text or hi != (t.hi_display or t.speech_text):
+                changes["hi"] = {"from": t.speech_text, "to": hi}
+                t.hi_raw = t.hi_fit = t.hi_display = hi
+                t.add_flag("edited")
+                if "translation_failed" in t.flags:
+                    t.flags.remove("translation_failed")
+                if not t.required and "deleted_by_user" not in t.flags and not ed.get("delete"):
+                    t.required = True     # a line the reviewer wrote Hindi for is voiced
+        if "delete" in ed:
+            if ed["delete"]:
+                if "deleted_by_user" not in t.flags:
+                    t.required = False    # not voiced, and not counted as missing
+                    t.add_flag("deleted_by_user")
+                    changes["delete"] = True
+            elif "deleted_by_user" in t.flags:
+                t.flags.remove("deleted_by_user")
+                t.required = True
+                changes["delete"] = False
+        if changes:
+            rec["changes"] = changes
+            if notes:
+                rec["notes"] = notes
+        else:
+            rec["ignored"] = "; ".join(notes) or "no change"
+        return rec
+
+    def _merge_speakers(self, src: str, dst: str) -> Dict[str, Any]:
+        rec: Dict[str, Any] = {"kind": "speaker_merge", "from": src, "into": dst}
+        reg = self.registry
+        if src == dst or src not in reg.speakers or dst not in reg.speakers:
+            return dict(rec, ignored="both speakers must exist and differ")
+        cat_src, cat_dst = self._known_category(src), self._known_category(dst)
+        moved = []
+        for t in self.turns:
+            if t.speaker_id == src:
+                t.speaker_id = dst
+                t.voice_category_hint = reg.speakers[dst].voice_category
+                moved.append(t.turn_id)
+        reg.merge_speaker(src, dst)
+        self.speaker_ranges[dst] = sorted(list(self.speaker_ranges.get(dst) or [])
+                                          + list(self.speaker_ranges.pop(src, None) or []))
+        rec["turn_ids"] = moved
+        if CATEGORY_UNKNOWN not in (cat_src, cat_dst) and cat_src != cat_dst:
+            # The lines were translated for the other speaker's voice
+            # category: verb endings and adjectives may carry its gender.
+            w = {"type": "speaker_merge_gender_check", "from": src, "into": dst,
+                 "from_category": cat_src, "into_category": cat_dst, "turn_ids": moved,
+                 "note": "merged lines were translated for a different voice category: "
+                         "check gendered Hindi forms (verb endings, adjectives)"}
+            self.report.content_warnings.append(w)
+            rec["warning"] = w["note"]
+        return rec
+
+    def _known_category(self, sid: str) -> str:
+        """The speaker's voice category, else the gender the story brief
+        found in the text (what the translation used for its own forms)."""
+        cat = self.registry.speakers[sid].voice_category
+        if cat != CATEGORY_UNKNOWN:
+            return cat
+        brief = getattr(getattr(self, "translator", None), "brief", None) or {}
+        gender = ((brief.get("speakers") or {}).get(sid) or {}).get("gender")
+        return {"male": CATEGORY_MALE, "female": CATEGORY_FEMALE}.get(gender, CATEGORY_UNKNOWN)
+
+    def _override_voice(self, sid: str, ov: Any) -> Dict[str, Any]:
+        rec: Dict[str, Any] = {"kind": "voice_override", "speaker_id": sid}
+        if sid not in self.registry.speakers or not isinstance(ov, dict):
+            return dict(rec, ignored="no such speaker" if isinstance(ov, dict) else "malformed override")
+        providers = list(self.c.tts_providers)
+        try:
+            if ov.get("category"):
+                cat = ov["category"]
+                got = self.registry.override_category(sid, cat, providers)
+                for t in self.turns:
+                    if t.speaker_id == sid:
+                        t.voice_category_hint = cat
+                rec.update(category=cat, voices={p: (b and {"voice": b["voice"], "pitch": b.get("pitch")})
+                                                  for p, b in got.items()})
+                if any(b and b.get("indistinguishable_reuse") for b in got.values()):
+                    rec["note"] = "no free voice of that category: shares a voice with another speaker"
+            else:
+                prov = ov.get("provider") or (providers[0] if providers else "")
+                if prov not in self.c.tts_providers:
+                    return dict(rec, ignored=f"provider {prov or '(none)'} is not used by this job")
+                b = self.registry.override_voice(sid, prov, ov.get("voice") or "", ov.get("pitch"))
+                rec.update(provider=prov, voice=b["voice"], pitch=b.get("pitch"))
+                if b.get("indistinguishable_reuse"):
+                    rec["note"] = "another speaker already has this voice"
+        except VoiceResolutionError as e:
+            return dict(rec, ignored=str(e)[:200])
+        return rec
+
+    def build_review_packet(self, stage: str = "before_voice") -> Dict[str, Any]:
+        """The review packet ("before_voice" or "after_run"): every line with
+        its speaker, English, Hindi, flags and (after a run) its accepted clip
+        and overflow; every speaker with its voice and reference clip; the
+        voices a reviewer can choose. Clip files are copied into
+        output_dir/clips/ (<turn_id>.wav, ref_<speaker_id>.wav)."""
+        after = stage == "after_run"
+        clips_dir = self.cfg.output_dir / "clips"
+        if after:
+            shutil.rmtree(clips_dir, ignore_errors=True)
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        refs: Dict[str, str] = {}
+        for sid, rec in self.registry.speakers.items():
+            if rec.reference_clip and Path(rec.reference_clip).exists():
+                name = f"ref_{_safe_name(sid)}.wav"
+                try:
+                    shutil.copyfile(rec.reference_clip, clips_dir / name)
+                    refs[sid] = name
+                except OSError:
+                    pass
+        turns = []
+        overflow = {d["turn_id"]: d.get("overflow_s") for d in self.report.timing_deviations
+                    if d.get("overflow_s") is not None} if after else {}
+        for t in self.turns:
+            clip_name = None
+            c = self.clips.get(t.turn_id) if after else None
+            if c is not None and c.accepted and Path(c.path).exists():
+                clip_name = f"{_safe_name(t.turn_id)}.wav"
+                try:
+                    shutil.copyfile(c.path, clips_dir / clip_name)
+                except OSError:
+                    clip_name = None
+            turns.append({"turn_id": t.turn_id, "speaker_id": t.speaker_id,
+                          "start": t.source_start, "end": t.source_end,
+                          "english": t.source_text, "hindi": t.speech_text,
+                          "flags": list(t.flags), "required": t.required,
+                          "clip": clip_name, "overflow_s": overflow.get(t.turn_id)})
+        providers = list(self.c.tts_providers)
+        router = getattr(self, "router", None)
+        speakers = []
+        for sid, rec in self.registry.speakers.items():
+            chain = router.providers_for(sid) if router is not None else providers
+            prov = next((p for p in chain if rec.provider_voices.get(p)), chain[0] if chain else None)
+            b = rec.provider_voices.get(prov) or {}
+            speakers.append({"speaker_id": sid, "voice_category": rec.voice_category,
+                             "category_confidence": rec.category_confidence,
+                             "total_speech_s": rec.total_speech_s,
+                             "turns": sum(1 for t in self.turns if t.speaker_id == sid and t.required),
+                             "provider": prov, "voice": b.get("voice"), "pitch": b.get("pitch"),
+                             "variant": b.get("variant"), "reference_clip": refs.get(sid),
+                             "override": bool(b.get("override"))})
+        return {"job_stage": stage, "turns": turns, "speakers": speakers,
+                "voice_options": {p: self.registry.voice_options(p) for p in providers},
+                "media_duration": round(float(getattr(self, "media_dur", 0.0) or 0.0), 3)}
+
+    # ── voice matching (optional) ──────────────────────────────────────
+    def _prepare_voice_match(self):
+        """Give the voice matcher up to 3 reference clips per speaker (the
+        longest clean ranges, <= 12 s each, from the vocals stem when there
+        is one, 24 kHz mono). Every failure is a limitation, never fatal."""
+        cfg, r = self.cfg, self.report
+        vm = getattr(self.c, "voice_matcher", None)
+        self._vm_ready = set()
+        if vm is None:
+            if (cfg.voice_match or "off") != "off":
+                why = self.c.notes.get("voice_match") or "not available"
+                r.limitations.append(f"voice matching ({cfg.voice_match}) did not run ({why}): "
+                                     f"the stock voices were used")
+            return
+        name = getattr(vm, "name", "") or cfg.voice_match
+        src = self.vocals_48k if (self.vocals_48k and Path(self.vocals_48k).exists()) else self.audio_48k
+        refs_dir = cfg.work_dir / "voice_match_refs"
+        voiced = {t.speaker_id for t in self.turns if t.required and t.speech_text}
+        failed = []
+        for sid in sorted(voiced):
+            self._check_cancel()
+            ranges = sorted(self.speaker_ranges.get(sid) or [], key=lambda x: x[1] - x[0],
+                            reverse=True)[:3]
+            if not ranges:
+                continue
+            self._progress("synthesize", 0.0, f"Learning how {sid} sounds...")
+            try:
+                refs_dir.mkdir(parents=True, exist_ok=True)
+                wavs = []
+                for i, (s, e) in enumerate(ranges):
+                    p = refs_dir / f"{_safe_name(sid)}_{i}.wav"
+                    audio.run_ffmpeg(["-ss", f"{s:.3f}", "-t", f"{min(e, s + 12.0) - s:.3f}", "-i",
+                                      str(src), "-ac", "1", "-ar", "24000", str(p)])
+                    wavs.append(p)
+                ok = bool(vm.prepare(sid, wavs))
+                if not ok:
+                    failed.append(f"{sid} (no usable reference)")
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                failed.append(f"{sid} ({type(e).__name__}: {str(e)[:80]})")
+            if ok:
+                self._vm_ready.add(sid)
+        if failed:
+            r.limitations.append(f"voice matching ({name}) could not learn {len(failed)} speaker(s): "
+                                 f"{', '.join(failed[:6])}; their lines keep the stock voice")
+        if self._vm_ready:
+            r.model_versions["voice_match"] = name
+
+    def _voice_match(self, clip: Clip):
+        """Convert a fresh clip toward its original speaker. False or an
+        error leaves the stock-voice clip as it is (errors are reported)."""
+        vm = getattr(self.c, "voice_matcher", None)
+        if vm is None or clip.speaker_id not in self._vm_ready:
+            return
+        src = Path(clip.path)
+        raw = src.with_name(src.stem + "_vm_raw.wav")
+        dst = src.with_name(src.stem + "_vm.wav")
+        try:
+            with self._vm_lock:      # one conversion at a time (one model, one GPU)
+                ok = vm.convert(src, raw, clip.speaker_id)
+            if not ok or not raw.exists():
+                return
+            audio.to_wav(raw, dst)   # 48 kHz mono 16-bit, what the checks and the mix read
+            raw.unlink(missing_ok=True)
+            clip.path = str(dst)
+            clip.natural_duration = clip.final_duration = audio.probe_duration(dst)
+            clip.voice_params["voice_matched"] = True
+        except Exception as e:  # noqa: BLE001
+            with self._vm_lock:
+                self._vm_errors.append(f"{clip.turn_id}: {type(e).__name__}: {str(e)[:100]}")
 
     def _check_brief_genders(self, brief: Dict):
         """The transcript says one gender, the voice analysis another: the
@@ -954,19 +1518,28 @@ class DialogueOrchestrator:
             pron = {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, str)}
         except Exception:
             pass
+        # Within-job TTS cache: a re-voice run of this job reuses unchanged lines.
         return TTSRouter(self.c.tts_providers, self.registry, list(self.c.tts_providers),
                          self.cfg.work_dir / "clips", max_retries=self.cfg.max_tts_retries,
-                         pronunciation=pron)
+                         pronunciation=pron, cache_dir=checkpoint.tts_cache_dir(self.cfg.work_dir))
 
     def _synth_checked(self, t: Turn, reason: str, only_provider: Optional[str] = None,
                        speed: float = 1.0) -> Clip:
-        """Synthesize + cheap checks; one regeneration (same voice) on failure."""
-        clip = self.router.synthesize(t, reason=reason, only_provider=only_provider, speed=speed)
+        """Synthesize (+ voice matching) + cheap checks; one regeneration
+        (same voice) on failure. A regeneration never reuses cached audio."""
+        clip = self.router.synthesize(t, reason=reason, only_provider=only_provider, speed=speed,
+                                      use_cache=not reason.startswith(_REGEN_REASONS))
+        self._voice_match(clip)
         chk = verify.check_clip(clip)
         if not chk["ok"]:
+            self.router.uncache(clip)
             again = self.router.synthesize(t, reason="cheap_check_regen:" + ",".join(chk["problems"]),
-                                           only_provider=only_provider or clip.provider, speed=speed)
+                                           only_provider=only_provider or clip.provider, speed=speed,
+                                           use_cache=False)
+            self._voice_match(again)
             chk2 = verify.check_clip(again)
+            if not chk2["ok"]:
+                self.router.uncache(again)
             again.retry_history = clip.retry_history + again.retry_history
             clip, chk = again, chk2
         clip.verification["cheap"] = chk
@@ -989,6 +1562,9 @@ class DialogueOrchestrator:
         return c if c.accepted else None
 
     def _synthesize_all(self):
+        if self.report.resumed_from_checkpoint:
+            # the earlier run's clips are superseded (reusable audio is in tts_cache)
+            shutil.rmtree(self.cfg.work_dir / "clips", ignore_errors=True)
         self.router = self._new_router()
         todo = [t for t in self.turns if t.required and t.speech_text]
         done = 0
@@ -1125,17 +1701,45 @@ class DialogueOrchestrator:
         mix.write_srt(src_cues, out / "transcript_en_speakers.srt")
         outputs = {"audio_mix": str(final_wav), "subtitles_srt": str(srt), "subtitles_vtt": str(vtt),
                    "source_transcript": str(out / "transcript_en_speakers.srt")}
+        # English subtitles: the source text on the source timing, no speaker labels.
+        en_srt: Optional[Path] = out / "subtitles_en.srt"
+        en_cues = [{"start": t.source_start, "end": t.source_end, "text": mix.wrap_lines(t.source_text.strip())}
+                   for t in sorted(self.turns, key=lambda t: (t.source_start, t.source_end))
+                   if t.source_text.strip() and "deleted_by_user" not in t.flags]
+        if cfg.english_subtitles and en_cues:
+            mix.write_srt(en_cues, en_srt)
+            outputs["subtitles_en_srt"] = str(en_srt)
+        else:
+            en_srt.unlink(missing_ok=True)    # an earlier run of this job may have written one
+            en_srt = None
         if self.video and audio.probe_streams(self.video).get("video"):
-            mp4 = out / "dubbed_hi.mp4"
-            mix.mux(self.video, final_wav, mp4, cfg.audio_bitrate,
-                    subtitles=srt if cfg.embed_subtitles else None)
-            info = audio.probe_streams(mp4)
+            container = cfg.container if cfg.container in ("mp4", "mkv") else "mp4"
+            opts = {"original_audio": cfg.keep_original_audio,
+                    "extra_subtitles": ([(en_srt, "eng", "English")]
+                                        if en_srt and cfg.embed_subtitles else None),
+                    "burn_subtitles": srt if cfg.burn_subtitles else None,
+                    "container": container}
+            # Passed by keyword; an option this build's mix.mux does not take
+            # is reported (an mkv then falls back to mp4), never a crash.
+            kw = _supported_kwargs(mix.mux, **opts)
+            for k, v in opts.items():
+                if k not in kw and v and not (k == "container" and v == "mp4"):
+                    r.limitations.append(f"output option {k} is not supported by this build's muxer")
+            if "container" not in kw:
+                container = "mp4"
+            video_out = out / f"dubbed_hi.{container}"
+            for other in ("mp4", "mkv"):
+                if other != container:
+                    (out / f"dubbed_hi.{other}").unlink(missing_ok=True)   # stale, earlier run
+            mix.mux(self.video, final_wav, video_out, cfg.audio_bitrate,
+                    subtitles=srt if cfg.embed_subtitles else None, **kw)
+            info = audio.probe_streams(video_out)
             if not (info.get("video") and info.get("audio")):
-                raise RuntimeError("muxed MP4 is missing a stream")
+                raise RuntimeError(f"muxed {container.upper()} is missing a stream")
             if abs(info.get("duration", 0) - self.media_dur) > 0.5:
                 r.unresolved_failures.append(
                     f"output duration {info.get('duration')}s differs from source {self.media_dur:.2f}s")
-            outputs["video"] = str(mp4)
+            outputs["video"] = str(video_out)
         for p in rend["stems"]:
             shutil.copy2(p, out / Path(p).name)
         r.outputs.update(outputs)
@@ -1149,6 +1753,13 @@ class DialogueOrchestrator:
                     close()
                 except Exception:
                     pass
+        vm = getattr(self.c, "voice_matcher", None)
+        if vm is not None and not self._vm_closed:
+            self._vm_closed = True     # closed once (this runs before the mix and again at the end)
+            try:
+                vm.close()
+            except Exception:
+                pass
 
     # finalise
     def _finalise(self, aborted: str):
@@ -1170,6 +1781,17 @@ class DialogueOrchestrator:
         r.voice_reuse = reuse
         for k, v in self.c.notes.items():
             r.model_versions.setdefault(k, v)
+        if self._vm_errors:
+            r.limitations.append(f"voice matching failed on {len(self._vm_errors)} clip(s) "
+                                 f"(first: {self._vm_errors[0]}); those keep the stock voice")
+        if not aborted and r.outputs.get("audio_mix"):
+            # The run produced audio: the after-run review packet (with the
+            # accepted clips in output_dir/clips/) is what a re-voice starts from.
+            try:
+                packet = self.build_review_packet("after_run")
+                r.outputs["review"] = str(checkpoint.write_json_atomic(out / "review.json", packet))
+            except Exception as e:  # noqa: BLE001
+                r.limitations.append(f"could not write the review packet ({str(e)[:160]})")
         # translate() handed over only the warnings that existed when it
         # returned; the fit stage's rewrites can add more (an engine marked
         # down, an API key refused) and those belong in the report too.
@@ -1184,17 +1806,29 @@ class DialogueOrchestrator:
 def run_dialogue(cfg: DialogueConfig, on_progress: Optional[ProgressCB] = None,
                  cancel_check: Optional[Callable[[], bool]] = None,
                  components: Optional[Components] = None,
-                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None) -> DialogueResult:
+                 on_legacy_pipeline: Optional[Callable[[Any], None]] = None,
+                 review: Optional[ReviewHook] = None) -> DialogueResult:
     """`on_legacy_pipeline` is called with every legacy pipeline.Pipeline the
     run creates (link download, subtitles, local Whisper); app.py keeps it as
-    job.pipeline_ref so a cancel can kill its subprocesses at once."""
+    job.pipeline_ref so a cancel can kill its subprocesses at once.
+
+    `review` (with cfg.review_before_voice) is called from this thread right
+    after "translate" with the review packet; it blocks until the reviewer
+    is done and returns {"turn_edits", "voice_overrides", "speaker_merges"}
+    (any subset) or None. cancel_check() is consulted as soon as it returns."""
     orch = DialogueOrchestrator(cfg, components, on_progress, cancel_check)
     # Set after construction: wrappers of __init__ keep the 4-argument call.
     orch.on_legacy_pipeline = on_legacy_pipeline
+    orch.review = review
     return orch.run()
 
 
 # ── environment / resource helpers ────────────────────────────────────────
+def _safe_name(s: str) -> str:
+    """A turn/speaker id as a plain file name (the clip endpoint accepts only these)."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", s or "") or "_"
+
+
 def _redact(s: str) -> str:
     """Drop query strings (signed URLs, tokens) from logged sources, keeping a
     YouTube video id so the report still identifies the input."""
