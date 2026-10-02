@@ -46,7 +46,7 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFil
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, ValidationError, validator
 from sse_starlette.sse import EventSourceResponse
 
 from pipeline import Pipeline, PipelineConfig, list_voices, DEFAULT_VOICES
@@ -267,6 +267,13 @@ class Job:
     # Where the finished job's SRT now lives (the saved folder): the job's
     # work folder is deleted after saving, so the old path 404s.
     subtitles_path: Optional[str] = None
+    # hindi_dialogue review: the "before_voice" packet while the job waits for
+    # the user (state review_translation), None otherwise.
+    dialogue_review: Optional[Dict] = None
+    # Every edit applied to this dialogue job so far (review + re-voices):
+    # {"turn_edits", "voice_overrides", "speaker_merges"}. Each re-voice
+    # applies all of them again on top of the job's own checkpoint.
+    dialogue_edits: Dict[str, Any] = field(default_factory=dict)
 
 
 class JobCreateRequest(BaseModel):
@@ -373,6 +380,13 @@ class JobCreateRequest(BaseModel):
     # is given, the resolver decides every stage and the fields above are ignored.
     dialogue_preset: str = ""                       # e.g. "free-online", "free-local"
     dialogue_modules_json: str = ""                 # {"<stage>": [choices], "params": {...}}
+    # Applied on top of the module matrix when set away from their defaults.
+    dialogue_review: bool = False                   # pause after translation to review lines + voices
+    dialogue_voice_overrides_json: str = ""         # {"<speaker_id>": {"provider","voice","pitch"} | {"category"}}
+    dialogue_keep_original_audio: bool = False      # original audio as a second, non-default track
+    dialogue_english_subtitles: bool = True         # English subtitle track/file next to the Hindi one
+    dialogue_burn_subtitles: bool = False           # burn the Hindi subtitles into the picture
+    dialogue_container: str = "mp4"                 # "mp4" | "mkv"
     # ── SRT Direct mode options ──
     sd_srt_content: str = ""            # Full SRT content (cues verbatim) — required for srtdub mode
     sd_max_stretch: float = 20.0        # 1.0–20.0× max video slowdown; freeze-pads if still short
@@ -411,6 +425,17 @@ class JobCreateRequest(BaseModel):
         if not re.match(r"^[a-zA-Z]{2,5}(-[a-zA-Z]{2,5})?$|^auto$", v):
             raise ValueError(f"Invalid language code: {v}")
         return v
+
+    @validator("dialogue_container")
+    def validate_dialogue_container(cls, v):
+        v = (v or "").strip().lower()
+        return v if v in ("mp4", "mkv") else "mp4"
+
+    @validator("dialogue_voice_overrides_json")
+    def validate_dialogue_voice_overrides(cls, v):
+        if (v or "").strip():
+            _parse_voice_overrides_json(v)   # raises ValueError with the reason
+        return v or ""
 
 
 # ── Step weights for overall progress ────────────────────────────────────────
@@ -474,6 +499,25 @@ SAVED_DIR.mkdir(parents=True, exist_ok=True)
 # was broken on this Python install.
 _store = JobStore(STATE_DIR / "jobs.db")
 _store.load_all(JOBS)
+
+
+def _settle_loaded_jobs(jobs: Dict[str, "Job"], store) -> None:
+    """Fix up jobs loaded from the store."""
+    for j in jobs.values():
+        # The store cannot serialise threading.Event: loaded jobs need a fresh one.
+        if not isinstance(j.pause_event, threading.Event):
+            j.pause_event = threading.Event()
+        if j.dialogue_review is not None:
+            # Paused for the dialogue review when the server stopped: its worker
+            # is gone (the store already marked it error). The checkpoint is kept.
+            j.dialogue_review = None
+            j.error = j.error or "Server restarted while the job waited for review"
+            j.message = ("Server restarted while the job waited for review — "
+                         "re-voice it to continue from its checkpoint")
+            store.save(j)
+
+
+_settle_loaded_jobs(JOBS, _store)
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
@@ -950,13 +994,248 @@ def _dialogue_speakers(speakers_json: Path, providers: List[str],
     return out
 
 
+# ── Hindi dialogue: review before voicing, re-voice, voice options ──────────
+
+DIALOGUE_REVIEW_MESSAGE = "Review the Hindi lines and voices, then continue"
+_dialogue_lock = threading.Lock()   # review/re-voice state changes from API threads
+
+
+def _is_dialogue_job(job: Job) -> bool:
+    return getattr(job.original_req, "pipeline_mode", "") == "hindi_dialogue"
+
+
+def _dialogue_checkpoint(job: Job) -> Path:
+    """This job's own checkpoint (never another job's)."""
+    return OUTPUTS / job.id / "work" / "checkpoint" / "state.json"
+
+
+def _dialogue_voice_options() -> Dict[str, Dict[str, Any]]:
+    """Voices a dialogue speaker can be bound to, per TTS provider.
+
+    Exactly the slots SpeakerRegistry.bind_provider picks from (the curated
+    pools; Edge's are MALE_SLOTS/FEMALE_SLOTS of dubbing/hindi_voices.py),
+    each "voice|pitch" slot split into voice + pitch. Providers without
+    voices here (ElevenLabs with no voice IDs set, IndicF5 with no
+    references) are left out. "preview": a sample can be made right now
+    (Edge, or a paid provider whose API key is set; local models load for
+    minutes, so they are heard in the job only)."""
+    from dubbing.dialogue.contracts import CATEGORY_FEMALE, CATEGORY_MALE
+    from dubbing.dialogue.speaker_registry import curated_pools
+    from dubbing.dialogue.tts import PROVIDER_CLASSES
+    from dubbing.hindi_voices import slot_label, split_slot
+    out: Dict[str, Dict[str, Any]] = {}
+    for prov, pool in curated_pools().items():
+        if prov == "mock" or prov not in PROVIDER_CLASSES:
+            continue
+        cats: Dict[str, List[Dict]] = {}
+        for cat in (CATEGORY_MALE, CATEGORY_FEMALE):
+            opts = []
+            for slot in pool.get(cat) or []:
+                voice, pitch = split_slot(slot)
+                label = (slot_label(slot) if prov == "edge"
+                         else voice.replace("hi-IN-", "") + (f" {pitch}" if pitch else ""))
+                opts.append({"voice": voice, "pitch": pitch, "label": label})
+            cats[cat] = opts
+        if not any(cats.values()):
+            continue
+        entry: Dict[str, Any] = dict(cats)
+        cls = PROVIDER_CLASSES[prov]
+        entry["paid"] = bool(getattr(cls, "paid", False))
+        if entry["paid"]:
+            entry["key_set"] = bool(getattr(cls(), "key", ""))   # paid __init__ only reads env
+        entry["preview"] = prov == "edge" or bool(entry.get("key_set"))
+        out[prov] = entry
+    return out
+
+
+def _voice_option_ok(opts: Dict[str, Any], voice: Any, pitch: Optional[str]) -> bool:
+    """(voice, pitch) is a bindable slot of this provider; a listed voice
+    without a pitch is always fine."""
+    from dubbing.dialogue.contracts import CATEGORY_FEMALE, CATEGORY_MALE
+    return any(o["voice"] == voice and (pitch is None or o["pitch"] == pitch)
+               for cat in (CATEGORY_MALE, CATEGORY_FEMALE) for o in opts.get(cat, []))
+
+
+def _check_voice_overrides(raw: Any, options: Optional[Dict] = None) -> Dict[str, Dict]:
+    """speaker_id -> {"provider","voice","pitch"} | {"category"}; raises
+    ValueError naming the first bad entry."""
+    if not isinstance(raw, dict):
+        raise ValueError("voice_overrides must be an object keyed by speaker_id")
+    out: Dict[str, Dict] = {}
+    for sid, ov in raw.items():
+        if not isinstance(ov, dict):
+            raise ValueError(f"voice_overrides[{sid}] must be an object")
+        if "category" in ov:
+            if set(ov) != {"category"} or ov["category"] not in ("male_like", "female_like"):
+                raise ValueError(f"voice_overrides[{sid}]: category must be male_like or "
+                                 f"female_like (and nothing else)")
+            out[str(sid)] = {"category": ov["category"]}
+            continue
+        extra = set(ov) - {"provider", "voice", "pitch"}
+        if extra:
+            raise ValueError(f"voice_overrides[{sid}]: unknown keys {sorted(extra)}")
+        options = options if options is not None else _dialogue_voice_options()
+        prov, voice, pitch = ov.get("provider"), ov.get("voice"), (ov.get("pitch") or None)
+        if prov not in options:
+            raise ValueError(f"voice_overrides[{sid}]: unknown TTS provider {prov!r}")
+        if not _voice_option_ok(options[prov], voice, pitch):
+            raise ValueError(f"voice_overrides[{sid}]: {prov} has no voice {voice!r}"
+                             + (f" with pitch {pitch}" if pitch else ""))
+        out[str(sid)] = {"provider": prov, "voice": voice, "pitch": pitch}
+    return out
+
+
+def _parse_voice_overrides_json(raw: str) -> Dict[str, Dict]:
+    """JobCreateRequest.dialogue_voice_overrides_json -> checked overrides."""
+    if not (raw or "").strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"dialogue_voice_overrides_json is not valid JSON: {e}")
+    return _check_voice_overrides(data)
+
+
+def _clean_dialogue_edits(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Validated {turn_edits, voice_overrides, speaker_merges} (empty parts
+    dropped). Raises ValueError naming the first bad entry."""
+    for key in ("turn_edits", "speaker_merges"):
+        if not isinstance(body.get(key) or {}, dict):
+            raise ValueError(f"{key} must be an object")
+    turn_edits: Dict[str, Dict] = {}
+    for tid, e in (body.get("turn_edits") or {}).items():
+        if not isinstance(e, dict) or not e:
+            raise ValueError(f"turn_edits[{tid}] must be a non-empty object")
+        extra = set(e) - {"hi", "speaker_id", "delete"}
+        if extra:
+            raise ValueError(f"turn_edits[{tid}]: unknown keys {sorted(extra)}")
+        clean: Dict[str, Any] = {}
+        if "hi" in e:
+            if not isinstance(e["hi"], str) or not e["hi"].strip():
+                raise ValueError(f"turn_edits[{tid}]: 'hi' must be a non-empty line "
+                                 f"(use delete to drop it)")
+            clean["hi"] = e["hi"].strip()
+        if "speaker_id" in e:
+            if not isinstance(e["speaker_id"], str) or not e["speaker_id"].strip():
+                raise ValueError(f"turn_edits[{tid}]: 'speaker_id' must be a speaker id")
+            clean["speaker_id"] = e["speaker_id"].strip()
+        if "delete" in e:
+            if not isinstance(e["delete"], bool):
+                raise ValueError(f"turn_edits[{tid}]: 'delete' must be true or false")
+            clean["delete"] = e["delete"]
+        turn_edits[str(tid)] = clean
+    merges: Dict[str, str] = {}
+    for frm, into in (body.get("speaker_merges") or {}).items():
+        if not isinstance(into, str) or not into.strip() or into.strip() == frm:
+            raise ValueError(f"speaker_merges[{frm}] must name another speaker")
+        merges[str(frm)] = into.strip()
+    out = {"turn_edits": turn_edits,
+           "voice_overrides": _check_voice_overrides(body.get("voice_overrides") or {}),
+           "speaker_merges": merges}
+    return {k: v for k, v in out.items() if v}
+
+
+def _merge_dialogue_edits(base: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """Later edits win: per turn field by field, per speaker as a whole.
+    Merges stay resolved (A->B then B->C is stored as A->C, B->C)."""
+    turn_edits = {k: dict(v) for k, v in (base.get("turn_edits") or {}).items()}
+    for tid, e in (new.get("turn_edits") or {}).items():
+        turn_edits[tid] = {**turn_edits.get(tid, {}), **e}
+    voice_overrides = {**(base.get("voice_overrides") or {}), **(new.get("voice_overrides") or {})}
+    merges = dict(base.get("speaker_merges") or {})
+    for frm, into in (new.get("speaker_merges") or {}).items():
+        into = merges.get(into, into)
+        if into == frm:
+            continue                         # would merge a speaker into itself
+        merges[frm] = into
+        for k, v in list(merges.items()):
+            if v == frm:
+                merges[k] = into
+    out = {"turn_edits": turn_edits, "voice_overrides": voice_overrides, "speaker_merges": merges}
+    return {k: v for k, v in out.items() if v}
+
+
+def _dialogue_request_overrides(req: JobCreateRequest) -> Dict[str, Any]:
+    """DialogueConfig keys from the request's dialogue_* output/review options.
+    Only values set away from their defaults are returned, so the same
+    option given in the module matrix params is not reset by a default."""
+    out: Dict[str, Any] = {}
+    if getattr(req, "dialogue_review", False):
+        out["review_before_voice"] = True
+    overrides = _parse_voice_overrides_json(getattr(req, "dialogue_voice_overrides_json", ""))
+    if overrides:
+        out["voice_overrides"] = overrides
+    if getattr(req, "dialogue_keep_original_audio", False):
+        out["keep_original_audio"] = True
+    if not getattr(req, "dialogue_english_subtitles", True):
+        out["english_subtitles"] = False
+    if getattr(req, "dialogue_burn_subtitles", False):
+        out["burn_subtitles"] = True
+    if (getattr(req, "dialogue_container", "mp4") or "mp4") != "mp4":
+        out["container"] = req.dialogue_container
+    return out
+
+
+def _dialogue_review_hook(job: Job):
+    """run_dialogue's review hook: called from the job thread after the
+    translate stage with the "before_voice" packet. Pauses the job (state
+    review_translation) until POST .../dialogue/review or /continue sets
+    pause_event, polling the cancel flag. Returns this job's edits, or None
+    (no edits, or cancelled; the orchestrator checks cancel right after)."""
+    def review(packet: Dict) -> Optional[Dict]:
+        if not isinstance(job.pause_event, threading.Event):
+            job.pause_event = threading.Event()
+        job.pause_event.clear()          # before the state flips: a quick POST is not lost
+        job.dialogue_review = packet
+        # The transcript view shows the lines under review (not the finished
+        # download/ASR Pipeline's segments; it has no process left to kill).
+        job.pipeline_ref = None
+        job.segments = [{"start": t.get("start"), "end": t.get("end"), "text": t.get("english", ""),
+                         "text_translated": t.get("hindi", ""), "speaker_id": t.get("speaker_id"),
+                         "turn_id": t.get("turn_id")} for t in (packet or {}).get("turns") or []]
+        job.state = "review_translation"
+        job.message = DIALOGUE_REVIEW_MESSAGE
+        job.events.append({"type": "review", "step": "translate", "progress": 1.0,
+                           "overall": round(job.overall_progress, 3),
+                           "message": DIALOGUE_REVIEW_MESSAGE})
+        _store.save(job)
+        while not job.pause_event.wait(0.5):
+            if job.cancel_event.is_set():
+                break
+        job.dialogue_review = None
+        if job.cancel_event.is_set():
+            return None
+        job.state = "running"
+        job.message = "Voicing the reviewed lines..."
+        _store.save(job)
+        return dict(job.dialogue_edits) or None
+    return review
+
+
+def _drop_saved_copy(job: Job) -> None:
+    """Remove this job's earlier saved-folder copy before a re-voice copies
+    its new outputs (the folder name carries the result status)."""
+    if not job.saved_folder:
+        return
+    old = Path(job.saved_folder)
+    try:
+        if (old.is_dir() and old.parent.resolve() == SAVED_DIR.resolve()
+                and old.name.endswith(f"({job.id})")):
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError as e:
+        print(f"[hindi_dialogue] could not remove the old copy {old}: {e}", flush=True)
+
+
 def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
-                       english_srt: Optional[Path] = None):
+                       english_srt: Optional[Path] = None, resume: bool = False):
     """pipeline_mode="hindi_dialogue": the shared speaker-aware dialogue path.
 
     Runs inside the caller's pipeline semaphore. Never deletes partial assets:
     a failed or draft job keeps its work folder and report for review.
+    resume=True (re-voice): same work/output folders, this job's checkpoint,
+    every edit in job.dialogue_edits; the saved-folder copy is replaced.
     """
+    from dataclasses import fields as _dc_fields
     from dubbing.dialogue.orchestrator import DialogueConfig, run_dialogue
 
     job_dir = OUTPUTS / job.id
@@ -1000,6 +1279,22 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         _store.save(job)
         return
 
+    # Review/output options from the request on top of the module matrix; a
+    # re-voice adds this job's checkpoint and every edit made so far (the
+    # user has reviewed already, so it does not pause again).
+    conf = dict(resolution.config)
+    for k, v in _dialogue_request_overrides(req).items():
+        conf[k] = {**(conf.get(k) or {}), **v} if k == "voice_overrides" else v
+    if resume:
+        edits = job.dialogue_edits or {}
+        conf.update(resume=True, review_before_voice=False,
+                    turn_edits=dict(edits.get("turn_edits") or {}),
+                    speaker_merges=dict(edits.get("speaker_merges") or {}))
+        conf["voice_overrides"] = {**(conf.get("voice_overrides") or {}),
+                                   **(edits.get("voice_overrides") or {})}
+    known = {f.name for f in _dc_fields(DialogueConfig)}
+    for k in sorted(set(conf) - known):
+        print(f"[hindi_dialogue] the orchestrator has no '{k}' option: ignored", flush=True)
     cfg = DialogueConfig(
         source=req.url, work_dir=work_dir, output_dir=out_dir,
         source_srt=source_srt, translated_srt=translated_srt,
@@ -1007,7 +1302,7 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         audio_bitrate=req.audio_bitrate,
         limit_seconds=float(req.dub_duration or 0) * 60.0,
         modules=resolution.to_dict(),
-        **resolution.config,
+        **{k: v for k, v in conf.items() if k in known},
     )
     # Every legacy Pipeline the dialogue path creates (link download, local
     # Whisper) becomes job.pipeline_ref, so Cancel kills its yt-dlp/ffmpeg
@@ -1015,11 +1310,20 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
     # name so this works whichever side of that orchestrator change merges first.)
     import inspect
     run_kw: Dict[str, Any] = {}
-    if "on_legacy_pipeline" in inspect.signature(run_dialogue).parameters:
+    run_params = inspect.signature(run_dialogue).parameters
+    if "on_legacy_pipeline" in run_params:
         run_kw["on_legacy_pipeline"] = lambda p: setattr(job, "pipeline_ref", p)
     else:
         print("[hindi_dialogue] orchestrator has no on_legacy_pipeline hook: Cancel cannot "
               "stop its download/ASR subprocesses early", flush=True)
+    # Review before voicing: the orchestrator calls the hook only when
+    # cfg.review_before_voice is set (same by-name check as above).
+    if "review" in run_params:
+        run_kw["review"] = _dialogue_review_hook(job)
+    elif conf.get("review_before_voice"):
+        n = "review before voicing is not available in this orchestrator: the job runs straight through"
+        print(f"[hindi_dialogue] {n}", flush=True)
+        job.events.append({"type": "note", "message": n})
     try:
         res = run_dialogue(cfg, on_progress=_make_progress_callback(job, DIALOGUE_STEP_WEIGHTS),
                            cancel_check=job.cancel_event.is_set, **run_kw)
@@ -1051,6 +1355,8 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
     # Save a titled copy of every deliverable (video, subtitles, report, stems)
     title = _sanitize_filename(job.video_title)
     folder = SAVED_DIR / f"{title} [HI Dialogue {res.status}] ({job.id})"
+    if resume:
+        _drop_saved_copy(job)   # refreshed, not merged with the earlier run's files
     try:
         shutil.copytree(out_dir, folder, dirs_exist_ok=True)
         job.saved_folder = str(folder)
@@ -2786,6 +3092,12 @@ async def create_job_upload(
     pipeline_mode: str = Form("classic"),
     dialogue_preset: str = Form(""),
     dialogue_modules_json: str = Form(""),
+    dialogue_review: str = Form("false"),
+    dialogue_voice_overrides_json: str = Form(""),
+    dialogue_keep_original_audio: str = Form("false"),
+    dialogue_english_subtitles: str = Form("true"),
+    dialogue_burn_subtitles: str = Form("false"),
+    dialogue_container: str = Form("mp4"),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
     # "Upload Transcript (Skip Transcription)": the UI sends it with the file;
@@ -2868,12 +3180,21 @@ async def create_job_upload(
             pipeline_mode=pipeline_mode,
             dialogue_preset=dialogue_preset,
             dialogue_modules_json=dialogue_modules_json,
+            dialogue_review=_bool(dialogue_review),
+            dialogue_voice_overrides_json=dialogue_voice_overrides_json,
+            dialogue_keep_original_audio=_bool(dialogue_keep_original_audio),
+            dialogue_english_subtitles=_bool(dialogue_english_subtitles),
+            dialogue_burn_subtitles=_bool(dialogue_burn_subtitles),
+            dialogue_container=dialogue_container,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
             transcript_srt_content=transcript_srt_content,
         )
-    except Exception:
+    except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
+        if isinstance(e, ValidationError):   # a bad field value: say which, not a 500
+            raise HTTPException(status_code=422, detail=[
+                {"loc": list(err.get("loc", ())), "msg": err.get("msg", "")} for err in e.errors()])
         raise
 
     job = Job(id=job_id, source_url=f"upload:{file.filename}", target_language=target_language)
@@ -3152,6 +3473,12 @@ async def create_job_with_srt(
     pipeline_mode: str = Form("classic"),
     dialogue_preset: str = Form(""),
     dialogue_modules_json: str = Form(""),
+    dialogue_review: str = Form("false"),
+    dialogue_voice_overrides_json: str = Form(""),
+    dialogue_keep_original_audio: str = Form("false"),
+    dialogue_english_subtitles: str = Form("true"),
+    dialogue_burn_subtitles: str = Form("false"),
+    dialogue_container: str = Form("mp4"),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
 ):
@@ -3248,11 +3575,20 @@ async def create_job_with_srt(
             pipeline_mode=pipeline_mode,
             dialogue_preset=dialogue_preset,
             dialogue_modules_json=dialogue_modules_json,
+            dialogue_review=_bool(dialogue_review),
+            dialogue_voice_overrides_json=dialogue_voice_overrides_json,
+            dialogue_keep_original_audio=_bool(dialogue_keep_original_audio),
+            dialogue_english_subtitles=_bool(dialogue_english_subtitles),
+            dialogue_burn_subtitles=_bool(dialogue_burn_subtitles),
+            dialogue_container=dialogue_container,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
         )
-    except Exception:
+    except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
+        if isinstance(e, ValidationError):   # a bad field value: say which, not a 500
+            raise HTTPException(status_code=422, detail=[
+                {"loc": list(err.get("loc", ())), "msg": err.get("msg", "")} for err in e.errors()])
         raise
 
     job = Job(id=job_id, source_url=display_source, target_language=target_language)
@@ -3396,6 +3732,12 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "max_sentences_per_cue": getattr(req, "max_sentences_per_cue", 2),
         "tts_chunk_words": getattr(req, "tts_chunk_words", 0),
         "gap_mode": getattr(req, "gap_mode", "micro"),
+        # ── Hindi dialogue review / outputs ──
+        "dialogue_review": getattr(req, "dialogue_review", False),
+        "dialogue_keep_original_audio": getattr(req, "dialogue_keep_original_audio", False),
+        "dialogue_english_subtitles": getattr(req, "dialogue_english_subtitles", True),
+        "dialogue_burn_subtitles": getattr(req, "dialogue_burn_subtitles", False),
+        "dialogue_container": getattr(req, "dialogue_container", "mp4"),
     }
 
 
@@ -3438,7 +3780,19 @@ def get_job(job_id: str):
         "report_path":        job.report_path,
         # The file /srt serves (also for jobs saved before subtitles_path existed)
         "subtitles_path":     str(srt) if srt else None,
+        # hindi_dialogue: the review packet while the job waits for review
+        # (None otherwise), and whether a re-voice can start now.
+        "dialogue_review":    job.dialogue_review,
+        "dialogue_revoice_ready": _dialogue_revoice_ready(job),
     }
+
+
+def _dialogue_revoice_ready(job: Job) -> bool:
+    try:
+        return (_is_dialogue_job(job) and job.state in ("done", "error")
+                and not job.cancel_event.is_set() and _dialogue_checkpoint(job).is_file())
+    except OSError:
+        return False
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -3631,15 +3985,18 @@ def compare_translations(job_id: str, body: CompareRequest):
 
 @app.post("/api/jobs/{job_id}/continue")
 def continue_job(job_id: str):
-    """Resume a step-by-step job after reviewing transcription or translation."""
+    """Resume a step-by-step job after reviewing transcription or translation.
+    A paused hindi_dialogue job continues with no further edits."""
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.state not in ("review_transcription", "review_translation"):
-        raise HTTPException(status_code=400, detail=f"Job is not paused for review (state={job.state})")
-    job.state = "running"
-    job.pause_event.set()  # Unblock the pipeline thread
-    return {"status": "resumed", "from_state": job.state}
+    with _dialogue_lock:   # the dialogue review POST changes the same state
+        from_state = job.state
+        if from_state not in ("review_transcription", "review_translation"):
+            raise HTTPException(status_code=400, detail=f"Job is not paused for review (state={job.state})")
+        job.state = "running"
+        job.pause_event.set()  # Unblock the pipeline thread
+    return {"status": "resumed", "from_state": from_state}
 
 
 @app.get("/api/jobs/{job_id}/result")
@@ -3653,10 +4010,11 @@ def get_result(job_id: str):
         raise HTTPException(status_code=404, detail="Result file not found (cleaned up)")
 
     title = _sanitize_filename(job.video_title) if job.video_title else f"dubbed_{job_id}"
+    mkv = job.result_path.suffix.lower() == ".mkv"   # hindi_dialogue container option
     return FileResponse(
         path=str(job.result_path),
-        media_type="video/mp4",
-        filename=f"{title} - Dubbed.mp4",
+        media_type="video/x-matroska" if mkv else "video/mp4",
+        filename=f"{title} - Dubbed{'.mkv' if mkv else '.mp4'}",
     )
 
 
@@ -3761,6 +4119,256 @@ def get_dialogue_report(job_id: str, fmt: str = "md"):
     # and an attachment disposition both made the browser download it.
     media = "text/plain; charset=utf-8" if fmt == "md" else "application/json"
     return FileResponse(path=str(path), media_type=media, filename=path.name,
+                        content_disposition_type="inline")
+
+
+class DialogueEditsRequest(BaseModel):
+    turn_edits: Dict[str, Dict[str, Any]] = {}      # turn_id -> {"hi"?, "speaker_id"?, "delete"?}
+    voice_overrides: Dict[str, Dict[str, Any]] = {} # speaker_id -> {"provider","voice","pitch"} | {"category"}
+    speaker_merges: Dict[str, str] = {}             # from speaker_id -> into speaker_id
+
+
+class DialogueRevoiceRequest(DialogueEditsRequest):
+    # Output options; None keeps what the job used last.
+    keep_original_audio: Optional[bool] = None
+    english_subtitles: Optional[bool] = None
+    burn_subtitles: Optional[bool] = None
+    container: Optional[str] = None                 # "mp4" | "mkv"
+
+
+def _edits_from(body: Optional[DialogueEditsRequest]) -> Dict[str, Any]:
+    raw = {k: getattr(body, k) for k in ("turn_edits", "voice_overrides", "speaker_merges")} if body else {}
+    try:
+        return _clean_dialogue_edits(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/jobs/{job_id}/dialogue/review")
+def get_dialogue_review(job_id: str):
+    """The review packet: the live one while the job waits for review, else
+    the finished run's (job folder, then the saved copy)."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state == "review_translation" and job.dialogue_review is not None:
+        return job.dialogue_review
+    candidates = [OUTPUTS / job.id / "dialogue_out" / "review.json"]
+    if job.saved_folder:
+        candidates.append(Path(job.saved_folder) / "review.json")
+    for p in candidates:
+        try:
+            if p.is_file():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"[hindi_dialogue] unreadable review packet {p}: {e}", flush=True)
+    raise HTTPException(status_code=404, detail="No review for this job")
+
+
+@app.post("/api/jobs/{job_id}/dialogue/review")
+def submit_dialogue_review(job_id: str, body: Optional[DialogueEditsRequest] = None):
+    """Store the user's edits and let the paused dialogue job voice them."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    edits = _edits_from(body)
+    with _dialogue_lock:
+        if (not _is_dialogue_job(job) or job.state != "review_translation"
+                or job.dialogue_review is None):
+            raise HTTPException(status_code=409,
+                                detail=f"Job is not waiting for a dialogue review (state={job.state})")
+        job.dialogue_edits = _merge_dialogue_edits(job.dialogue_edits or {}, edits)
+        job.state = "running"
+        job.message = "Voicing the reviewed lines..."
+        job.pause_event.set()            # the job thread's review hook returns the edits
+    return {"status": "resumed"}
+
+
+def _dialogue_srt_inputs(job: Job, req: JobCreateRequest) -> Dict[str, Path]:
+    """The SRT a with-srt dialogue job started from (a re-voice passes the same)."""
+    srt = OUTPUTS / job.id / "work" / "translated_upload.srt"
+    if not srt.is_file():
+        return {}
+    return ({"english_srt": srt} if getattr(req, "srt_needs_translation", False)
+            else {"translated_srt": srt})
+
+
+def _run_dialogue_revoice(job: Job, req: JobCreateRequest):
+    """Re-voice a finished dialogue job from its own checkpoint (background
+    thread, one pipeline at a time like every other job)."""
+    job.message = "Waiting for a pipeline slot..."
+    _pipeline_semaphore.acquire()
+    try:
+        if job.cancel_event.is_set():
+            return                       # cancelled while queued: the cancel marked the job
+        job.state = "running"
+        job.message = "Re-voicing from this job's checkpoint..."
+        _store.save(job)
+        _run_dialogue_mode(job, req, resume=True, **_dialogue_srt_inputs(job, req))
+    except Exception as e:
+        import traceback
+        print(f"[REVOICE ERROR] {e}\n{traceback.format_exc()}", flush=True)
+        _crash_dump_job(job, e)
+        # The job folder (checkpoint, earlier outputs) stays for another try.
+        job.state = "error"
+        job.error = str(e)
+        job.message = f"Error: {e}"
+        job.events.append({"type": "complete", "state": "error", "error": str(e)})
+        _store.save(job)
+    finally:
+        try:
+            _purge_global_caches()
+        except Exception:
+            pass
+        _pipeline_semaphore.release()
+
+
+@app.post("/api/jobs/{job_id}/dialogue/revoice")
+def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = None):
+    """Run a finished dialogue job again from its own checkpoint with the
+    given edits (and every earlier one): translation is reused, voicing,
+    fit, verification and mix re-run, outputs and saved copy are replaced."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    body = body or DialogueRevoiceRequest()
+    edits = _edits_from(body)
+    container = None
+    if body.container is not None:
+        container = body.container.strip().lower()
+        if container not in ("mp4", "mkv"):
+            raise HTTPException(status_code=400, detail="container must be mp4 or mkv")
+    with _dialogue_lock:
+        worker = job.worker_thread
+        if not _is_dialogue_job(job):
+            raise HTTPException(status_code=409, detail="Only Hindi dialogue jobs can be re-voiced")
+        if job.state not in ("done", "error") or (worker is not None and worker.is_alive()):
+            raise HTTPException(status_code=409, detail=f"Job is still running (state={job.state})")
+        if job.cancel_event.is_set():
+            # Cancel removes the job folder once its worker stops.
+            raise HTTPException(status_code=409, detail="A cancelled job cannot be re-voiced")
+        if not _dialogue_checkpoint(job).is_file():
+            raise HTTPException(status_code=409,
+                                detail="This job has no checkpoint to re-voice from; run it again")
+        req = job.original_req
+        # Output options given here replace the job's own (later re-voices keep them).
+        for key in ("keep_original_audio", "english_subtitles", "burn_subtitles"):
+            if getattr(body, key) is not None:
+                setattr(req, f"dialogue_{key}", bool(getattr(body, key)))
+        if container:
+            req.dialogue_container = container
+        job.dialogue_edits = _merge_dialogue_edits(job.dialogue_edits or {}, edits)
+        # A fresh run of the same job: same folders, new outcome.
+        job.cancel_event = threading.Event()
+        if not isinstance(job.pause_event, threading.Event):
+            job.pause_event = threading.Event()
+        job.pause_event.clear()
+        job.dialogue_review = None
+        job.state = "queued"
+        job.error = None
+        job.message = "Re-voice queued..."
+        job.result_status, job.status_reasons = None, []
+        job.result_path = job.saved_video = job.subtitles_path = None
+        job.current_step, job.step_progress, job.overall_progress = "", 0.0, 0.0
+        job.step_times, job._step_start = {}, 0.0
+        job.events.clear()   # in place: SSE generators re-sync on the shorter list
+        _store.save(job)
+        t = threading.Thread(target=_run_dialogue_revoice, args=(job, req), daemon=True)
+        job.worker_thread = t
+        t.start()
+    return {"status": "started"}
+
+
+_CLIP_NAME = re.compile(r"^[A-Za-z0-9_.-]+\.wav$")
+
+
+@app.get("/api/jobs/{job_id}/dialogue/clip/{name}")
+def get_dialogue_clip(job_id: str, name: str):
+    """A voiced line or speaker reference of the review (output_dir/clips)."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not _CLIP_NAME.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Invalid clip name")
+    dirs = [OUTPUTS / job.id / "dialogue_out" / "clips"]
+    if job.saved_folder:
+        dirs.append(Path(job.saved_folder) / "clips")
+    for d in dirs:
+        p = d / name
+        try:
+            if p.is_file() and p.resolve().parent == d.resolve():
+                return FileResponse(path=str(p), media_type="audio/wav", filename=name,
+                                    content_disposition_type="inline")
+        except OSError:
+            continue
+    raise HTTPException(status_code=404, detail="Clip not found")
+
+
+@app.get("/api/dialogue/voices")
+def dialogue_voices():
+    """Voices a dialogue speaker can be given, per TTS provider (the review
+    packet's voice_options shape); paid providers carry "paid": true."""
+    return _dialogue_voice_options()
+
+
+class VoicePreviewRequest(BaseModel):
+    provider: str = "edge"
+    voice: str
+    pitch: Optional[str] = None
+    text: str = ""
+
+
+VOICE_PREVIEW_TEXT = "नमस्ते, यह मेरी आवाज़ है।"
+
+
+@app.post("/api/dialogue/voice-preview")
+def dialogue_voice_preview(body: VoicePreviewRequest):
+    """A short Hindi sample of one bindable voice, as WAV. Cached per
+    (provider, voice, pitch, text); paid providers only with their key set."""
+    import hashlib
+    from dubbing.dialogue import tts as dialogue_tts
+    from dubbing.dialogue.speaker_registry import curated_pools
+    prov_name = (body.provider or "edge").strip()
+    pitch = (body.pitch or "").strip() or None
+    text = (body.text or "").strip() or VOICE_PREVIEW_TEXT
+    if len(text) > 300:
+        raise HTTPException(status_code=400, detail="Preview text is limited to 300 characters")
+    opts = _dialogue_voice_options().get(prov_name)
+    if opts is None:
+        raise HTTPException(status_code=400, detail=f"Unknown TTS provider {prov_name!r}")
+    if not _voice_option_ok(opts, body.voice, pitch):
+        raise HTTPException(status_code=400, detail=f"{prov_name} has no voice {body.voice!r}"
+                                                    + (f" with pitch {pitch}" if pitch else ""))
+    if not opts.get("preview"):
+        reason = ("its API key is not set" if opts.get("paid")
+                  else "it is a local model (heard in the job only)")
+        raise HTTPException(status_code=409, detail=f"No preview for {prov_name}: {reason}")
+    key = hashlib.sha1(f"{prov_name}|{body.voice}|{pitch or ''}|{text}".encode("utf-8")).hexdigest()[:20]
+    cache = OUTPUTS / "_voice_previews"
+    out = cache / f"{prov_name}_{key}.wav"
+    if not out.is_file():
+        provider = dialogue_tts.PROVIDER_CLASSES[prov_name]()
+        if getattr(provider, "paid", False) and not getattr(provider, "key", ""):
+            raise HTTPException(status_code=409, detail=f"No preview for {prov_name}: its API key is not set")
+        binding = {"voice": body.voice, "pitch": pitch, "rate": "+0%",
+                   "model": curated_pools().get(prov_name, {}).get("model", "")}
+        cache.mkdir(parents=True, exist_ok=True)
+        tmp = cache / f"{out.stem}.{uuid.uuid4().hex[:8]}.tmp.wav"
+        try:
+            provider.synthesize(text, binding, tmp)
+            os.replace(tmp, out)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"{prov_name} could not voice the sample: "
+                                                        f"{str(e)[:200]}")
+        finally:
+            tmp.unlink(missing_ok=True)
+            close = getattr(provider, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
+    return FileResponse(path=str(out), media_type="audio/wav", filename=out.name,
                         content_disposition_type="inline")
 
 
@@ -4160,7 +4768,9 @@ def delete_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.state in ("running", "queued"):
+    # A job paused for review still has a live worker (a hindi_dialogue job
+    # holds the pipeline slot and polls the cancel flag while it waits).
+    if job.state in ("running", "queued", "review_transcription", "review_translation"):
         # ── Phase 1 (synchronous, fast): signal + mark cancelled ──
         # Signal cancellation so the pipeline's _check_cancelled() raises at
         # its next checkpoint
