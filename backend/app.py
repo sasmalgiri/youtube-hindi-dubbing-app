@@ -424,6 +424,18 @@ STEP_WEIGHTS = {
     "synthesize": 0.30,
     "assemble": 0.10,
 }
+# Hindi Dialogue jobs spend their time differently: voice/music separation
+# (inside "extract") runs ~1.2x the video length before anything else, while
+# cloud ASR + diarization take seconds. With the classic weights the bar sat
+# at 15-20% for most of the job and then raced.
+DIALOGUE_STEP_WEIGHTS = {
+    "download": 0.05,
+    "extract": 0.35,
+    "transcribe": 0.10,
+    "translate": 0.10,
+    "synthesize": 0.30,
+    "assemble": 0.10,
+}
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 
@@ -432,6 +444,9 @@ MAX_JOBS = 200
 # Only run one pipeline at a time to avoid resource contention
 _pipeline_semaphore = threading.Semaphore(1)
 BASE_DIR = Path(__file__).resolve().parent
+# Job history (jobs.db) and the saved/completed link lists. Overridable so
+# the test suite never writes its throwaway jobs into the real history.
+STATE_DIR = Path(os.environ.get("VOICEDUB_STATE_DIR") or BASE_DIR)
 # Use a short temp path on Windows to avoid 260-char path limit (WinError 206)
 if os.name == "nt":
     _short_root = Path(os.environ.get("VOICEDUB_WORK", "C:/tmp/vd"))
@@ -457,7 +472,7 @@ SAVED_DIR.mkdir(parents=True, exist_ok=True)
 # Supabase secondary writer was removed because it added no value for a
 # single-machine workflow and the supabase package's websockets dependency
 # was broken on this Python install.
-_store = JobStore(BASE_DIR / "jobs.db")
+_store = JobStore(STATE_DIR / "jobs.db")
 _store.load_all(JOBS)
 
 # ── App ──────────────────────────────────────────────────────────────────────
@@ -486,14 +501,16 @@ def _english_source(lang: Optional[str]) -> str:
     return "en" if (lang or "auto") == "auto" else lang
 
 
-def _calc_overall(step: str, step_progress: float) -> float:
+def _calc_overall(step: str, step_progress: float,
+                  weights: Optional[Dict[str, float]] = None) -> float:
     """Calculate overall progress from current step and its progress."""
+    weights = weights or STEP_WEIGHTS
     overall = 0.0
     for s in STEP_ORDER:
         if s == step:
-            overall += STEP_WEIGHTS.get(s, 0) * step_progress
+            overall += weights.get(s, 0) * step_progress
             break
-        overall += STEP_WEIGHTS.get(s, 0)
+        overall += weights.get(s, 0)
     return min(overall, 1.0)
 
 
@@ -692,8 +709,9 @@ def _split_video(ffmpeg_path: str, video_path: Path, split_mins: int, output_dir
     return parts
 
 
-def _make_progress_callback(job: Job):
-    """Create a progress callback that updates the job and appends events."""
+def _make_progress_callback(job: Job, weights: Optional[Dict[str, float]] = None):
+    """Create a progress callback that updates the job and appends events.
+    `weights`: per-step share of the bar (default STEP_WEIGHTS)."""
     _prev_step = [job.current_step]  # mutable for closure
 
     def callback(step: str, progress: float, message: str):
@@ -715,7 +733,7 @@ def _make_progress_callback(job: Job):
 
         job.current_step = step
         job.step_progress = progress
-        job.overall_progress = _calc_overall(step, progress)
+        job.overall_progress = _calc_overall(step, progress, weights)
         job.message = message
 
         # Update job state for step-by-step pauses
@@ -1003,7 +1021,7 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         print("[hindi_dialogue] orchestrator has no on_legacy_pipeline hook: Cancel cannot "
               "stop its download/ASR subprocesses early", flush=True)
     try:
-        res = run_dialogue(cfg, on_progress=_make_progress_callback(job),
+        res = run_dialogue(cfg, on_progress=_make_progress_callback(job, DIALOGUE_STEP_WEIGHTS),
                            cancel_check=job.cancel_event.is_set, **run_kw)
     finally:
         job.pipeline_ref = None   # run over: nothing left to kill; /transcript shows the turns
@@ -4221,8 +4239,8 @@ def delete_job(job_id: str):
 
 # ── Saved Links (persistent) ─────────────────────────────────────────────────
 
-LINKS_FILE = BASE_DIR / "saved_links.json"
-COMPLETED_FILE = BASE_DIR / "completed_urls.json"
+LINKS_FILE = STATE_DIR / "saved_links.json"
+COMPLETED_FILE = STATE_DIR / "completed_urls.json"
 _links_lock = threading.Lock()
 
 
@@ -4449,8 +4467,13 @@ def _refresh_ytdlp() -> None:
         if stamp.exists() and time.time() - stamp.stat().st_mtime < YTDLP_CHECK_EVERY_DAYS * 86400:
             return
         before = _version("yt-dlp")
-        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]"],
-                           capture_output=True, text=True, timeout=300)
+        # -c constraints.txt: an unattended upgrade must never be able to drag
+        # torch/numpy/onnxruntime-gpu along if a future yt-dlp adds a dependency.
+        cmd = [sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]"]
+        constraints = Path(__file__).resolve().parent / "constraints.txt"
+        if constraints.exists():
+            cmd += ["-c", str(constraints)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode == 0:
             stamp.parent.mkdir(parents=True, exist_ok=True)
             stamp.write_text(time.strftime("%Y-%m-%d %H:%M"), encoding="utf-8")

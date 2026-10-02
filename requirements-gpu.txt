@@ -1,5 +1,15 @@
 # GPU-accelerated packages (optional, for Coqui XTTS v2 voice cloning)
-# Install with: pip install -r requirements-gpu.txt --extra-index-url https://download.pytorch.org/whl/cu126
+#
+# DO NOT install this on the owner's PC: it pins torch 2.6.0+cu126, which
+# would replace the working CUDA stack (torch 2.4.1+cu121 + the cuDNN that
+# faster-whisper/CTranslate2, pyannote and Demucs run on). The -c line below
+# applies backend/constraints.txt (the working versions), so pip now stops
+# with a conflict instead of swapping torch. Voice cloning on this PC needs
+# its own venv.
+#
+# Elsewhere (a separate venv): pip install -r requirements-gpu.txt --extra-index-url https://download.pytorch.org/whl/cu126
+# after deleting the -c line.
+-c backend/constraints.txt
 torch==2.6.0+cu126
 torchvision==0.21.0+cu126
 torchaudio==2.6.0+cu126

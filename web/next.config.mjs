@@ -1,7 +1,8 @@
 /** @type {import('next').NextConfig} */
-// desktop.py starts the backend on the first free port from 8000 and passes it
-// as BACKEND_PORT; proxying to a hard-coded 8000 sent the UI to the wrong (or
-// no) backend whenever 8000 was busy.
+// desktop.py always runs the backend on 8000 (it stops an older VoiceDub
+// backend there first, and refuses to start next to anything else) and still
+// passes BACKEND_PORT explicitly, so this proxy and the backend can never
+// disagree about the port.
 const BACKEND_PORT = process.env.BACKEND_PORT || '8000';
 
 const nextConfig = {

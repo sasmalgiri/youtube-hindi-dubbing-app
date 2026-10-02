@@ -371,3 +371,31 @@ def test_no_translated_lines_fails_before_tts_with_the_engine_errors(tmp_path):
     assert orch.all_clips == [] and res.output_video is None
     stages = {s.name: s.status for s in orch.report.stages}
     assert stages["translate"] == "failed" and "synthesize" not in stages
+
+
+# ── Groq word list -> segments ─────────────────────────────────────────────
+def test_boundary_word_goes_to_exactly_one_segment():
+    # Real case (airport video): "That's" starts exactly where the previous
+    # segment ends. The old ±0.01 s window put it into both segments, so the
+    # turn read "That's That's convenient." and the dub kept the English.
+    from dubbing.dialogue.orchestrator import _words_into_segments
+    segments = [{"start": 17.64, "end": 23.76, "text": "night."},
+                {"start": 23.76, "end": 27.92, "text": "That's convenient."}]
+    words = [{"word": "night.", "start": 17.64, "end": 18.1},
+             {"word": "That's", "start": 23.76, "end": 24.4},
+             {"word": "convenient.", "start": 24.4, "end": 25.52}]
+    segs = _words_into_segments(segments, words)
+    assert [w["word"] for w in segs[0]["words"]] == ["night."]
+    assert [w["word"] for w in segs[1]["words"]] == ["That's", "convenient."]
+    assert sum(len(s["words"]) for s in segs) == len(words)
+
+
+def test_word_just_outside_a_segment_still_attaches_once():
+    from dubbing.dialogue.orchestrator import _words_into_segments
+    segments = [{"start": 0.0, "end": 1.0, "text": "a"}, {"start": 2.0, "end": 3.0, "text": "b"}]
+    words = [{"word": "a", "start": 1.005, "end": 1.2},     # 5 ms after segment 0
+             {"word": "lost", "start": 1.5, "end": 1.6},    # in the gap: dropped, as before
+             {"word": "b", "start": 2.5, "end": 2.9}]
+    segs = _words_into_segments(segments, words)
+    assert [w["word"] for w in segs[0]["words"]] == ["a"]
+    assert [w["word"] for w in segs[1]["words"]] == ["b"]

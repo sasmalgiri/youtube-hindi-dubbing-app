@@ -7,9 +7,12 @@ import { formatTime, getLanguageName } from '@/lib/utils';
 interface TranscriptViewerProps {
     jobId: string;
     targetLanguage?: string;
+    // Only when the backend has a subtitle file for the job (the job page's
+    // hasSubtitles); an always-on link 404ed after the SRT moved to the saved folder.
+    showSrtLink?: boolean;
 }
 
-export default function TranscriptViewer({ jobId, targetLanguage = 'hi' }: TranscriptViewerProps) {
+export default function TranscriptViewer({ jobId, targetLanguage = 'hi', showSrtLink = false }: TranscriptViewerProps) {
     const [segments, setSegments] = useState<TranscriptSegment[]>([]);
     const [loading, setLoading] = useState(true);
 
@@ -43,7 +46,7 @@ export default function TranscriptViewer({ jobId, targetLanguage = 'hi' }: Trans
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-3 border-b border-border">
                 <h3 className="text-sm font-medium text-text-primary">Transcript</h3>
-                <a
+                {showSrtLink && <a
                     href={resultSrtUrl(jobId)}
                     download
                     className="text-xs text-primary hover:text-primary-light transition-colors flex items-center gap-1"
@@ -54,7 +57,7 @@ export default function TranscriptViewer({ jobId, targetLanguage = 'hi' }: Trans
                         <line x1="12" x2="12" y1="15" y2="3" />
                     </svg>
                     Download SRT
-                </a>
+                </a>}
             </div>
 
             {/* Column headers */}

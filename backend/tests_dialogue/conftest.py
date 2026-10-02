@@ -15,4 +15,7 @@ if str(BACKEND) not in sys.path:
 # job's folder. Tests get a throwaway work root (set before app is imported).
 _WORK = tempfile.mkdtemp(prefix="voicedub-tests-")
 os.environ["VOICEDUB_WORK"] = _WORK
+# ...and its own jobs.db / saved_links.json / completed_urls.json: the API tests
+# create jobs, which used to land in the real job history (32 ghost jobs found).
+os.environ["VOICEDUB_STATE_DIR"] = _WORK
 atexit.register(shutil.rmtree, _WORK, True)

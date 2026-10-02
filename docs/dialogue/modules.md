@@ -44,7 +44,7 @@ Nothing changes silently. Every change appears in the UI preview, in the job's e
 | | Groq LLM | free tier | cloud | `GROQ_API_KEY` | next in chain |
 | | Cerebras | free tier | cloud | `CEREBRAS_API_KEY` | next in chain |
 | | Ollama | free | local | Ollama running + a pulled instruct model named in `OLLAMA_MODEL` or the *Ollama model* option (never guessed) | next in chain |
-| | IndicTrans2 | free | local | IndicTransToolkit + transformers 4.x (separate venv), `HF_TOKEN` with access to the model (`INDICTRANS2_MODEL`, default `ai4bharat/indictrans2-en-indic-1B`; checked on huggingface.co, a check that cannot finish is only a warning) | next in chain |
+| | IndicTrans2 | free | local | IndicTransToolkit + transformers 4.x (in the app's Python here; a separate venv via `INDICTRANS2_PYTHON` also works), `HF_TOKEN` with access to the model (`INDICTRANS2_MODEL`, default `ai4bharat/indictrans2-en-indic-1B`; checked on huggingface.co, a check that cannot finish is only a warning) | next in chain |
 | | Google basic | free | cloud | deep-translator | next in chain |
 | | OpenAI | **paid** | cloud | `OPENAI_API_KEY` + Allow paid | next in chain |
 | Voices (chain) | Microsoft Edge | free | online | edge-tts | next provider |

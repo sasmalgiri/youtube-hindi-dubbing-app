@@ -474,13 +474,25 @@ def get_sarvam_key() -> str:
 # ── Gemini API Key Rotator ──────────────────────────────────────────────────
 # Rotates between GEMINI_API_KEY, GEMINI_API_KEY_2, ... GEMINI_API_KEY_10
 # Enables parallel Gemma 4 translation with multiple accounts. Thread-safe.
+def _is_refused_key_error(err) -> bool:
+    """A Google AI error that says the KEY itself is refused (revoked, invalid,
+    or "reported as leaked" -> 403 PERMISSION_DENIED) rather than rate-limited:
+    retrying that key can never succeed."""
+    code = getattr(err, "code", None) or getattr(err, "status_code", None)
+    text = str(err).lower()
+    return (code in (401, 403) or "api_key_invalid" in text or "api key not valid" in text
+            or "reported as leaked" in text or "permission_denied" in text)
+
+
 class _GeminiKeyRotator:
     def __init__(self):
         import threading
         self._lock = threading.Lock()
         self._keys = []
+        self._names = []     # env var of each key (never print the key itself)
         self._index = 0
         self._failures = {}  # key_index → last_failure_time
+        self._dead = set()   # key indexes refused by Google (401/403): skipped for good
         self._loaded = False
 
     def _load_keys(self):
@@ -490,37 +502,53 @@ class _GeminiKeyRotator:
         main = os.environ.get("GEMINI_API_KEY", "").strip()
         if main:
             self._keys.append(main)
+            self._names.append("GEMINI_API_KEY")
         for i in range(2, 20):
             k = os.environ.get(f"GEMINI_API_KEY_{i}", "").strip()
             if k:
                 self._keys.append(k)
+                self._names.append(f"GEMINI_API_KEY_{i}")
 
     def get_key(self) -> str:
-        """Get the next available Gemini API key (round-robin, skip rate-limited)."""
+        """Get the next available Gemini API key (round-robin, skip rate-limited
+        and refused keys). "" when every key has been refused."""
         with self._lock:
             self._load_keys()
-            if not self._keys:
+            live = [i for i in range(len(self._keys)) if i not in self._dead]
+            if not live:
                 return ""
             now = time.time()
             for _ in range(len(self._keys)):
                 idx = self._index % len(self._keys)
                 self._index += 1
+                if idx in self._dead:
+                    continue
                 last_fail = self._failures.get(idx, 0)
                 if now - last_fail > 30:  # 30s cooldown after rate limit
                     return self._keys[idx]
-            return self._keys[0]
+            return self._keys[live[0]]
 
-    def report_rate_limit(self, key: str):
-        """Mark a key as rate-limited."""
+    def report_rate_limit(self, key: str, err=None):
+        """Mark a key as rate-limited (30 s cooldown), or as refused for the
+        rest of this run when `err` says Google rejects the key itself (a
+        leaked/revoked key would otherwise burn an attempt every 30 s)."""
+        refused = err is not None and _is_refused_key_error(err)
         with self._lock:
+            self._load_keys()
             for i, k in enumerate(self._keys):
                 if k == key:
                     self._failures[i] = time.time()
+                    if refused and i not in self._dead:
+                        self._dead.add(i)
+                        print(f"[Gemini] {self._names[i]} refused by Google "
+                              f"({type(err).__name__}: {str(err)[:90]}) — not used again "
+                              f"until restart; replace it in backend/.env", flush=True)
                     break
 
     def count(self) -> int:
+        """Usable keys (loaded minus refused)."""
         self._load_keys()
-        return len(self._keys)
+        return len(self._keys) - len(self._dead)
 
 _gemini_keys = _GeminiKeyRotator()
 
@@ -2947,7 +2975,7 @@ class Pipeline:
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
-        shutil.copy2(srt_translated, out_srt)
+        self._write_output_srt(srt_translated, out_srt)
 
         self._report("assemble", 1.0, "Done!")
 
@@ -3101,7 +3129,7 @@ class Pipeline:
         # Copy SRT
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
         if srt_translated.exists():
-            shutil.copy2(srt_translated, out_srt)
+            self._write_output_srt(srt_translated, out_srt)
 
         self._report("assemble", 1.0, "Done!")
 
@@ -3251,7 +3279,7 @@ class Pipeline:
             self._assemble_video_adapts_to_audio(video_path, audio_raw, tts_data, video_duration)
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
         if srt_path.exists():
-            shutil.copy2(srt_path, out_srt)
+            self._write_output_srt(srt_path, out_srt)
         self._report("assemble", 1.0, "Done!")
 
     def download_and_extract(self):
@@ -3414,7 +3442,7 @@ class Pipeline:
 
         # Copy SRT to output
         out_srt = self.cfg.output_path.parent / f"subtitles_{self.cfg.target_language}.srt"
-        shutil.copy2(srt_translated, out_srt)
+        self._write_output_srt(srt_translated, out_srt)
 
         self._report("assemble", 1.0, "Done!")
 
@@ -5084,7 +5112,22 @@ class Pipeline:
                     daemon=True,
                 )
                 p.start()
-                p.join(timeout=child_timeout)
+                # Poll instead of one blocking join (up to 15 min): Cancel kills
+                # the child at once, and a heartbeat shows the step is alive.
+                t0 = last_beat = time.time()
+                while p.is_alive() and time.time() - t0 < child_timeout:
+                    p.join(1.0)
+                    if self._cancel_check():
+                        p.kill()
+                        p.join(5)
+                        raise RuntimeError("Job cancelled by user")
+                    now = time.time()
+                    if p.is_alive() and now - last_beat >= 10:
+                        last_beat = now
+                        self._report("transcribe",
+                                     min(0.9, 0.1 + 0.8 * (now - t0) / max(60.0, _audio_dur * 0.5)),
+                                     f"Whisper ({model}) transcribing on {device.upper()}... "
+                                     f"{int(now - t0)}s")
                 if p.is_alive():
                     p.kill()
                     p.join(5)
@@ -5368,7 +5411,7 @@ class Pipeline:
                     )
                     return (response.text or "").strip()
                 except Exception as e:
-                    _gemini_keys.report_rate_limit(worker_key)
+                    _gemini_keys.report_rate_limit(worker_key, e)
                     if attempt < retries - 1:
                         # Get a different key for retry
                         worker_key = get_gemini_key() or api_key
@@ -5851,7 +5894,7 @@ class Pipeline:
                             seg["text"] = simplified[i].strip()
                     return True
                 except Exception as e:
-                    _gemini_keys.report_rate_limit(worker_key)
+                    _gemini_keys.report_rate_limit(worker_key, e)
                     if attempt < 2:
                         worker_key = get_gemini_key() or gemini_key
                         worker_client = genai.Client(api_key=worker_key)
@@ -6435,6 +6478,13 @@ class Pipeline:
                     break
                 except Exception as e:
                     best = self._better_partial(best, e)
+                    # Next try on the next key: retrying the same key repeats a
+                    # 429 (quota) or a refused key (403) three times.
+                    _gemini_keys.report_rate_limit(api_key, e)
+                    nxt = get_gemini_key()
+                    if nxt and nxt != api_key:
+                        api_key = nxt
+                        client = genai.Client(api_key=api_key)
                     if attempt < retries - 1:
                         wait = 2 * (attempt + 1)
                         self._report("translate", 0.1 + 0.8 * (batch_idx / total_batches),
@@ -6527,7 +6577,7 @@ class Pipeline:
                     break
                 except Exception as e:
                     best = self._better_partial(best, e)
-                    _gemini_keys.report_rate_limit(worker_key)
+                    _gemini_keys.report_rate_limit(worker_key, e)
                     if attempt < 2:
                         worker_key = get_gemini_key() or api_key
                         worker_client = genai.Client(api_key=worker_key)
@@ -7246,16 +7296,35 @@ class Pipeline:
         src = self.cfg.source_language if self.cfg.source_language != "auto" else "auto"
         translator = GoogleTranslator(source=src, target=self.cfg.target_language)
 
+        # Google's free endpoint answers HTTP 429 for every call once it blocks
+        # an IP (it does on this PC): stop at the first 429 and say so, and let
+        # stage 2 translate from English, instead of quietly handing English
+        # to a "polish" prompt that is told it is reading Hindi.
+        google_blocked = None
         for i, seg in enumerate(segments):
+            if google_blocked is not None:
+                seg["text_translated"] = seg["text"]
+                continue
             try:
                 seg["text_translated"] = translator.translate(seg["text"]) or seg["text"]
-            except Exception:
+            except Exception as e:
                 seg["text_translated"] = seg["text"]
+                if (type(e).__name__ == "TooManyRequests" or "429" in str(e)
+                        or "too many requests" in str(e).lower()):
+                    google_blocked = e
+                    self._report("translate", 0.40,
+                                 "Google Translate is blocking this PC (HTTP 429): stage 1 skipped, "
+                                 "the LLM stage translates from English")
+                    self.result_warnings.append(
+                        "Google Translate blocked (HTTP 429): Google + Polish ran as LLM-only "
+                        "translation from English")
+                    continue
             if (i + 1) % 20 == 0 or i == total - 1:
                 self._report("translate", 0.02 + 0.38 * ((i + 1) / total),
                              f"Stage 1/2: Google Translate {i + 1}/{total}")
 
-        self._report("translate", 0.40, "Stage 1 complete. Starting LLM polish...")
+        if google_blocked is None:
+            self._report("translate", 0.40, "Stage 1 complete. Starting LLM polish...")
 
         # ── Stage 2: LLM Polish ──────────────────────────────────────────
         groq_key = get_groq_key()
@@ -7287,6 +7356,13 @@ class Pipeline:
                 "Keep same meaning, just make it punchy and natural.\n\n"
                 "GOOGLE TRANSLATED:\n"
             )
+            if google_blocked is not None:
+                polish_prefix = (
+                    "These lines are ENGLISH (Google Translate was unavailable). Translate each "
+                    "into natural spoken Hindi narration in Devanagari, following the rules above. "
+                    "Each line must sound like it was WRITTEN in Hindi. Keep the same meaning.\n\n"
+                    "ENGLISH:\n"
+                )
         else:
             polish_system = (
                 f"You are a {target_name} language polishing expert. You receive Google-translated "
@@ -8829,6 +8905,11 @@ class Pipeline:
         # ── ASSEMBLY MANAGER: Verify + fix timeline before building video ──
         # ══════════════════════════════════════════════════════════════════
 
+        # The line's own span, before the overlap cascade below moves start/end:
+        # _write_output_srt finds each line's subtitle text by it.
+        for tts in tts_data:
+            tts.setdefault("_src_span", (tts.get("start", 0), tts.get("end", tts.get("start", 0))))
+
         # 1. SORT: Guarantee original video order
         tts_data = sorted(tts_data, key=lambda t: t.get("start", 0))
 
@@ -9103,6 +9184,7 @@ class Pipeline:
                 "type": "speech",
                 "video_start": seg_start,
                 "video_end": seg_end,
+                "src_span": tts.get("_src_span", (seg_start, seg_end)),
                 "pts_factor": pts_factor,
                 "freeze": freeze,
                 "freeze_target_dur": freeze_target_dur,
@@ -9321,6 +9403,10 @@ class Pipeline:
                         "start": audio_timeline_pos,
                         "wav": wav_path,
                         "duration": sec["tts_dur"],
+                        # source span of the line: maps its placed audio back to
+                        # its subtitle text (_write_output_srt)
+                        "src_start": sec["src_span"][0],
+                        "src_end": sec["src_span"][1],
                     })
                 else:
                     print(f"[Assembly Manager] Section {idx}: WAV missing/corrupt, "
@@ -9340,6 +9426,10 @@ class Pipeline:
               f"placed across {total_output_dur:.0f}s video", flush=True)
 
         audio_segments = self._truncate_overlaps(audio_segments)
+        # Where each line's audio really plays in the output, after the reflow
+        # above: the deliverable SRT is written from this (_write_output_srt).
+        self._placed_speech = [(a["src_start"], a["src_end"], a["start"], a["duration"])
+                               for a in audio_segments if "src_start" in a]
         tts_audio = self._build_timeline(audio_segments, total_output_dur, prefix="adapted_")
 
         # Mix original audio at low volume if requested
@@ -9360,6 +9450,40 @@ class Pipeline:
         "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv",
         "sw", "tr", "zh",
     }
+
+    def _write_output_srt(self, srt_src, out_srt) -> None:
+        """Write the deliverable subtitles.
+
+        With audio as master (_assemble_video_adapts_to_audio) the output is
+        NOT on the source timeline: clips are stretched or shrunk to their
+        Hindi audio, gaps become micro-gaps and overlaps are reflowed, so the
+        source-timed SRT ran up to ~15 s behind the dubbed speech by the end
+        of a 5-min video. When assembly recorded where every line's audio
+        plays, each cue goes there; otherwise (e.g. Tempo Match, which keeps
+        the source timeline) the source-timed SRT is copied as before.
+        """
+        placed = getattr(self, "_placed_speech", None) or []
+        segs = getattr(self, "_split_tts_segments", None) or []
+        texts = {}
+        for seg in segs:
+            t = (seg.get("text_translated") or "").strip()
+            if t:
+                key = (round(float(seg.get("start", 0)), 2), round(float(seg.get("end", 0)), 2))
+                texts.setdefault(key, t)
+        cues = []
+        for src_start, src_end, out_start, dur in placed:
+            t = texts.get((round(float(src_start), 2), round(float(src_end), 2)))
+            if t:
+                cues.append({"start": out_start, "end": out_start + max(float(dur), 0.3),
+                             "text_translated": t})
+        if placed and texts and len(cues) >= 0.9 * len(texts):
+            write_srt(cues, Path(out_srt), text_key="text_translated")
+            print(f"[SRT] {len(cues)} subtitle cues written on the dubbed timeline", flush=True)
+            return
+        if placed:
+            print(f"[SRT] matched only {len(cues)}/{len(texts)} lines to their placed audio: "
+                  f"subtitles keep the source timings", flush=True)
+        shutil.copy2(srt_src, out_srt)
 
     def _split_segments_at_sentences(self, segments):
         """Split multi-sentence segments so each sentence is its own segment.

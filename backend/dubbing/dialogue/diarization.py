@@ -133,8 +133,12 @@ def run_pyannote(wav_path: Path, hf_token: str, model: str = "community-1",
         from importlib.metadata import version as _pkg_version
         version = _pkg_version("pyannote.audio")
     except Exception as e:
+        # Not `pip install -r requirements-dialogue.txt`: pyannote.audio 4.x
+        # declares torch>=2.8, so an unconstrained install swaps the CUDA torch.
         raise DiarizationUnavailable(
-            "pyannote.audio is not installed (pip install -r backend/requirements-dialogue.txt)") from e
+            "pyannote.audio is not installed. Install it as docs/dialogue/README.md "
+            "('Setup') describes, always with -c backend/constraints.txt: a plain pip "
+            "install replaces the CUDA torch") from e
     major = int(version.split(".")[0]) if version[:1].isdigit() else 0
 
     order = [model] + [m for m in MODEL_IDS if m != model]
