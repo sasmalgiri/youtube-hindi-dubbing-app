@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -379,7 +380,8 @@ def final_mix(dialogue_bus: Path, background: Optional[Path], out: Path,
 def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
         subtitles: Optional[Path] = None, *, original_audio: bool = False,
         extra_subtitles: Optional[List[Tuple[Path, str, str]]] = None,
-        burn_subtitles: Optional[Path] = None, container: str = "mp4") -> Path:
+        burn_subtitles: Optional[Path] = None, container: str = "mp4",
+        cancel_check: Optional[Callable[[], bool]] = None) -> Path:
     """Video + Hindi mix -> ``out``, with optional extra tracks.
 
     * Hindi audio is always the first, default audio track; with
@@ -390,10 +392,18 @@ def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
       are never default (FFmpeg's mp4 muxer still enables the first
       subtitle track it writes). mp4 stores them as mov_text, mkv as SRT.
     * ``burn_subtitles`` draws that SRT into the picture (the video is
-      re-encoded); otherwise the video stream is copied untouched.
+      re-encoded); otherwise the video stream is copied untouched. With
+      lines burned in, no soft subtitle track is shown by default: in mkv
+      they are all non-default, and an mp4 gets none (its player shows
+      the first subtitle track whatever its flags: the lines twice).
     * ``container`` "mp4" (+faststart) or "mkv" sets the format whatever
       the file name says.
-    An SRT with no cues is left out rather than failing the mux.
+    * ``cancel_check``: polled while FFmpeg runs (a burn-in re-encode takes
+      minutes); once true, FFmpeg is killed and RuntimeError("... cancelled
+      by user") raised.
+    An SRT with no cues is left out rather than failing the mux. The file is
+    written next to ``out`` and renamed into place only when FFmpeg
+    succeeded: a failed or cancelled mux leaves ``out`` as it was.
     """
     mkv = str(container or "mp4").lower() == "mkv"
     # (path, language, title, default) per soft subtitle stream, in order
@@ -408,6 +418,8 @@ def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
     if burn and not audio.has_filter("subtitles"):
         raise RuntimeError("this FFmpeg build has no 'subtitles' filter (libass), "
                            "so subtitles cannot be burned into the video")
+    if burn:
+        subs = [(p, lang, title, False) for p, lang, title, _ in subs] if mkv else []
 
     args = ["-i", str(video), "-i", str(mix_wav)]
     for path, *_ in subs:
@@ -438,12 +450,41 @@ def mux(video: Path, mix_wav: Path, out: Path, bitrate: str = "192k",
             args += [f"-metadata:s:{kind}:{i}", f"title={title}"]
             if not mkv:  # mp4 players show the handler name as the track name
                 args += [f"-metadata:s:{kind}:{i}", f"handler_name={title}"]
+    out = Path(out)
+    part = out.with_name(f".{out.stem}.partial{out.suffix}")
     if mkv:
-        args += ["-f", "matroska", str(out)]
+        args += ["-f", "matroska", str(part)]
     else:
-        args += ["-movflags", "+faststart", "-f", "mp4", str(out)]
-    audio.run_ffmpeg(args)
+        args += ["-movflags", "+faststart", "-f", "mp4", str(part)]
+    try:
+        _run_ffmpeg(args, cancel_check)
+        os.replace(part, out)
+    finally:
+        part.unlink(missing_ok=True)
     return out
+
+
+def _run_ffmpeg(args: Sequence[str], cancel_check: Optional[Callable[[], bool]] = None):
+    """audio.run_ffmpeg, or with `cancel_check` a run that is killed once it
+    returns true (raises RuntimeError "... cancelled by user")."""
+    if cancel_check is None:
+        return audio.run_ffmpeg(args)
+    if cancel_check():
+        raise RuntimeError("Job cancelled by user before the video was written")
+    cmd = [audio.find_ffmpeg(), "-hide_banner", "-nostdin", "-y", *map(str, args)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace")
+    while True:
+        try:
+            _, err = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_check():
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError("Job cancelled by user while the video was being written")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {(err or '')[-800:]}")
 
 
 def _has_cues(srt: Path) -> bool:

@@ -404,6 +404,93 @@ def _new_children_killer() -> Callable[[], None]:
     return kill
 
 
+# ── per-run deliverables: a new run never destroys the last good result ──
+# While a run is in progress, the previous run's deliverables (everything in
+# output_dir) and its checkpoint wait in work_dir/previous_run. A finished run
+# drops them; a run that fails or is cancelled (or a process that stopped
+# mid-run) gets them back, and what it wrote itself goes to work_dir/failed_run.
+PREVIOUS_RUN_DIR = "previous_run"
+FAILED_RUN_DIR = "failed_run"
+
+
+def _deliverables(output_dir: Path, work_dir: Path) -> List[Path]:
+    """Everything in output_dir except the work folder (the CLI's default
+    work folder is inside the output folder)."""
+    try:
+        wd = Path(work_dir).resolve()
+        return sorted(p for p in Path(output_dir).iterdir() if p.resolve() != wd)
+    except FileNotFoundError:
+        return []
+
+
+def stash_previous_outputs(work_dir: Path, output_dir: Path) -> bool:
+    """Before a run writes to output_dir: move the earlier run's files to
+    work_dir/previous_run (with a copy of the checkpoint they match). True
+    when there was anything to move. If a file cannot be moved (open in
+    another program), what was moved is put back and OSError raised."""
+    work_dir, output_dir = Path(work_dir), Path(output_dir)
+    if work_dir.resolve() == output_dir.resolve():
+        return False                                     # one folder for both: nothing to tell apart
+    recover_interrupted_run(work_dir, output_dir)       # an earlier run that never finished
+    items = _deliverables(output_dir, work_dir)
+    if not items:
+        return False
+    prev = work_dir / PREVIOUS_RUN_DIR
+    shutil.rmtree(prev, ignore_errors=True)
+    (prev / "outputs").mkdir(parents=True)
+    ckpt = checkpoint.checkpoint_path(work_dir)
+    if ckpt.is_file():
+        shutil.copy2(ckpt, prev / "state.json")
+    moved: List[Path] = []
+    try:
+        for p in items:
+            shutil.move(str(p), str(prev / "outputs" / p.name))
+            moved.append(p)
+    except OSError:
+        for p in moved:
+            shutil.move(str(prev / "outputs" / p.name), str(p))
+        shutil.rmtree(prev, ignore_errors=True)
+        raise
+    return True
+
+
+def recover_interrupted_run(work_dir: Path, output_dir: Path) -> Optional[Path]:
+    """Put back the outputs (and checkpoint) a run moved aside and never
+    released: that run failed, was cancelled or its process stopped. What
+    it wrote goes to work_dir/failed_run, which is returned (None when
+    nothing was waiting). Safe to call again after a partial put-back
+    (a file that could not be moved): it carries on where it stopped."""
+    work_dir, output_dir = Path(work_dir), Path(output_dir)
+    prev = work_dir / PREVIOUS_RUN_DIR
+    if not prev.is_dir():
+        return None
+    failed = work_dir / FAILED_RUN_DIR
+    cleared = prev / "output_cleared"        # this run's files are out of output_dir
+    if not cleared.exists():
+        shutil.rmtree(failed, ignore_errors=True)
+        failed.mkdir(parents=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for p in _deliverables(output_dir, work_dir):
+            shutil.move(str(p), str(failed / p.name))
+        cleared.touch()
+    stashed = prev / "outputs"
+    for p in sorted(stashed.iterdir()) if stashed.is_dir() else []:
+        shutil.move(str(p), str(output_dir / p.name))
+    if (prev / "state.json").is_file():
+        ckpt = checkpoint.checkpoint_path(work_dir)
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ckpt.with_name(ckpt.name + ".restore")
+        shutil.copy2(prev / "state.json", tmp)
+        os.replace(tmp, ckpt)
+    shutil.rmtree(prev, ignore_errors=True)
+    return failed
+
+
+def release_previous_outputs(work_dir: Path) -> None:
+    """The run finished: the earlier run's files are no longer needed."""
+    shutil.rmtree(Path(work_dir) / PREVIOUS_RUN_DIR, ignore_errors=True)
+
+
 def _speakers_off_reason(cfg: DialogueConfig) -> str:
     """Why the module resolver -- not the user -- switched speaker detection
     off (e.g. no HF token), or "" when one voice was the user's choice."""
@@ -590,9 +677,18 @@ class DialogueOrchestrator:
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
         self.report.config = cfg.public()
         self.report.environment = _environment()
+        # The earlier run's files (a re-voice, or a run into the same folder)
+        # are moved aside: nothing stale is mixed into this run's outputs,
+        # and they come back if this run does not finish.
+        try:
+            stashed = stash_previous_outputs(cfg.work_dir, cfg.output_dir)
+        except OSError as e:
+            return self._unstarted(f"the previous run's outputs could not be moved aside "
+                                   f"({str(e)[:200]}); nothing was changed")
         aborted = ""
         try:
             self._run_stages()
+            self._check_cancel()        # a cancel during the final mix still cancels
         except Cancelled:
             aborted = STATUS_CANCELLED
         except BaseException as e:  # noqa: BLE001 - record and keep partial assets
@@ -609,8 +705,44 @@ class DialogueOrchestrator:
         mp = cfg.output_dir / "report.md"
         video = Path(self.report.outputs["video"]) if self.report.outputs.get("video") else None
         subs = Path(self.report.outputs["subtitles_srt"]) if self.report.outputs.get("subtitles_srt") else None
+        if stashed and aborted:
+            # Did not finish: the earlier outputs and their checkpoint go back;
+            # this run's own files (its report) are kept in work_dir/failed_run.
+            failed = self._put_back_previous_outputs()
+            jp, mp, video, subs = failed / "report.json", failed / "report.md", None, None
+        elif stashed:
+            release_previous_outputs(cfg.work_dir)
         return DialogueResult(self.report.final_status, video, jp, mp, subs,
                               self.report.status_reasons, self.turns)
+
+    def _put_back_previous_outputs(self) -> Path:
+        """recover_interrupted_run for this run, with its report rewritten to
+        point at where its files now are (work_dir/failed_run)."""
+        cfg, r = self.cfg, self.report
+        failed = recover_interrupted_run(cfg.work_dir, cfg.output_dir) or cfg.work_dir / FAILED_RUN_DIR
+        out = cfg.output_dir.resolve()
+        for k, v in list(r.outputs.items()):
+            try:
+                if v and Path(v).resolve().parent == out:
+                    r.outputs[k] = str(failed / Path(v).name)
+            except (OSError, ValueError):
+                pass
+        r.limitations.append("this run did not finish: the previous run's outputs and checkpoint "
+                             "were put back unchanged")
+        try:
+            write_report(r, failed)
+        except OSError:
+            pass
+        return failed
+
+    def _unstarted(self, why: str) -> DialogueResult:
+        """A run that could not start: reported (in work_dir/failed_run), nothing touched."""
+        r, failed = self.report, self.cfg.work_dir / FAILED_RUN_DIR
+        r.unresolved_failures.append(why)
+        r.final_status, r.status_reasons = derive_status(r, STATUS_FAILED)
+        shutil.rmtree(failed, ignore_errors=True)
+        jp, mp = write_report(r, failed)
+        return DialogueResult(r.final_status, None, jp, mp, None, r.status_reasons, self.turns)
 
     # ── stages ─────────────────────────────────────────────────────────
     def _run_stages(self):
@@ -1727,12 +1859,9 @@ class DialogueOrchestrator:
                     r.limitations.append(f"output option {k} is not supported by this build's muxer")
             if "container" not in kw:
                 container = "mp4"
+            kw.update(_supported_kwargs(mix.mux, cancel_check=self.cancel_check))
             video_out = out / f"dubbed_hi.{container}"
-            for other in ("mp4", "mkv"):
-                if other != container:
-                    (out / f"dubbed_hi.{other}").unlink(missing_ok=True)   # stale, earlier run
-            mix.mux(self.video, final_wav, video_out, cfg.audio_bitrate,
-                    subtitles=srt if cfg.embed_subtitles else None, **kw)
+            self._mux(video_out, final_wav, srt if cfg.embed_subtitles else None, kw)
             info = audio.probe_streams(video_out)
             if not (info.get("video") and info.get("audio")):
                 raise RuntimeError(f"muxed {container.upper()} is missing a stream")
@@ -1744,6 +1873,30 @@ class DialogueOrchestrator:
             shutil.copy2(p, out / Path(p).name)
         r.outputs.update(outputs)
         st.detail = f"{n_tracks} dialogue track(s); background={sep['status']}"
+
+    def _mux(self, video_out: Path, final_wav: Path, subtitles: Optional[Path], kw: Dict[str, Any]):
+        """mix.mux, falling back to soft subtitles when the Hindi lines cannot
+        be burned into the picture (no libass/libx264, an encode error): the
+        dub is still delivered and the missing burn-in reported."""
+        r, cfg = self.report, self.cfg
+        try:
+            mix.mux(self.video, final_wav, video_out, cfg.audio_bitrate, subtitles=subtitles, **kw)
+        except Exception as e:  # noqa: BLE001
+            if not kw.get("burn_subtitles") or self.cancel_check() or "cancelled by user" in str(e).lower():
+                raise
+            r.unresolved_failures.append(
+                f"the Hindi subtitles could not be burned into the picture ({str(e)[:200]}): "
+                f"they are a soft subtitle track instead")
+            kw = dict(kw, burn_subtitles=None)
+            mix.mux(self.video, final_wav, video_out, cfg.audio_bitrate, subtitles=subtitles, **kw)
+            return
+        burned = kw.get("burn_subtitles")
+        if burned and mix._has_cues(burned) and kw.get("container", "mp4") == "mp4" and \
+                (subtitles or kw.get("extra_subtitles")):
+            r.limitations.append(
+                "the Hindi subtitles are burned into an MP4, so no soft subtitle track was added "
+                "(an MP4 player shows its first one, which would draw the lines twice); the .srt "
+                "files are next to the video, or choose MKV to keep them as optional tracks")
 
     def _close_local_models(self):
         for obj in list((self.c.tts_providers or {}).values()) + list(self.c.mt_engines or []):
@@ -1784,9 +1937,14 @@ class DialogueOrchestrator:
         if self._vm_errors:
             r.limitations.append(f"voice matching failed on {len(self._vm_errors)} clip(s) "
                                  f"(first: {self._vm_errors[0]}); those keep the stock voice")
-        if not aborted and r.outputs.get("audio_mix"):
+        translated = any(s.name == "translate" and s.status in ("ok", "skipped") for s in r.stages)
+        if (not aborted and r.outputs.get("audio_mix")) or \
+                (aborted == STATUS_FAILED and translated and self.turns):
             # The run produced audio: the after-run review packet (with the
             # accepted clips in output_dir/clips/) is what a re-voice starts from.
+            # A run that failed after translating writes one too (clips only
+            # for the lines voiced so far): the lines and voices as they now
+            # stand, so they can be fixed and re-voiced from the checkpoint.
             try:
                 packet = self.build_review_packet("after_run")
                 r.outputs["review"] = str(checkpoint.write_json_atomic(out / "review.json", packet))
