@@ -8,6 +8,13 @@ REM  app runs a newer transformers, so it gets its OWN Python environment:
 REM    - Indic Parler-TTS (free local Hindi voices)  -> backend\.venvs\parler
 REM  and its path is recorded in backend\.env (INDIC_PARLER_PYTHON).
 REM
+REM  At the end it offers the OPTIONAL, EXPERIMENTAL "Sound like the original
+REM  speaker" option (OpenVoice v2 tone colour converter). OpenVoice pins
+REM  numpy 1.22.0 and librosa 0.9.1, so it gets its own environment too:
+REM    - OpenVoice                                    -> backend\.venvs\openvoice
+REM  recorded as OPENVOICE_PYTHON in backend\.env. Set up only OpenVoice with:
+REM    setup_local_ai.bat openvoice
+REM
 REM  The main app's Python is never changed: no pip install/upgrade of torch,
 REM  numpy, transformers, onnxruntime or anything else runs there. Every pip
 REM  command below uses the venv's own python.exe.
@@ -26,7 +33,8 @@ REM  Python when IndicTransToolkit is installed there. Its default model is
 REM  ai4bharat/indictrans2-en-indic-1B (accept its terms on huggingface.co).
 REM
 REM  Not yet run end to end on this PC: if a step fails, run that pip command
-REM  by hand and send the error. To start over, delete backend\.venvs\parler.
+REM  by hand and send the error. To start over, delete backend\.venvs\parler
+REM  (or backend\.venvs\openvoice).
 REM ===========================================================================
 
 set "ROOT=%~dp0"
@@ -44,6 +52,7 @@ if not defined BASEPY (
     pause
     exit /b 1
 )
+if /i "%~1"=="openvoice" goto :openvoice
 
 if not exist "%PYV%" (
     echo   Creating %VENV% with Python 3.10 ...
@@ -80,6 +89,65 @@ if errorlevel 1 (
     >> "%ROOT%backend\.env" echo INDIC_PARLER_PYTHON=%PYV%
     echo   Added INDIC_PARLER_PYTHON to backend\.env
 )
+echo   Indic Parler-TTS is set up.
+
+echo.
+echo   OPTIONAL, EXPERIMENTAL: "Sound like the original speaker" (OpenVoice v2)
+echo   changes the colour of each Hindi voice toward the original speaker's own
+echo   voice. It needs its own Python env (about 3 GB more) and a GPU for usable speed.
+set "OVANS="
+set /p "OVANS=  Set it up now? [y/N] "
+if /i not "%OVANS%"=="y" goto :done
+
+:openvoice
+set "OVENV=%ROOT%backend\.venvs\openvoice"
+set "OVPY=%OVENV%\Scripts\python.exe"
+if not exist "%OVPY%" (
+    echo   Creating %OVENV% with Python 3.10 ...
+    %BASEPY% -m venv "%OVENV%" || goto :fail
+)
+"%OVPY%" -m pip install --upgrade pip || goto :fail
+
+REM Same torch as the main app and the Parler venv, held there by a
+REM constraints file (OpenVoice's watermark model needs torchaudio).
+echo   Installing PyTorch 2.4.1 + torchaudio (CUDA 12.1) into the OpenVoice venv...
+"%OVPY%" -m pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121 || goto :fail
+(
+    echo torch==2.4.1
+    echo torchaudio==2.4.1
+) > "%OVENV%\constraints.txt"
+
+REM From GitHub (OpenVoice is not on PyPI); the zip archive when git is not
+REM installed. setuptools 69: librosa 0.9.1 imports pkg_resources, which newer
+REM setuptools no longer ship.
+set "OVSRC=git+https://github.com/myshell-ai/OpenVoice.git"
+where git >nul 2>&1 || set "OVSRC=https://github.com/myshell-ai/OpenVoice/archive/refs/heads/main.zip"
+echo   Installing OpenVoice (pins numpy 1.22.0, librosa 0.9.1) into the venv...
+"%OVPY%" -m pip install "%OVSRC%" huggingface_hub setuptools==69.5.1 -c "%OVENV%\constraints.txt" && goto :ovcheck
+
+REM OpenVoice also pins its demo UI and its own reference-splitting ASR
+REM (gradio 3.48, faster-whisper 0.9 with PyAV 10, whisper-timestamped). The
+REM tone colour converter uses none of them, and the app does not ask for
+REM them; retry with only what the converter imports.
+echo   Full install failed; installing only what the tone colour converter needs...
+"%OVPY%" -m pip install --no-deps "%OVSRC%" || goto :fail
+"%OVPY%" -m pip install librosa==0.9.1 wavmark==0.0.3 numpy==1.22.0 eng_to_ipa==0.0.2 inflect==7.0.0 unidecode==1.3.7 pypinyin==0.50.0 cn2an==0.5.22 jieba==0.42.1 pydub==0.25.1 langid==1.1.6 soundfile huggingface_hub setuptools==69.5.1 -c "%OVENV%\constraints.txt" || goto :fail
+
+:ovcheck
+"%OVPY%" -c "from openvoice.api import ToneColorConverter; import torch; print('  openvoice ok, cuda =', torch.cuda.is_available())" || goto :fail
+echo   Checking the venv the way the app does...
+set "OPENVOICE_PYTHON=%OVPY%"
+%BASEPY% -c "import runpy, sys; ok, why = runpy.run_path(sys.argv[1])['runtime_status']('openvoice'); print('  app check:', why); sys.exit(0 if ok else 1)" "%ROOT%backend\dubbing\dialogue\local_workers.py" || goto :fail
+findstr /b /c:"OPENVOICE_PYTHON=" "%ROOT%backend\.env" >nul 2>&1
+if errorlevel 1 (
+    >> "%ROOT%backend\.env" echo.
+    >> "%ROOT%backend\.env" echo OPENVOICE_PYTHON=%OVPY%
+    echo   Added OPENVOICE_PYTHON to backend\.env
+)
+echo   OpenVoice is set up. Its converter checkpoint (about 130 MB) downloads into
+echo   backend\models\openvoice the first time a job uses it.
+
+:done
 echo.
 echo   Done. Restart VoiceDub, then check with:
 echo     cd backend ^&^& %BASEPY% -m dubbing.dialogue modules --preset free-local
