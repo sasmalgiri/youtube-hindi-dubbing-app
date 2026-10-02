@@ -7,6 +7,10 @@ Python interpreter (a separate venv):
 
     INDIC_PARLER_PYTHON=C:\\...\\venv-parler\\Scripts\\python.exe
     INDICTRANS2_PYTHON=C:\\...\\venv-indictrans2\\Scripts\\python.exe
+    OPENVOICE_PYTHON=C:\\...\\venv-openvoice\\Scripts\\python.exe
+
+(OpenVoice, the optional "sound like the original speaker" converter, pins
+numpy 1.22 and librosa 0.9.1, far older than the main app's.)
 
 If unset, the current interpreter is used. runtime_status() tells whether
 the configured interpreter can really run a model: the libraries must be
@@ -33,17 +37,30 @@ from typing import Any, Dict, List, Optional, Tuple
 # This module must stay importable on its own (standard library only at
 # module level): the runtime check runs it inside the model's interpreter.
 WORKER_DIR = Path(__file__).resolve().parent / "workers"
-INTERPRETER_ENV = {"parler": "INDIC_PARLER_PYTHON", "indictrans2": "INDICTRANS2_PYTHON"}
-SCRIPT = {"parler": "parler_worker.py", "indictrans2": "indictrans2_worker.py"}
+INTERPRETER_ENV = {"parler": "INDIC_PARLER_PYTHON", "indictrans2": "INDICTRANS2_PYTHON",
+                   "openvoice": "OPENVOICE_PYTHON"}
+SCRIPT = {"parler": "parler_worker.py", "indictrans2": "indictrans2_worker.py",
+          "openvoice": "openvoice_worker.py"}
 CHECK_MODULES = {"parler": ["parler_tts", "transformers", "torch"],
-                 "indictrans2": ["IndicTransToolkit", "transformers", "torch"]}
+                 "indictrans2": ["IndicTransToolkit", "transformers", "torch"],
+                 "openvoice": ["openvoice", "torch"]}
 # The package whose own metadata pins what its model code needs. parler-tts
 # pins transformers==4.46.1: under the main app's newer transformers it
 # still imports but runs on an unsupported stack (it already broke there
 # once: mixed bf16/fp32 weights), so an import check alone would wrongly
-# call it runnable.
-DISTRIBUTION = {"parler": "parler-tts", "indictrans2": "IndicTransToolkit"}
-SETUP_HINT = {"parler": "; run setup_local_ai.bat", "indictrans2": ""}
+# call it runnable. OpenVoice's package (MyShell-OpenVoice) pins
+# numpy==1.22.0 and librosa==0.9.1 the same way.
+DISTRIBUTION = {"parler": "parler-tts", "indictrans2": "IndicTransToolkit",
+                "openvoice": "MyShell-OpenVoice"}
+SETUP_HINT = {"parler": "; run setup_local_ai.bat", "indictrans2": "",
+              "openvoice": "; run setup_local_ai.bat"}
+# Requirements a distribution declares that its worker never imports.
+# MyShell-OpenVoice also pins its demo UI (gradio) and the ASR its own
+# reference splitter uses (faster-whisper, whisper-timestamped); the tone
+# colour converter needs none of them, and they are the pins most likely to
+# fail to install (faster-whisper 0.9 builds PyAV 10 from source where no
+# wheel fits), so a venv without them still counts as runnable.
+UNUSED_REQUIREMENTS = {"MyShell-OpenVoice": ("gradio", "faster-whisper", "whisper-timestamped")}
 
 
 class WorkerError(RuntimeError):
@@ -70,10 +87,14 @@ def unmet_requirements(dist: str) -> List[str]:
     itself is not installed."""
     from importlib import metadata
     from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    unused = {canonicalize_name(n) for n in UNUSED_REQUIREMENTS.get(dist, ())}
     bad = []
     for raw in metadata.requires(dist) or []:
         req = Requirement(raw)
         if req.marker is not None and not req.marker.evaluate({"extra": ""}):
+            continue
+        if canonicalize_name(req.name) in unused:
             continue
         try:
             have = metadata.version(req.name)

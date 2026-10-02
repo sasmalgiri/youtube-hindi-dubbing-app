@@ -8,7 +8,8 @@ from dubbing.dialogue.modules import (INDICTRANS2_DEFAULT_MODEL, PRESETS, STAGES
                                       describe_matrix, hf_model_access, resolve, to_config)
 
 ALL_PKGS = {"faster_whisper", "pyannote.audio", "torch", "demucs", "edge_tts",
-            "deep_translator", "transformers", "parler_tts", "IndicTransToolkit", "requests"}
+            "deep_translator", "transformers", "parler_tts", "IndicTransToolkit", "requests",
+            "openvoice"}
 QWEN = "qwen2.5:14b-instruct"
 
 
@@ -33,7 +34,8 @@ class FakeProbe(Probe):
         return self._env.get(name, "")
 
     def has_runtime(self, name):
-        return {"parler": "parler_tts", "indictrans2": "IndicTransToolkit"}[name] in self._pkgs
+        return {"parler": "parler_tts", "indictrans2": "IndicTransToolkit",
+                "openvoice": "openvoice"}[name] in self._pkgs
 
 
 def _changes(res, stage):
@@ -351,3 +353,69 @@ def test_hindi_srt_preset_with_srt_skips_asr_and_translation():
 def test_huggingface_token_name_enables_speaker_detection():
     res = resolve("free-online", probe=FakeProbe(env=("HUGGINGFACE_TOKEN", "GEMINI_API_KEY")))
     assert res.selections["speakers"] == ["pyannote"] and res.config["diarization"] is True
+
+
+# ── "Sound like the original speaker" (experimental, off by default) ─────────
+def test_voice_match_is_off_in_every_preset():
+    for p in PRESETS:
+        ctx = {"source_kind": "url", "files": {"hindi_srt": p["id"] == "hindi-srt-revoice"}}
+        res = resolve(p["id"], ctx=ctx, probe=FakeProbe())
+        assert res.selections["voice_match"] == ["off"], p["id"]
+        assert res.config["voice_match"] == "off"
+        assert not _changes(res, "voice_match")
+    stage = modules.STAGE_BY_ID["voice_match"]
+    assert stage.label == "Sound like the original speaker" and "EXPERIMENTAL" in stage.description
+
+
+def test_voice_match_openvoice_runs_when_its_runtime_does():
+    res = resolve("free-online", overrides={"voice_match": ["openvoice"]}, probe=FakeProbe())
+    assert res.ok and res.selections["voice_match"] == ["openvoice"]
+    assert res.config["voice_match"] == "openvoice"
+    assert any("experimental" in w for w in res.warnings)
+    no_gpu = resolve("free-online", overrides={"voice_match": "openvoice"},
+                     probe=FakeProbe(gpu=False))
+    assert no_gpu.config["voice_match"] == "openvoice"             # GPU is soft: slower, allowed
+    assert any("OpenVoice" in w and "GPU" in w for w in no_gpu.warnings)
+
+
+def test_voice_match_without_its_runtime_falls_back_to_off_with_the_fix():
+    res = resolve("free-online", overrides={"voice_match": ["openvoice"]},
+                  probe=FakeProbe(pkgs=ALL_PKGS - {"openvoice"}))
+    assert res.ok and res.config["voice_match"] == "off"
+    assert _changes(res, "voice_match") == [("deactivated", "openvoice"), ("activated", "off")]
+    fix = [c["fix"] for c in res.changes if c["choice"] == "openvoice"][0]
+    assert "OPENVOICE_PYTHON" in fix and "setup_local_ai.bat" in fix
+    m = describe_matrix(probe=FakeProbe(pkgs=ALL_PKGS - {"openvoice"}))
+    vm = [s for s in m["stages"] if s["id"] == "voice_match"][0]
+    ov = [c for c in vm["choices"] if c["id"] == "openvoice"][0]
+    assert vm["default"] == ["off"] and ov["available"] is False
+    assert ov["missing"][0]["name"] == "openvoice"
+
+
+def test_probe_checks_the_openvoice_runtime(monkeypatch, tmp_path):
+    from dubbing.dialogue import local_workers as lw
+    monkeypatch.setattr(lw, "_RUNTIME_CACHE", {})
+    monkeypatch.setenv("OPENVOICE_PYTHON", str(tmp_path / "missing" / "python.exe"))
+    assert Probe().has_runtime("openvoice") is False
+    asked = []
+    monkeypatch.setattr(lw, "runtime_available", lambda name: asked.append(name) or True)
+    assert Probe().has_runtime("openvoice") is True and asked == ["openvoice"]
+
+
+def test_to_config_passes_job_options_through():
+    base = to_config({}, {})
+    for k in ("review_before_voice", "keep_original_audio", "english_subtitles",
+              "burn_subtitles", "container"):
+        assert k not in base                                   # DialogueConfig defaults apply
+    cfg = to_config({}, {"review_before_voice": True, "keep_original_audio": "false",
+                         "english_subtitles": 0, "burn_subtitles": "1", "container": " MKV "})
+    assert cfg["review_before_voice"] is True and cfg["keep_original_audio"] is False
+    assert cfg["english_subtitles"] is False and cfg["burn_subtitles"] is True
+    assert cfg["container"] == "mkv"
+    for bad in ("avi", "", None, 3):
+        assert to_config({}, {"container": bad})["container"] == "mp4"
+    res = resolve("free-online", overrides={"params": {"review_before_voice": True,
+                                                       "keep_original_audio": True,
+                                                       "container": "mkv"}}, probe=FakeProbe())
+    assert res.config["review_before_voice"] is True and res.config["keep_original_audio"] is True
+    assert res.config["container"] == "mkv" and "burn_subtitles" not in res.config

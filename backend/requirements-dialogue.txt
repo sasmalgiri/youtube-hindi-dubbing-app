@@ -46,3 +46,15 @@ deep-translator>=1.11
 #   IndicTrans2 translation: indictranstoolkit with "transformers>=4.51,<5"; runs in the main
 #     Python here (1.1.1 + transformers 4.51.3). INDICTRANS2_PYTHON only for a separate venv
 #   Ollama translation: install Ollama, `ollama pull gemma3:12b`, set OLLAMA_MODEL
+#
+# OPTIONAL, EXPERIMENTAL "Sound like the original speaker" (OpenVoice v2 tone colour
+# converter, MIT; off by default): install in a SEPARATE venv (OpenVoice pins
+# numpy==1.22.0 and librosa==0.9.1; never install it into the main Python)
+#   -> setup_local_ai.bat offers it at the end (`setup_local_ai.bat openvoice` for only
+#      this) and sets OPENVOICE_PYTHON in backend/.env. By hand, with Python 3.10:
+#        py -3.10 -m venv backend\.venvs\openvoice
+#        backend\.venvs\openvoice\Scripts\python -m pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+#        backend\.venvs\openvoice\Scripts\python -m pip install git+https://github.com/myshell-ai/OpenVoice.git huggingface_hub setuptools==69.5.1
+#      then OPENVOICE_PYTHON=<that venv's python.exe> in backend/.env. The converter
+#      checkpoint (myshell-ai/OpenVoiceV2 on Hugging Face, ~130 MB) downloads into
+#      backend/models/openvoice the first time a job uses it. GPU strongly recommended.
