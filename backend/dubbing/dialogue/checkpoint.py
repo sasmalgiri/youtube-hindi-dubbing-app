@@ -66,21 +66,98 @@ def _sha1_file(p: Optional[Path]) -> Optional[str]:
         return None
 
 
+def _is_url(source: Optional[str]) -> bool:
+    return bool(re.match(r"^https?://", source or ""))
+
+
+def _source_key(source: Optional[str]) -> str:
+    """A local path in one spelling (absolute, links resolved, the OS's case
+    rules: D:\\v\\a.mp4 and d:/v/a.mp4 are one file); a URL as given."""
+    s = (source or "").strip()
+    if not s or _is_url(s):
+        return s
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(s)))
+    except (OSError, ValueError):
+        return s
+
+
 def source_identity(source: str, limit_seconds: float = 0.0, source_srt: Optional[Path] = None,
                     translated_srt: Optional[Path] = None) -> Dict[str, Any]:
     """What makes a checkpoint belong to this input: the source (hashed, so
     a signed URL is never written down), the dubbed length and the text
     files supplied, plus a local source file's size."""
-    ident: Dict[str, Any] = {"source_sha1": _sha1_bytes((source or "").encode("utf-8")),
+    ident: Dict[str, Any] = {"source_sha1": _sha1_bytes(_source_key(source).encode("utf-8")),
                              "limit_seconds": float(limit_seconds or 0.0),
                              "source_srt_sha1": _sha1_file(source_srt),
                              "translated_srt_sha1": _sha1_file(translated_srt)}
-    if source and not re.match(r"^https?://", source):
+    if source and not _is_url(source):
         try:
             ident["bytes"] = Path(source).stat().st_size
         except OSError:
             pass
     return ident
+
+
+def _work_copy(work_dir: Path, source: Optional[str], files: Dict[str, Any]) -> Optional[Path]:
+    """The job's own copy of a local source (default_acquire's work/source<ext>
+    hard link or copy), else the checkpointed video."""
+    if source and not _is_url(source):
+        p = Path(work_dir) / f"source{Path(source).suffix.lower() or '.mp4'}"
+        if p.is_file():
+            return p
+    v = resolve((files or {}).get("video"), work_dir)
+    return v if v is not None and v.is_file() else None
+
+
+def _same_content(a: Path, b: Path, chunk: int = 1 << 20) -> bool:
+    """Same file, or same size and the same first/middle/last megabyte."""
+    try:
+        if os.path.samefile(a, b):
+            return True
+        size = a.stat().st_size
+        if size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            for off in sorted({0, max(0, size // 2 - chunk // 2), max(0, size - chunk)}):
+                fa.seek(off)
+                fb.seek(off)
+                if fa.read(chunk) != fb.read(chunk):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def same_source(stored: Dict[str, Any], current: Dict[str, Any], work_dir: Path,
+                source: Optional[str] = None, files: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether a checkpoint's identity `stored` is this input `current`.
+
+    The length and text files must match exactly. A local source matches by
+    its path in any spelling (also a checkpoint written before paths were
+    normalised), unless the file there now has another size; an original
+    that was moved away or deleted still matches when the job's own copy is
+    there; one under another path matches when it holds the same media as
+    the job's own copy."""
+    if source is None:
+        return stored == current           # nothing to compare a local file with
+    for k in ("limit_seconds", "source_srt_sha1", "translated_srt_sha1"):
+        if stored.get(k) != current.get(k):
+            return False
+    # also the hash of the path as typed: checkpoints from before normalisation
+    names = {current.get("source_sha1"), _sha1_bytes((source or "").encode("utf-8"))}
+    if not source or _is_url(source):
+        return stored.get("source_sha1") in names
+    had, has = stored.get("bytes"), current.get("bytes")
+    if stored.get("source_sha1") in names:
+        if has is not None:
+            return had is None or had == has
+        # the original is gone: the job's own copy is all a resume reads
+        copy = _work_copy(work_dir, source, files or {})
+        return copy is not None and (had is None or copy.stat().st_size == had)
+    copy = _work_copy(work_dir, source, files or {})
+    return (has is not None and has == had and copy is not None
+            and _same_content(Path(source), copy))
 
 
 def save(work_dir: Path, state: Dict[str, Any]) -> Path:
@@ -102,9 +179,26 @@ def load(work_dir: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     return state, ""
 
 
-def unusable_reason(state: Dict[str, Any], identity: Dict[str, Any], work_dir: Path) -> str:
-    """"" when `state` can resume this job, else the reason it cannot."""
-    if state.get("identity") != identity:
+def stages_on_disk(work_dir: Path) -> Optional[List[str]]:
+    """The stages the checkpoint in work_dir says it finished, whatever its
+    version or identity; [] when there is none, None when it is unreadable."""
+    p = checkpoint_path(work_dir)
+    if not p.exists():
+        return []
+    try:
+        state = json.loads(p.read_text(encoding="utf-8"))
+        return [str(s) for s in state.get("completed") or []]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def unusable_reason(state: Dict[str, Any], identity: Dict[str, Any], work_dir: Path,
+                    source: Optional[str] = None) -> str:
+    """"" when `state` can resume this job, else the reason it cannot.
+    `source` (the job's source as given) lets a local file match in another
+    spelling or after it was moved (see same_source)."""
+    if not same_source(state.get("identity") or {}, identity, work_dir, source,
+                       state.get("files") or {}):
         return "the checkpoint belongs to a different source"
     if not completed_prefix(state):
         return "the checkpoint holds no finished stage"
@@ -184,8 +278,10 @@ def turns_from_list(items: Sequence[Dict[str, Any]]) -> List[Turn]:
 class RewriteCache:
     """Shortened lines of THIS job, keyed by (turn_id, current Hindi, target
     ratio rounded to 0.05): a resumed run asks the LLM again only for lines
-    that changed. Only accepted rewrites are kept (a refusal may have been an
-    outage)."""
+    that changed. Only accepted rewrites are kept: neither a refusal (it may
+    have been an outage) nor a rewrite the fit rejected because it did not
+    make the line shorter (the orchestrator stores a rewrite only after the
+    fit has kept it)."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -209,7 +305,16 @@ class RewriteCache:
     def put(self, turn_id: str, current_hi: str, ratio: float, new_hi: str):
         with self._lock:
             self.data[self.key(turn_id, current_hi, ratio)] = new_hi
-            try:
-                write_json_atomic(self.path, self.data)
-            except OSError:
-                pass
+            self._write()
+
+    def delete(self, turn_id: str, current_hi: str, ratio: float):
+        """Forget a rewrite the fit rejected (it did not make the line shorter)."""
+        with self._lock:
+            if self.data.pop(self.key(turn_id, current_hi, ratio), None) is not None:
+                self._write()
+
+    def _write(self):
+        try:
+            write_json_atomic(self.path, self.data)
+        except OSError:
+            pass

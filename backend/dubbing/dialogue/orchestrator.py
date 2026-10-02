@@ -67,6 +67,29 @@ _PCT_PREFIX = re.compile(r"^\[\d+%\]\s*")
 _REGEN_REASONS = ("cheap_check_regen", "content_mismatch")
 RESUMED_DETAIL = "resumed from this job's checkpoint"
 ReviewHook = Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+# Turn-scoped translation problems that a reviewer's delete or rewrite settles
+# (the warning stays in the report, marked "resolved"; the flag is dropped on
+# a rewrite, which replaces the machine translation).
+_TURN_WARNING_TYPES = ("critical_tokens", "translation_uncertain", "translation_failed",
+                       "non_contextual_translation")
+_TURN_ISSUE_FLAGS = ("critical_token_warning", "translation_uncertain",
+                     "non_contextual_translation", "sentence_level_mt")
+RESOLVED_DELETED = "line deleted by the reviewer"
+RESOLVED_REWRITTEN = "line rewritten by the reviewer"
+DELETED_LINE_NOTE = "Hindi edit ignored: line is deleted; restore it first"
+
+
+def _edit_key(e: Dict[str, Any]) -> tuple:
+    """One applied_edits entry per line / merged speaker / voiced speaker."""
+    return (e.get("kind"), e.get("turn_id") or e.get("from") or e.get("speaker_id"))
+
+
+def _with_notes(entry: Dict[str, Any], notes: Optional[List[str]]) -> Dict[str, Any]:
+    """An applied_edits entry with this run's notes (none: the old ones go)."""
+    out = {k: v for k, v in entry.items() if k != "notes"}
+    if notes:
+        out["notes"] = list(notes)
+    return out
 
 
 @dataclass
@@ -167,6 +190,10 @@ class DialogueResult:
 
 class Cancelled(RuntimeError):
     pass
+
+
+class ResumeError(RuntimeError):
+    """A re-voice that cannot honestly go on (its edits would land on other lines)."""
 
 
 def _is_url(s: str) -> bool:
@@ -563,10 +590,14 @@ class DialogueOrchestrator:
         self._restored: set = set()                 # checkpointed stages restored by a resume
         self._ckpt_stages: Dict[str, Dict] = {}     # their report entries from the first run
         self._ckpt_error = ""
+        # an unusable checkpoint is replaced once this run saved its own first stage
+        self._stale_ckpt = False
+        self._edits_in_effect = 0                   # re-sent edits the restored state already holds
         # voice matching (optional)
         self._vm_ready: set = set()
         self._vm_lock = threading.Lock()
         self._vm_errors: List[str] = []
+        self._vm_fail_by_clip: Dict[str, str] = {}  # clip_id -> why it kept the stock voice
         self._vm_closed = False
 
     # helpers
@@ -1004,6 +1035,7 @@ class DialogueOrchestrator:
         with self._stage("synthesize") as st:
             self._prepare_voice_match()
             self._synthesize_all()
+            self._vm_consistency(fitted=False)
             st.detail = f"{sum(1 for c in self.clips.values() if c.accepted)} clips accepted"
             if self.router.cache_hits:
                 st.data["tts_cache_hits"] = self.router.cache_hits
@@ -1020,11 +1052,17 @@ class DialogueOrchestrator:
             else:
                 rewrite = self._cached_rewrite(rewrite)
             accepted = {k: v for k, v in self.clips.items() if v.accepted}
-            r.timing_deviations = fit.fit_all(
-                self.turns, accepted, self.media_dur, self._resynth, rewrite,
-                fit.FitConfig(max_stretch=cfg.max_stretch, max_rewrites=cfg.max_rewrites),
-                self.cancel_check, lambda p, m: self._progress("fit", p, m),
-                native_rate=self._native_rate if cfg.native_rate else None)
+            try:
+                r.timing_deviations = fit.fit_all(
+                    self.turns, accepted, self.media_dur, self._resynth, rewrite,
+                    fit.FitConfig(max_stretch=cfg.max_stretch, max_rewrites=cfg.max_rewrites),
+                    self.cancel_check, lambda p, m: self._progress("fit", p, m),
+                    native_rate=self._native_rate if cfg.native_rate else None)
+            finally:
+                # only the rewrites the fit kept are worth reusing
+                commit = getattr(rewrite, "commit", None)
+                if commit is not None:
+                    commit(self.turns)
             self.clips.update(accepted)
             st.detail = f"{sum(1 for d in r.timing_deviations if d.get('severity') != 'info')} timing issue(s)"
         self._check_cancel()
@@ -1034,6 +1072,11 @@ class DialogueOrchestrator:
             st.detail = (f"coverage {len(r.generated_turn_ids)}/{len(r.required_turn_ids)}; "
                          f"{len(r.content_warnings)} content warning(s)")
         self._check_cancel()
+        # Clips the fit / verification regenerated went through the voice
+        # matcher too: one voice per speaker still holds, and what the
+        # matcher could not do is reported, before its worker is closed.
+        self._vm_consistency(fitted=True)
+        self._vm_report()
 
         # Local model workers (Indic Parler, IndicTrans2) are done: free the GPU
         # (separation already ran up front; a fallback separation may run in the mix).
@@ -1048,27 +1091,47 @@ class DialogueOrchestrator:
     def _resume(self):
         """With cfg.resume, restore this job's checkpoint when it is usable
         for the same source; otherwise (and on every fresh run) clear the
-        checkpoint and the within-job caches so nothing earlier is reused."""
+        checkpoint and the within-job caches so nothing earlier is reused.
+
+        Edits are keyed by line and speaker IDs of the transcript they were
+        made on. When that transcript cannot be restored, a full run would
+        produce new lines and speakers (other ASR segments, other diarization
+        labels) and the edits could land on the wrong ones: such a re-voice
+        fails before anything changes, and the checkpoint is kept. An
+        unusable checkpoint without edits is replaced only once the full run
+        has saved its own first stage (a run that fails before that, e.g.
+        because the original file is gone, leaves the job as it was)."""
         cfg, r, w = self.cfg, self.report, self.cfg.work_dir
         self._identity = checkpoint.source_identity(cfg.source, cfg.limit_seconds,
                                                     cfg.source_srt, cfg.translated_srt)
         if not cfg.resume:
             checkpoint.clear(w)
             return
+        on_disk = checkpoint.stages_on_disk(w)
         state, why = checkpoint.load(w)
         if state is not None:
-            why = checkpoint.unusable_reason(state, self._identity, w)
+            why = checkpoint.unusable_reason(state, self._identity, w, source=cfg.source)
         if not why:
             try:
                 self._restore(state)
             except Exception as e:  # noqa: BLE001 - a damaged checkpoint means a full run
                 why = f"the checkpoint could not be read back ({type(e).__name__}: {str(e)[:100]})"
+        if not why:
+            self._restored = set(checkpoint.completed_prefix(state))
+            self._ckpt_stages = {s["name"]: s for s in state.get("stages") or [] if s.get("name")}
+        n_edits = sum(len(x) for x in (cfg.turn_edits, cfg.speaker_merges, cfg.voice_overrides)
+                      if isinstance(x, dict))
+        had_lines = on_disk is None or "turns" in on_disk
+        if n_edits and had_lines and "turns" not in self._restored:
+            raise ResumeError(
+                f"re-voice stopped: this job's checkpoint cannot be used "
+                f"({(why or 'no transcript in it')[:120]}), so every stage would run again and the "
+                f"line and speaker IDs of {n_edits} edit(s) could then name other lines or speakers. "
+                f"Nothing was re-voiced; the earlier dub and the checkpoint are unchanged. "
+                f"Start a new job to dub this video again")
         if why:
             r.limitations.append(f"resume was asked for but {why}: every stage ran again")
-            checkpoint.clear(w)
-            return
-        self._restored = set(checkpoint.completed_prefix(state))
-        self._ckpt_stages = {s["name"]: s for s in state.get("stages") or [] if s.get("name")}
+            self._stale_ckpt = True
 
     def _restore(self, state: Dict[str, Any]):
         """Parse everything first, then assign: a damaged checkpoint leaves
@@ -1085,6 +1148,10 @@ class DialogueOrchestrator:
         words = checkpoint.words_from_list(state.get("asr_words"))
         diar = checkpoint.diar_from_dict(state.get("diar"))
         registry = SpeakerRegistry.from_dict(state["registry"]) if state.get("registry") else None
+        if registry is not None:
+            for rec in registry.speakers.values():
+                if rec.reference_clip:     # stored relative to work_dir: the job folder may move
+                    rec.reference_clip = str(checkpoint.resolve(rec.reference_clip, w))
         ranges = {k: [tuple(x) for x in v] for k, v in (state.get("speaker_ranges") or {}).items()}
         tr = None
         if state.get("translator") is not None:
@@ -1139,6 +1206,10 @@ class DialogueOrchestrator:
         """Atomically write everything the stages up to `stage` produced.
         A failure only costs the ability to resume; it is reported once."""
         r, w = self.report, self.cfg.work_dir
+        if self._stale_ckpt:
+            # this full run has a stage of its own now: drop the unusable one
+            checkpoint.clear(w)
+            self._stale_ckpt = False
         idx = checkpoint.STAGES.index(stage)
         names = ("acquire",) + checkpoint.STAGES
         stages = []
@@ -1155,6 +1226,12 @@ class DialogueOrchestrator:
                 if sep.get(k):
                     sep[k] = checkpoint.rel(Path(sep[k]), w)
         tr = getattr(self, "translator", None)
+        registry = None
+        if idx >= checkpoint.STAGES.index("speakers"):
+            registry = self.registry.to_dict()
+            for d in registry["speakers"].values():
+                if d.get("reference_clip"):
+                    d["reference_clip"] = checkpoint.rel(Path(d["reference_clip"]), w)
         state = {
             "identity": self._identity,
             "completed": list(checkpoint.STAGES[:idx + 1]),
@@ -1168,8 +1245,7 @@ class DialogueOrchestrator:
             "asr_segs": getattr(self, "asr_segs", None) or [],
             "diar": checkpoint.diar_to_dict(getattr(self, "diar", None)),
             "turns": [t.to_dict() for t in self.turns],
-            "registry": (self.registry.to_dict()
-                         if idx >= checkpoint.STAGES.index("speakers") else None),
+            "registry": registry,
             "speaker_ranges": {k: [list(x) for x in v] for k, v in self.speaker_ranges.items()},
             "translator": tr.export_state() if tr is not None else None,
             "notes": dict(self.c.notes),
@@ -1187,19 +1263,51 @@ class DialogueOrchestrator:
                                      f"a re-voice of this job would redo every stage")
 
     def _cached_rewrite(self, rewrite):
-        """translator.rewrite_shorter through this job's rewrite cache."""
+        """translator.rewrite_shorter through this job's rewrite cache.
+
+        The fit may reject a rewrite (its audio is not shorter) and then asks
+        again for the same line and ratio: a key is served from the cache at
+        most once per run, so that second request reaches the LLM. Rewrites
+        are stored only once the fit has kept them: `cached.commit(turns)`
+        after the fit stores the kept ones and forgets cached ones it rejected."""
         cache = checkpoint.RewriteCache(checkpoint.rewrite_cache_path(self.cfg.work_dir))
+        asked: set = set()
+        calls: List[tuple] = []        # (turn_id, current_hi, ratio, new_hi, from_cache)
+        lock = threading.Lock()
 
         def cached(t: Turn, current_hi: str, ratio: float) -> Optional[str]:
-            hit = cache.get(t.turn_id, current_hi, ratio)
+            key = cache.key(t.turn_id, current_hi, ratio)
+            with lock:
+                again = key in asked
+                asked.add(key)
+            hit = None if again else cache.get(t.turn_id, current_hi, ratio)
             if hit:
                 t.translation_attempts.append({"engine": "rewrite_cache", "ok": True,
                                                "reason": "duration_rewrite"})
-                return hit
-            new = rewrite(t, current_hi, ratio)
+                new, from_cache = hit, True
+            else:
+                new, from_cache = rewrite(t, current_hi, ratio), False
             if new:
-                cache.put(t.turn_id, current_hi, ratio, new)
+                with lock:
+                    calls.append((t.turn_id, current_hi, ratio, new, from_cache))
             return new
+
+        def commit(turns: List[Turn]):
+            # kept = still spoken, or the base of a later rewrite of that line
+            # (the fit only asks again from the text it kept)
+            final = {t.turn_id: t.speech_text for t in turns}
+            with lock:
+                done = list(calls)
+                calls.clear()
+            bases = {(tid, cur.strip()) for tid, cur, _, _, _ in done}
+            for tid, cur, ratio, new, from_cache in done:
+                kept = final.get(tid) == new.strip() or (tid, new.strip()) in bases
+                if kept and not from_cache:
+                    cache.put(tid, cur, ratio, new)
+                elif not kept and from_cache:
+                    cache.delete(tid, cur, ratio)
+
+        cached.commit = commit
         return cached
 
     def _text_source(self):
@@ -1307,6 +1415,7 @@ class DialogueOrchestrator:
         cfg, r, w = self.cfg, self.report, self.cfg.work_dir
         t0 = time.time()
         applied = 0
+        self._edits_in_effect = 0
         requested = {"turn_edits": cfg.turn_edits, "voice_overrides": cfg.voice_overrides,
                      "speaker_merges": cfg.speaker_merges}
         if any(requested.values()):
@@ -1331,88 +1440,199 @@ class DialogueOrchestrator:
             self._check_cancel()
             if edits:
                 applied += self.apply_edits(edits, via="review")
-        if applied or cfg.review_before_voice:
+        if applied or self._edits_in_effect or cfg.review_before_voice:
             st = r.stage("review")
             st.status = "ok"
             st.seconds = round(time.time() - t0, 2)
             st.detail = f"{applied} edit(s) applied"
+            if self._edits_in_effect:
+                st.detail += f"; {self._edits_in_effect} earlier edit(s) already in effect"
             if cfg.review_before_voice and not hooked:
                 st.detail += "; review.json written (no reviewer attached)"
+        if applied or cfg.review_before_voice:
             self._save_checkpoint("translate")
 
     def apply_edits(self, edits: Optional[Dict[str, Any]], via: str = "review") -> int:
         """Apply reviewer edits to the lines, speakers and voices (shared by
         the review hook and re-voice runs). Turn edits come first, then
-        speaker merges (which also sweep up turns just relabelled to the
-        merged speaker), then voice overrides. Every edit, applied or ignored
-        with its reason, is recorded in report.applied_edits. Returns the
-        number applied."""
+        speaker merges (chains resolved: A->B with B->C merges A into C,
+        whatever the order; they also sweep up turns just relabelled to the
+        merged speaker), then voice overrides.
+
+        report.applied_edits holds one entry per line / merged speaker /
+        voiced speaker. A re-voice sends every earlier edit again: one the
+        restored state already holds keeps its earlier entry (it is in
+        effect, not "ignored"), a changed one replaces it. Returns the
+        number of edits that changed something in this call."""
         if not isinstance(edits, dict):
             return 0
-        log: List[Dict[str, Any]] = []
         turn_edits = edits.get("turn_edits") or {}
         merges = edits.get("speaker_merges") or {}
         overrides = edits.get("voice_overrides") or {}
+        recs: List[Dict[str, Any]] = []
         for tid, ed in (turn_edits.items() if isinstance(turn_edits, dict) else []):
-            log.append(self._edit_turn(str(tid), ed))
-        for src, dst in (merges.items() if isinstance(merges, dict) else []):
-            log.append(self._merge_speakers(str(src), str(dst)))
+            recs.append(self._edit_turn(str(tid), ed))
+        resolved = self._resolve_merges(merges)
+        # merges of speakers still here first, so a re-sent A->C (A went into
+        # B on an earlier run, B->C now) is checked after B has gone into C
+        for src, dst, asked in sorted(resolved, key=lambda m: m[0] not in self.registry.speakers):
+            recs.append(self._merge_speakers(src, dst, asked))
         for sid, ov in (overrides.items() if isinstance(overrides, dict) else []):
-            log.append(self._override_voice(str(sid), ov))
-        log = [dict(e, via=via) for e in log]
-        self.report.applied_edits += log
-        return sum(1 for e in log if not e.get("ignored"))
+            recs.append(self._override_voice(str(sid), ov))
+        return sum(1 for rec in recs if self._log_edit(dict(rec, via=via)) == "changed")
+
+    def _log_edit(self, rec: Dict[str, Any]) -> str:
+        """Record one edit in report.applied_edits (see apply_edits); returns
+        its state: changed | in_effect | ignored."""
+        state = rec.pop("_state", "ignored" if rec.get("ignored") else "changed")
+        replace = rec.pop("_replace", False)
+        log = self.report.applied_edits
+        key = _edit_key(rec)
+        i = next((n for n, x in enumerate(log) if _edit_key(x) == key), None)
+        prev = log[i] if i is not None else None
+        live = prev is not None and not prev.get("ignored") and not replace
+        if state == "changed":
+            if live and rec.get("kind") == "turn_edit":
+                kept = {k: v for k, v in (prev.get("changes") or {}).items()
+                        if k not in rec.get("changes", {})}
+                rec["changes"] = {**kept, **rec.get("changes", {})}
+            entry = rec
+        elif state == "in_effect":
+            self._edits_in_effect += 1
+            entry = _with_notes(prev, rec.get("notes")) if live else dict(rec, in_effect=True)
+        else:
+            notes = rec.get("notes") or [f"later edit ignored: {rec.get('ignored')}"]
+            entry = _with_notes(prev, notes) if live else rec
+        if i is None:
+            log.append(entry)
+        else:
+            log[i] = entry
+        return state
 
     def _edit_turn(self, tid: str, ed: Any) -> Dict[str, Any]:
         rec: Dict[str, Any] = {"kind": "turn_edit", "turn_id": tid}
         t = next((x for x in self.turns if x.turn_id == tid), None)
         if t is None or not isinstance(ed, dict):
-            return dict(rec, ignored="no such line" if t is None else "malformed edit")
+            return dict(rec, ignored="no such line" if t is None else "malformed edit", _state="ignored")
         changes: Dict[str, Any] = {}
         notes: List[str] = []
+        in_effect: List[str] = []
         new_spk = ed.get("speaker_id")
-        if new_spk and new_spk != t.speaker_id:
-            if not isinstance(new_spk, str) or new_spk not in self.registry.speakers:
+        if new_spk:
+            # a speaker merged away since stands for the one it went into
+            target = self.registry.resolve_speaker(new_spk) if isinstance(new_spk, str) else None
+            if target is None:
                 notes.append(f"speaker {new_spk} does not exist (a line can only move to an existing speaker)")
+            elif target == t.speaker_id:
+                in_effect.append("speaker_id")
             else:
-                changes["speaker_id"] = {"from": t.speaker_id, "to": new_spk}
-                t.speaker_id = new_spk
-                t.voice_category_hint = self.registry.speakers[new_spk].voice_category
+                changes["speaker_id"] = {"from": t.speaker_id, "to": target}
+                if target != new_spk:
+                    changes["speaker_id"]["requested"] = new_spk
+                t.speaker_id = target
+                t.voice_category_hint = self.registry.speakers[target].voice_category
+        if "delete" in ed:
+            deleted = "deleted_by_user" in t.flags
+            if ed["delete"] and not deleted:
+                t.required = False        # not voiced, and not counted as missing
+                t.add_flag("deleted_by_user")
+                changes["delete"] = True
+                self._settle_turn_warnings(tid, RESOLVED_DELETED)
+            elif not ed["delete"] and deleted:
+                # restored: voiced again (a line whose translation failed is
+                # required, so it counts as missing until it gets Hindi)
+                t.flags.remove("deleted_by_user")
+                t.required = bool(t.speech_text) or "translation_failed" in t.flags
+                changes["delete"] = False
+                self._settle_turn_warnings(tid, None, undo=RESOLVED_DELETED)
+            else:
+                in_effect.append("delete")
         if isinstance(ed.get("hi"), str):
             hi = ed["hi"].strip()
             if not hi:
                 notes.append("empty Hindi line ignored (delete the line instead)")
-            elif hi != t.speech_text or hi != (t.hi_display or t.speech_text):
+            elif "deleted_by_user" in t.flags:
+                notes.append(DELETED_LINE_NOTE)
+            elif hi == t.speech_text and hi == (t.hi_display or t.speech_text):
+                in_effect.append("hi")
+            else:
                 changes["hi"] = {"from": t.speech_text, "to": hi}
                 t.hi_raw = t.hi_fit = t.hi_display = hi
                 t.add_flag("edited")
-                if "translation_failed" in t.flags:
-                    t.flags.remove("translation_failed")
-                if not t.required and "deleted_by_user" not in t.flags and not ed.get("delete"):
+                for f in ("translation_failed",) + _TURN_ISSUE_FLAGS:
+                    if f in t.flags:
+                        t.flags.remove(f)
+                self._settle_turn_warnings(tid, RESOLVED_REWRITTEN)
+                if not t.required:
                     t.required = True     # a line the reviewer wrote Hindi for is voiced
-        if "delete" in ed:
-            if ed["delete"]:
-                if "deleted_by_user" not in t.flags:
-                    t.required = False    # not voiced, and not counted as missing
-                    t.add_flag("deleted_by_user")
-                    changes["delete"] = True
-            elif "deleted_by_user" in t.flags:
-                t.flags.remove("deleted_by_user")
-                t.required = True
-                changes["delete"] = False
         if changes:
             rec["changes"] = changes
-            if notes:
-                rec["notes"] = notes
+            rec["_state"] = "changed"
+        elif in_effect:
+            rec["_state"] = "in_effect"
         else:
             rec["ignored"] = "; ".join(notes) or "no change"
+            rec["_state"] = "ignored"
+            return rec
+        if notes:
+            rec["notes"] = notes
         return rec
 
-    def _merge_speakers(self, src: str, dst: str) -> Dict[str, Any]:
-        rec: Dict[str, Any] = {"kind": "speaker_merge", "from": src, "into": dst}
+    def _settle_turn_warnings(self, tid: str, reason: Optional[str], undo: Optional[str] = None):
+        """Mark the line's translation warnings resolved by `reason` (or,
+        with `undo`, take back a resolution: a restored line has its
+        original translation, and its warnings, again)."""
+        for w in self.report.translation_warnings:
+            if w.get("id") != tid or w.get("type") not in _TURN_WARNING_TYPES:
+                continue
+            if undo is not None:
+                if w.get("resolved") == undo:
+                    w.pop("resolved", None)
+            elif not w.get("resolved"):
+                w["resolved"] = reason
+
+    def _resolve_merges(self, merges: Any) -> List[tuple]:
+        """(from, final target or None for a cycle, requested target) for each
+        merge: a chain is followed (A->B with B->C merges A into C, whatever
+        the dict order) and so is a target merged away on an earlier run."""
+        if not isinstance(merges, dict):
+            return []
         reg = self.registry
+        m = {str(k): str(v) for k, v in merges.items()}
+        out = []
+        for src, dst in m.items():
+            seen, target = {src}, dst
+            while target not in seen:
+                seen.add(target)
+                nxt = m.get(target)
+                if nxt is None and target not in reg.speakers:
+                    nxt = reg.merged_into.get(target)
+                if nxt is None:
+                    break
+                target = nxt
+            else:
+                target = None             # the chain comes back to src: a cycle
+            if target is not None and target not in reg.speakers and dst in reg.speakers:
+                target = dst              # the chain runs into a merge that cannot happen
+            out.append((src, target, dst))
+        return out
+
+    def _merge_speakers(self, src: str, dst: Optional[str], asked: Optional[str] = None) -> Dict[str, Any]:
+        asked = asked or dst
+        rec: Dict[str, Any] = {"kind": "speaker_merge", "from": src, "into": dst or asked}
+        if dst is not None and dst != asked:
+            rec["requested_into"] = asked
+        reg = self.registry
+        if dst is None:
+            return dict(rec, ignored="these merges form a cycle", _state="ignored")
+        if src not in reg.speakers:
+            now = reg.resolve_speaker(src)
+            if now is not None and now == dst:
+                return dict(rec, _state="in_effect")      # merged on an earlier run
+            if now is not None:
+                return dict(rec, ignored=f"speaker {src} was already merged into {now}", _state="ignored")
         if src == dst or src not in reg.speakers or dst not in reg.speakers:
-            return dict(rec, ignored="both speakers must exist and differ")
+            return dict(rec, ignored="both speakers must exist and differ", _state="ignored")
         cat_src, cat_dst = self._known_category(src), self._known_category(dst)
         moved = []
         for t in self.turns:
@@ -1433,6 +1653,7 @@ class DialogueOrchestrator:
                          "check gendered Hindi forms (verb endings, adjectives)"}
             self.report.content_warnings.append(w)
             rec["warning"] = w["note"]
+        rec["_state"] = "changed"
         return rec
 
     def _known_category(self, sid: str) -> str:
@@ -1445,40 +1666,93 @@ class DialogueOrchestrator:
         gender = ((brief.get("speakers") or {}).get(sid) or {}).get("gender")
         return {"male": CATEGORY_MALE, "female": CATEGORY_FEMALE}.get(gender, CATEGORY_UNKNOWN)
 
-    def _override_voice(self, sid: str, ov: Any) -> Dict[str, Any]:
-        rec: Dict[str, Any] = {"kind": "voice_override", "speaker_id": sid}
-        if sid not in self.registry.speakers or not isinstance(ov, dict):
-            return dict(rec, ignored="no such speaker" if isinstance(ov, dict) else "malformed override")
+    def _first_provider(self, sid: str) -> str:
+        """The provider a speaker is voiced by first: the one a reviewer chose
+        a voice on (registry.provider_pins), else the job's first."""
         providers = list(self.c.tts_providers)
+        pin = self.registry.provider_pins.get(sid)
+        return pin if pin in providers else (providers[0] if providers else "")
+
+    def _voice_state(self, sid: str) -> str:
+        rec = self.registry.speakers[sid]
+        return json.dumps({"category": rec.voice_category, "voices": rec.provider_voices,
+                           "pin": self.registry.provider_pins.get(sid)},
+                          sort_keys=True, default=str)
+
+    def _override_voice(self, sid: str, ov: Any) -> Dict[str, Any]:
+        """A chosen voice on one of the job's providers (that provider then
+        voices the speaker first: chosen on another provider than the job's
+        first, the speaker is pinned to it), or a voice category. A voice of
+        another category makes it the speaker's category, so the voices on
+        the other providers (used if this one fails) follow."""
+        rec: Dict[str, Any] = {"kind": "voice_override", "speaker_id": sid}
+        reg = self.registry
+        if not isinstance(ov, dict):
+            return dict(rec, ignored="malformed override", _state="ignored")
+        if sid not in reg.speakers:
+            now = reg.resolve_speaker(sid)
+            if now is not None:
+                # the speaker is gone: its old override is no longer in effect
+                return dict(rec, ignored=f"speaker {sid} was merged into {now} (choose {now}'s voice)",
+                            _state="ignored", _replace=True)
+            return dict(rec, ignored="no such speaker", _state="ignored")
+        providers = list(self.c.tts_providers)
+        spk = reg.speakers[sid]
+        before, cat_before = self._voice_state(sid), spk.voice_category
         try:
             if ov.get("category"):
                 cat = ov["category"]
-                got = self.registry.override_category(sid, cat, providers)
-                for t in self.turns:
-                    if t.speaker_id == sid:
-                        t.voice_category_hint = cat
+                got = reg.override_category(sid, cat, providers)
                 rec.update(category=cat, voices={p: (b and {"voice": b["voice"], "pitch": b.get("pitch")})
                                                   for p, b in got.items()})
                 if any(b and b.get("indistinguishable_reuse") for b in got.values()):
                     rec["note"] = "no free voice of that category: shares a voice with another speaker"
             else:
-                prov = ov.get("provider") or (providers[0] if providers else "")
+                first = self._first_provider(sid)
+                prov = ov.get("provider") or first
                 if prov not in self.c.tts_providers:
-                    return dict(rec, ignored=f"provider {prov or '(none)'} is not used by this job")
-                b = self.registry.override_voice(sid, prov, ov.get("voice") or "", ov.get("pitch"))
+                    return dict(rec, ignored=f"provider {prov or '(none)'} is not used by this job",
+                                _state="ignored")
+                b = reg.override_voice(sid, prov, ov.get("voice") or "", ov.get("pitch"),
+                                       providers=providers)
+                reg.pin_provider(sid, prov if prov != providers[0] else None)
                 rec.update(provider=prov, voice=b["voice"], pitch=b.get("pitch"))
+                if prov != first:
+                    rec["provider_first"] = {"from": first, "to": prov}
                 if b.get("indistinguishable_reuse"):
                     rec["note"] = "another speaker already has this voice"
+                if spk.voice_category != cat_before:
+                    rec["category"] = {"from": cat_before, "to": spk.voice_category,
+                                       "why": "the chosen voice's category; the speaker's voices on "
+                                              "the other providers follow it"}
         except VoiceResolutionError as e:
-            return dict(rec, ignored=str(e)[:200])
+            return dict(rec, ignored=str(e)[:200], _state="ignored")
+        for t in self.turns:
+            if t.speaker_id == sid:
+                t.voice_category_hint = spk.voice_category
+        if spk.voice_category != cat_before:
+            self._recheck_brief_gender(sid)
+        rec["_state"] = "changed" if self._voice_state(sid) != before else "in_effect"
         return rec
+
+    def _recheck_brief_gender(self, sid: str):
+        """A user-set category replaces the voice analysis: its old
+        disagreement with the story brief goes, and one is reported again
+        only when the user's category contradicts the brief."""
+        self.report.content_warnings[:] = [
+            w for w in self.report.content_warnings
+            if not (w.get("type") == "speaker_gender_disagreement" and w.get("speaker_id") == sid)]
+        brief = getattr(getattr(self, "translator", None), "brief", None) or {}
+        v = (brief.get("speakers") or {}).get(sid)
+        if v:
+            self._check_brief_genders({"speakers": {sid: v}}, by_user=True)
 
     def build_review_packet(self, stage: str = "before_voice") -> Dict[str, Any]:
         """The review packet ("before_voice" or "after_run"): every line with
-        its speaker, English, Hindi, flags and (after a run) its accepted clip
-        and overflow; every speaker with its voice and reference clip; the
-        voices a reviewer can choose. Clip files are copied into
-        output_dir/clips/ (<turn_id>.wav, ref_<speaker_id>.wav)."""
+        its speaker, English, Hindi, flags, whether the reviewer deleted it
+        and (after a run) its accepted clip and overflow; every speaker with
+        its voice and reference clip; the voices a reviewer can choose. Clip
+        files are copied into output_dir/clips/ (<turn_id>.wav, ref_<speaker_id>.wav)."""
         after = stage == "after_run"
         clips_dir = self.cfg.output_dir / "clips"
         if after:
@@ -1509,12 +1783,17 @@ class DialogueOrchestrator:
                           "start": t.source_start, "end": t.source_end,
                           "english": t.source_text, "hindi": t.speech_text,
                           "flags": list(t.flags), "required": t.required,
+                          "deleted": "deleted_by_user" in t.flags,
                           "clip": clip_name, "overflow_s": overflow.get(t.turn_id)})
         providers = list(self.c.tts_providers)
         router = getattr(self, "router", None)
         speakers = []
         for sid, rec in self.registry.speakers.items():
-            chain = router.providers_for(sid) if router is not None else providers
+            if router is not None:
+                chain = router.providers_for(sid)
+            else:
+                first = self._first_provider(sid)
+                chain = ([first] if first else []) + [p for p in providers if p != first]
             prov = next((p for p in chain if rec.provider_voices.get(p)), chain[0] if chain else None)
             b = rec.provider_voices.get(prov) or {}
             speakers.append({"speaker_id": sid, "voice_category": rec.voice_category,
@@ -1546,12 +1825,13 @@ class DialogueOrchestrator:
         src = self.vocals_48k if (self.vocals_48k and Path(self.vocals_48k).exists()) else self.audio_48k
         refs_dir = cfg.work_dir / "voice_match_refs"
         voiced = {t.speaker_id for t in self.turns if t.required and t.speech_text}
-        failed = []
+        failed, skipped = [], []
         for sid in sorted(voiced):
             self._check_cancel()
             ranges = sorted(self.speaker_ranges.get(sid) or [], key=lambda x: x[1] - x[0],
                             reverse=True)[:3]
             if not ranges:
+                skipped.append(sid)
                 continue
             self._progress("synthesize", 0.0, f"Learning how {sid} sounds...")
             try:
@@ -1564,7 +1844,10 @@ class DialogueOrchestrator:
                     wavs.append(p)
                 ok = bool(vm.prepare(sid, wavs))
                 if not ok:
-                    failed.append(f"{sid} (no usable reference)")
+                    # the matcher's own reason (a worker that could not start,
+                    # too little reference speech, ...)
+                    why = (getattr(vm, "notes", None) or {}).get(sid) or "no usable reference"
+                    failed.append(f"{sid} ({str(why)[:160]})")
             except Exception as e:  # noqa: BLE001
                 ok = False
                 failed.append(f"{sid} ({type(e).__name__}: {str(e)[:80]})")
@@ -1573,35 +1856,139 @@ class DialogueOrchestrator:
         if failed:
             r.limitations.append(f"voice matching ({name}) could not learn {len(failed)} speaker(s): "
                                  f"{', '.join(failed[:6])}; their lines keep the stock voice")
+        if skipped:
+            r.limitations.append(f"voice matching ({name}) skipped {', '.join(skipped[:6])}: no clean "
+                                 f"speech of their own to learn from; their lines keep the stock voice")
         if self._vm_ready:
             r.model_versions["voice_match"] = name
 
-    def _voice_match(self, clip: Clip):
-        """Convert a fresh clip toward its original speaker. False or an
-        error leaves the stock-voice clip as it is (errors are reported)."""
+    def _voice_match(self, clip: Clip, fitted: bool = False) -> bool:
+        """Convert a clip toward its original speaker; True when it was.
+        A prepared speaker's clip the matcher leaves unconverted (it returned
+        False or failed) is recorded with the matcher's reason: the speaker
+        would otherwise have two voices (see _vm_consistency). `fitted`: the
+        clip is already placed (a second try after the fit), so only its
+        audio file changes, not its timing (the converter keeps the length)."""
         vm = getattr(self.c, "voice_matcher", None)
         if vm is None or clip.speaker_id not in self._vm_ready:
-            return
+            return False
         src = Path(clip.path)
         raw = src.with_name(src.stem + "_vm_raw.wav")
         dst = src.with_name(src.stem + "_vm.wav")
+        why = ""
         try:
             with self._vm_lock:      # one conversion at a time (one model, one GPU)
+                n_err = len(getattr(vm, "errors", None) or [])
                 ok = vm.convert(src, raw, clip.speaker_id)
-            if not ok or not raw.exists():
-                return
-            audio.to_wav(raw, dst)   # 48 kHz mono 16-bit, what the checks and the mix read
-            raw.unlink(missing_ok=True)
-            clip.path = str(dst)
-            clip.natural_duration = clip.final_duration = audio.probe_duration(dst)
-            clip.voice_params["voice_matched"] = True
+                errs = [str(x) for x in getattr(vm, "errors", None) or []]
+            # the matcher keeps each distinct reason once: a repeat of the
+            # speaker's last one adds nothing new to its list
+            new_errs = errs[n_err:] or [x for x in errs if x.startswith(f"{clip.speaker_id}:")][-1:]
+            if ok and raw.exists():
+                audio.to_wav(raw, dst)   # 48 kHz mono 16-bit, what the checks and the mix read
+                raw.unlink(missing_ok=True)
+                dur = audio.probe_duration(dst)
+                clip.voice_params["stock_path"] = str(src)
+                if fitted:
+                    clip.voice_params["stock_fitted"] = True
+                    clip.final_duration = dur
+                else:
+                    clip.natural_duration = clip.final_duration = dur
+                clip.path = str(dst)
+                clip.voice_params["voice_matched"] = True
+                with self._vm_lock:
+                    self._vm_fail_by_clip.pop(clip.clip_id, None)
+                return True
+            why = (new_errs[-1] if new_errs
+                   else "the converter left the clip unchanged (too short, or refused)")
         except Exception as e:  # noqa: BLE001
-            with self._vm_lock:
-                self._vm_errors.append(f"{clip.turn_id}: {type(e).__name__}: {str(e)[:100]}")
+            why = f"{type(e).__name__}: {str(e)[:100]}"
+        msg = f"{clip.turn_id}: {why[:160]}"
+        with self._vm_lock:
+            self._vm_errors.append(msg)
+            self._vm_fail_by_clip[clip.clip_id] = msg
+        return False
 
-    def _check_brief_genders(self, brief: Dict):
-        """The transcript says one gender, the voice analysis another: the
-        voice or the Hindi verb forms may be wrong. Reported, not overridden."""
+    def _vm_revert(self, c: Clip, fitted: bool) -> bool:
+        """Put a converted clip back to its stock-voice audio (same timing)."""
+        stock = c.voice_params.get("stock_path")
+        try:
+            if not stock or not Path(stock).is_file():
+                return False
+            src = dst = Path(stock)
+            if fitted and not c.voice_params.get("stock_fitted") and abs(c.stretch - 1.0) > 1e-3:
+                dst = src.with_name(src.stem + "_fit.wav")
+                audio.time_stretch(src, dst, c.stretch)
+            dur = audio.probe_duration(dst)
+        except Exception:  # noqa: BLE001
+            return False
+        c.path = str(dst)
+        if fitted:
+            c.final_duration = dur
+            c.scheduled_end = round(c.scheduled_start + dur, 3)
+        else:
+            c.natural_duration = c.final_duration = dur
+        c.voice_params["voice_matched"] = False
+        c.voice_params["voice_match_undone"] = True
+        return True
+
+    def _vm_consistency(self, fitted: bool):
+        """One voice per speaker with voice matching: a prepared speaker whose
+        accepted clips are only partly converted (the converter failed on
+        some) gets one more try on the rest; if that fails as well, its
+        converted clips go back to the stock voice and its later clips stay
+        stock. Only when even that is impossible are the two voices reported
+        as an unresolved failure (the status then says so)."""
+        vm = getattr(self.c, "voice_matcher", None)
+        if vm is None or not self._vm_ready:
+            return
+        name = getattr(vm, "name", "") or self.cfg.voice_match
+        accepted = [c for c in self.clips.values() if c.accepted]
+        for sid in sorted(self._vm_ready):
+            mine = [c for c in accepted if c.speaker_id == sid]
+            conv = [c for c in mine if c.voice_params.get("voice_matched")]
+            plain = [c for c in mine if not c.voice_params.get("voice_matched")]
+            if not conv or not plain:
+                continue
+            for c in plain:
+                self._check_cancel()
+                self._voice_match(c, fitted=fitted)
+            plain = [c for c in plain if not c.voice_params.get("voice_matched")]
+            if not plain:
+                continue
+            self._vm_ready.discard(sid)
+            stuck = [c for c in conv if not self._vm_revert(c, fitted)]
+            if stuck:
+                self.report.unresolved_failures.append(
+                    f"voice_match_mixed {sid}: {len(stuck)} line(s) sound like the original speaker "
+                    f"and {len(mine) - len(stuck)} keep the stock voice (voice matching failed on "
+                    f"some lines and could not be undone)")
+            else:
+                self.report.limitations.append(
+                    f"voice matching ({name}) failed on {len(plain)} of {sid}'s {len(mine)} line(s): "
+                    f"all of {sid}'s lines keep the stock voice (one voice per speaker)")
+
+    def _vm_report(self):
+        """After the last conversion: the per-clip failures still in the dub
+        (reported by _finalise) and an honest model note when no line was
+        converted at all."""
+        vm = getattr(self.c, "voice_matcher", None)
+        if vm is None:
+            return
+        accepted = [c for c in self.clips.values() if c.accepted]
+        stock = {c.clip_id for c in accepted if not c.voice_params.get("voice_matched")}
+        with self._vm_lock:
+            self._vm_errors[:] = [m for cid, m in self._vm_fail_by_clip.items() if cid in stock]
+        r = self.report
+        if r.model_versions.get("voice_match") and not any(
+                c.voice_params.get("voice_matched") for c in accepted):
+            r.model_versions["voice_match"] = (f"{r.model_versions['voice_match']} (not applied: "
+                                               f"every line keeps the stock voice)")
+
+    def _check_brief_genders(self, brief: Dict, by_user: bool = False):
+        """The transcript says one gender, the voice analysis (or, by_user,
+        the reviewer's category) another: the voice or the Hindi verb forms
+        may be wrong. Reported, not overridden."""
         cat_of = {"male": CATEGORY_MALE, "female": CATEGORY_FEMALE}
         for sid, v in (brief.get("speakers") or {}).items():
             rec = self.registry.speakers.get(sid)
@@ -1609,10 +1996,14 @@ class DialogueOrchestrator:
             if not rec or not want or rec.voice_category not in (CATEGORY_MALE, CATEGORY_FEMALE):
                 continue
             if rec.voice_category != want:
-                self.report.content_warnings.append({
-                    "type": "speaker_gender_disagreement", "speaker_id": sid,
-                    "voice_category": rec.voice_category, "transcript_gender": v.get("gender"),
-                    "evidence": v.get("evidence", "")})
+                w = {"type": "speaker_gender_disagreement", "speaker_id": sid,
+                     "voice_category": rec.voice_category, "transcript_gender": v.get("gender"),
+                     "evidence": v.get("evidence", "")}
+                if by_user:
+                    w["set_by_user"] = True
+                    w["note"] = ("the voice category chosen in review contradicts the story brief: "
+                                 "check gendered Hindi forms (verb endings, adjectives)")
+                self.report.content_warnings.append(w)
 
     def _use_vocals(self) -> bool:
         return bool(self.cfg.analysis_audio == "vocals" and getattr(self, "vocals_16k", None))
@@ -1725,10 +2116,18 @@ class DialogueOrchestrator:
             self.report.unresolved_failures.append(
                 f"speaker_mixed_providers {u['speaker_id']}: turns {u['turn_ids']} still use "
                 f"a different provider voice")
-        for spk in self.router.speaker_provider:
+        for spk, prov in self.router.speaker_provider.items():
             self.report.limitations.append(
-                f"speaker {spk} voiced entirely by fallback provider "
-                f"'{self.router.speaker_provider[spk]}' (degraded)")
+                f"speaker {spk} voiced entirely by fallback provider '{prov}' (degraded)")
+            # the reviewer chose this speaker's voice: say plainly it is not the one heard
+            rec = self.registry.speakers.get(spk)
+            own = self.router.primary_for(spk)
+            chosen = (rec.provider_voices.get(own) if rec else None) or {}
+            if chosen.get("override"):
+                used = (rec.provider_voices.get(prov) or {}).get("voice")
+                self.report.unresolved_failures.append(
+                    f"your voice choice for {spk} ({own}: {chosen.get('voice')}) could not be used: "
+                    f"{own} failed, so its lines were voiced by '{prov}' ({used}) instead")
 
     # verification
     def _refit(self, t: Turn, old: Clip, new: Clip):
