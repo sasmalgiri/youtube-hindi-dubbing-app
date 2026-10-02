@@ -263,7 +263,10 @@ def test_resume_skips_to_voicing_and_reuses_unchanged_lines(tmp_path):
                      cfg={"resume": True, "voice_overrides": {"SPEAKER_00": {"category": "female_like"}}})
     res3 = orch3.run()
     rep3 = _report(res3)
-    assert res3.status == "completed", res3.reasons
+    # the story brief says SPEAKER_00 is a man: the Hindi may carry male forms
+    assert res3.status == "completed_with_warnings", res3.reasons
+    assert [(w["type"], w["speaker_id"], w.get("set_by_user")) for w in rep3["content_warnings"]] == \
+        [("speaker_gender_disagreement", "SPEAKER_00", True)]
     assert len(prov.calls) == 7
     assert {c["voice"] for c in prov.calls[-2:]} == {"mock-female-2"}   # a voice SPEAKER_01 does not use
     assert _clip_of(orch3, "t0002").spoken_text == new_line              # earlier edit kept

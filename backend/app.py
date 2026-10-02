@@ -274,6 +274,14 @@ class Job:
     # {"turn_edits", "voice_overrides", "speaker_merges"}. Each re-voice
     # applies all of them again on top of the job's own checkpoint.
     dialogue_edits: Dict[str, Any] = field(default_factory=dict)
+    # Output options a re-voice was given explicitly (keep_original_audio,
+    # english_subtitles, burn_subtitles, container): they win over the
+    # module matrix params, and later re-voices keep them.
+    dialogue_output: Dict[str, Any] = field(default_factory=dict)
+    # While a re-voice is queued or running: the job as it was before it
+    # (result, saved copy, edits, ...). A re-voice that does not finish
+    # (failed, cancelled, server restart) puts it back.
+    dialogue_revoice_prev: Optional[Dict] = None
 
 
 class JobCreateRequest(BaseModel):
@@ -497,8 +505,9 @@ SAVED_DIR.mkdir(parents=True, exist_ok=True)
 # Supabase secondary writer was removed because it added no value for a
 # single-machine workflow and the supabase package's websockets dependency
 # was broken on this Python install.
+# The jobs are loaded at the end of this module (_load_jobs): rebuilding a
+# stored request runs its validators, which use helpers defined further down.
 _store = JobStore(STATE_DIR / "jobs.db")
-_store.load_all(JOBS)
 
 
 def _settle_loaded_jobs(jobs: Dict[str, "Job"], store) -> None:
@@ -507,17 +516,24 @@ def _settle_loaded_jobs(jobs: Dict[str, "Job"], store) -> None:
         # The store cannot serialise threading.Event: loaded jobs need a fresh one.
         if not isinstance(j.pause_event, threading.Event):
             j.pause_event = threading.Event()
+        if j.dialogue_revoice_prev is not None:
+            # A re-voice was queued or running when the server stopped: the job
+            # goes back to what it was (outputs and checkpoint too).
+            _recover_revoice_files(j)
+            with _dialogue_lock:
+                _restore_revoice(j, "interrupted", "the server restarted during the re-voice")
+                j.dialogue_revoice_prev = None
+            store.save(j)
+            continue
         if j.dialogue_review is not None:
             # Paused for the dialogue review when the server stopped: its worker
-            # is gone (the store already marked it error). The checkpoint is kept.
+            # is gone (the store already marked it error). The checkpoint is kept,
+            # and GET .../dialogue/review still serves the packet (work/review.json).
             j.dialogue_review = None
             j.error = j.error or "Server restarted while the job waited for review"
             j.message = ("Server restarted while the job waited for review — "
                          "re-voice it to continue from its checkpoint")
             store.save(j)
-
-
-_settle_loaded_jobs(JOBS, _store)
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
@@ -1195,8 +1211,8 @@ def _dialogue_review_hook(job: Job):
                          "turn_id": t.get("turn_id")} for t in (packet or {}).get("turns") or []]
         job.state = "review_translation"
         job.message = DIALOGUE_REVIEW_MESSAGE
-        job.events.append({"type": "review", "step": "translate", "progress": 1.0,
-                           "overall": round(job.overall_progress, 3),
+        job.events.append({"type": "review", "state": "review_translation", "step": "translate",
+                           "progress": 1.0, "overall": round(job.overall_progress, 3),
                            "message": DIALOGUE_REVIEW_MESSAGE})
         _store.save(job)
         while not job.pause_event.wait(0.5):
@@ -1226,15 +1242,124 @@ def _drop_saved_copy(job: Job) -> None:
         print(f"[hindi_dialogue] could not remove the old copy {old}: {e}", flush=True)
 
 
+def _save_dialogue_copy(job: Job, out_dir: Path, folder: Path, replace_old: bool) -> bool:
+    """Copy out_dir to the saved folder: into a staging folder first, then
+    (and only then) the job's earlier copy is removed and the new one put in
+    its place. A copy that fails (disk full) leaves the earlier copy alone."""
+    staging = folder.with_name(f".{folder.name}.partial")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        shutil.copytree(out_dir, staging)
+        if replace_old:
+            _drop_saved_copy(job)
+        if folder.exists():
+            shutil.rmtree(folder)
+        os.replace(staging, folder)
+        return True
+    except Exception as e:
+        print(f"[hindi_dialogue] could not copy outputs to {folder}: {e}", flush=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        return False
+
+
+# Job fields a re-voice changes; a re-voice that does not finish puts them back.
+_REVOICE_FIELDS = ("state", "message", "error", "result_status", "status_reasons", "result_path",
+                   "saved_folder", "saved_video", "subtitles_path", "report_path", "speakers",
+                   "segments", "dialogue_edits", "dialogue_output", "current_step", "step_progress",
+                   "overall_progress", "step_times")
+_REVOICE_REQUEST_FIELDS = ("dialogue_keep_original_audio", "dialogue_english_subtitles",
+                           "dialogue_burn_subtitles", "dialogue_container")
+
+
+def _revoice_snapshot(job: Job) -> Dict[str, Any]:
+    """The job before a re-voice (JSON-safe: it is persisted with the job)."""
+    import copy
+    snap = {k: copy.deepcopy(getattr(job, k, None)) for k in _REVOICE_FIELDS}
+    snap["result_path"] = str(job.result_path) if job.result_path else None
+    snap["request"] = {k: getattr(job.original_req, k, None) for k in _REVOICE_REQUEST_FIELDS}
+    return snap
+
+
+def _restore_revoice(job: Job, outcome: str, reason: str = "") -> bool:
+    """Put the job back as it was before its re-voice (caller holds
+    _dialogue_lock). outcome: "cancelled" keeps the earlier message;
+    "failed" / "interrupted" say why nothing changed. Idempotent: the
+    snapshot stays (marked restored) until the re-voice's worker is gone,
+    and applying it again gives the same job. False when there is none."""
+    import copy
+    snap = job.dialogue_revoice_prev
+    if snap is None:
+        return False
+    for k in _REVOICE_FIELDS:
+        if k in snap:
+            setattr(job, k, copy.deepcopy(snap[k]))
+    job.result_path = Path(snap["result_path"]) if snap.get("result_path") else None
+    for k, v in (snap.get("request") or {}).items():
+        if job.original_req is not None and v is not None:
+            setattr(job.original_req, k, v)
+    first = not snap.get("restored")
+    if first:
+        snap["restored"], snap["reason"] = outcome, reason
+    outcome, reason = snap["restored"], snap.get("reason") or ""
+    if outcome == "failed":
+        job.message = (f"Re-voice failed — nothing was changed, the previous result is kept"
+                       + (f": {reason}" if reason else ""))[:300]
+    elif outcome == "interrupted":
+        job.message = (f"Re-voice stopped ({reason}) — nothing was changed, "
+                       f"the previous result is kept")[:300]
+    if first:
+        job.events.append({"type": "complete", "state": job.state, "result_status": job.result_status,
+                           "revoice": outcome, "message": job.message})
+    return True
+
+
+def _recover_revoice_files(job: Job) -> None:
+    """The job folder after a re-voice that did not finish: the outputs and
+    checkpoint the orchestrator moved aside go back (no-op otherwise)."""
+    try:
+        from dubbing.dialogue.orchestrator import recover_interrupted_run
+        job_dir = OUTPUTS / job.id
+        recover_interrupted_run(job_dir / "work", job_dir / "dialogue_out")
+    except Exception as e:  # noqa: BLE001
+        print(f"[hindi_dialogue] could not put back the outputs of {job.id}: {e}", flush=True)
+
+
+def _end_revoice_unchanged(job: Job, outcome: str, reason: str = "",
+                           failed_report: Optional[Path] = None) -> None:
+    """A re-voice ended without a new result: the job is put back as it was
+    (its outputs and checkpoint were put back by the orchestrator)."""
+    with _dialogue_lock:
+        if failed_report is not None and Path(failed_report).is_file():
+            job.events.append({"type": "note", "message": f"Report of the re-voice that did not "
+                                                          f"finish: {failed_report}"})
+        restored = _restore_revoice(job, outcome, reason)
+        job.dialogue_revoice_prev = None
+        if not restored:
+            # No snapshot (should not happen): at least report it honestly.
+            job.state = "error"
+            job.result_status = outcome
+            job.error = reason or outcome
+            job.message = f"Re-voice {outcome}" + (f": {reason}" if reason else "")
+            job.events.append({"type": "complete", "state": "error", "error": job.error,
+                               "result_status": outcome})
+    _store.save(job)
+
+
 def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional[Path] = None,
-                       english_srt: Optional[Path] = None, resume: bool = False):
+                       english_srt: Optional[Path] = None, resume: bool = False,
+                       cancel_event: Optional[threading.Event] = None):
     """pipeline_mode="hindi_dialogue": the shared speaker-aware dialogue path.
 
     Runs inside the caller's pipeline semaphore. Never deletes partial assets:
     a failed or draft job keeps its work folder and report for review.
     resume=True (re-voice): same work/output folders, this job's checkpoint,
-    every edit in job.dialogue_edits; the saved-folder copy is replaced.
+    every edit in job.dialogue_edits; the saved-folder copy is replaced once
+    the re-voice finished. One that fails or is cancelled changes nothing:
+    the job, its outputs, checkpoint and saved copy stay as they were.
+    `cancel_event`: this run's cancel flag (a re-voice's; job.cancel_event
+    otherwise). Stopping a re-voice gives the job a fresh one.
     """
+    cancel_ev = cancel_event or job.cancel_event
     from dataclasses import fields as _dc_fields
     from dubbing.dialogue.orchestrator import DialogueConfig, run_dialogue
 
@@ -1270,6 +1395,10 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         print(f"[hindi_dialogue] {msg}", flush=True)
         job.events.append({"type": "note", "message": msg})
     if not resolution.ok:
+        if resume:
+            _end_revoice_unchanged(job, "failed", "cannot run on this PC: "
+                                   + " | ".join(resolution.blocking))
+            return
         job.state = "error"
         job.result_status = "failed"
         job.error = "Cannot run on this PC: " + " | ".join(resolution.blocking)
@@ -1279,12 +1408,14 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         _store.save(job)
         return
 
-    # Review/output options from the request on top of the module matrix; a
-    # re-voice adds this job's checkpoint and every edit made so far (the
-    # user has reviewed already, so it does not pause again).
+    # Review/output options from the request on top of the module matrix
+    # (output options a re-voice was given win over both); a re-voice adds
+    # this job's checkpoint and every edit made so far (the user has
+    # reviewed already, so it does not pause again).
     conf = dict(resolution.config)
     for k, v in _dialogue_request_overrides(req).items():
         conf[k] = {**(conf.get(k) or {}), **v} if k == "voice_overrides" else v
+    conf.update(job.dialogue_output or {})
     if resume:
         edits = job.dialogue_edits or {}
         conf.update(resume=True, review_before_voice=False,
@@ -1324,14 +1455,39 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         n = "review before voicing is not available in this orchestrator: the job runs straight through"
         print(f"[hindi_dialogue] {n}", flush=True)
         job.events.append({"type": "note", "message": n})
+    report_progress = _make_progress_callback(job, DIALOGUE_STEP_WEIGHTS)
+
+    def on_progress(step: str, frac: float, msg: str):
+        if not cancel_ev.is_set():     # once cancelled, the job shows the cancel, not the run stopping
+            report_progress(step, frac, msg)
     try:
-        res = run_dialogue(cfg, on_progress=_make_progress_callback(job, DIALOGUE_STEP_WEIGHTS),
-                           cancel_check=job.cancel_event.is_set, **run_kw)
+        res = run_dialogue(cfg, on_progress=on_progress, cancel_check=cancel_ev.is_set, **run_kw)
     finally:
         job.pipeline_ref = None   # run over: nothing left to kill; /transcript shows the turns
 
-    job.result_status = res.status
-    job.status_reasons = list(res.reasons)
+    status, reasons = res.status, list(res.reasons)
+    if resume:
+        if status in ("failed", "cancelled"):
+            # Nothing changed: the orchestrator put the earlier outputs and
+            # checkpoint back; the job and its saved copy go back too.
+            _end_revoice_unchanged(job, status, "; ".join(reasons)[:300], res.report_md)
+            return
+        with _dialogue_lock:
+            snap = job.dialogue_revoice_prev
+            if snap is not None:
+                snap["committing"] = True       # too late to stop: DELETE now answers 409
+            late = bool(snap is None or snap.get("restored"))
+        if late:
+            # Stopped just as it finished: the new outputs are already in place.
+            job.events.append({"type": "note", "message": "The re-voice finished before it "
+                                                          "could be stopped"})
+    elif cancel_ev.is_set() and status not in ("failed", "cancelled"):
+        # Cancelled after the last check of the run: the cancel stands (its
+        # cleanup removes this job folder once this thread is done).
+        status, reasons = "cancelled", ["cancelled by user"]
+
+    job.result_status = status
+    job.status_reasons = reasons
     job.report_path = str(res.report_md)
     job.segments = [{"start": t.source_start, "end": t.source_end, "text": t.source_text,
                      "text_translated": t.speech_text, "speaker_id": t.speaker_id,
@@ -1352,26 +1508,27 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         job.video_title = (Path(req.url).stem if not re.match(r"^https?://", req.url or "")
                            else req.url.rstrip("/").split("/")[-1].split("=")[-1]) or "Untitled"
 
-    # Save a titled copy of every deliverable (video, subtitles, report, stems)
+    # Save a titled copy of every deliverable (video, subtitles, report, stems).
+    # A re-voice's copy replaces the earlier one (refreshed, not merged; the
+    # output folder holds this run's files only).
     title = _sanitize_filename(job.video_title)
-    folder = SAVED_DIR / f"{title} [HI Dialogue {res.status}] ({job.id})"
-    if resume:
-        _drop_saved_copy(job)   # refreshed, not merged with the earlier run's files
-    try:
-        shutil.copytree(out_dir, folder, dirs_exist_ok=True)
+    folder = SAVED_DIR / f"{title} [HI Dialogue {status}] ({job.id})"
+    saved = _save_dialogue_copy(job, out_dir, folder, replace_old=resume)
+    if saved:
         job.saved_folder = str(folder)
         if res.output_video and res.output_video.exists():
             job.saved_video = str(folder / res.output_video.name)
-    except Exception as e:
-        print(f"[hindi_dialogue] could not copy outputs to {folder}: {e}", flush=True)
+    elif resume:
+        job.events.append({"type": "note", "message": "The re-voiced outputs could not be copied to "
+                                                      "the saved folder (the earlier copy is kept)"})
     # Subtitles button: the saved copy (outlives the job folder), else dialogue_out's.
     if res.subtitles:
         saved_srt = folder / res.subtitles.name
-        srt = saved_srt if saved_srt.exists() else res.subtitles
+        srt = saved_srt if saved and saved_srt.exists() else res.subtitles
         if srt.exists():
             job.subtitles_path = str(srt)
 
-    if res.output_video and res.output_video.exists():
+    if status not in ("failed", "cancelled") and res.output_video and res.output_video.exists():
         job.result_path = res.output_video
     labels = {
         "completed": "Complete",
@@ -1380,18 +1537,21 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         "cancelled": "Cancelled — partial assets kept",
         "failed": "Failed — partial assets and report kept",
     }
-    job.message = labels.get(res.status, res.status)
+    job.message = labels.get(status, status)
     job.overall_progress = 1.0
-    if res.status in ("failed", "cancelled"):
+    if status in ("failed", "cancelled"):
         job.state = "error"
-        job.error = "; ".join(res.reasons)[:500] or res.status
+        job.error = "; ".join(reasons)[:500] or status
         job.events.append({"type": "complete", "state": "error", "error": job.error,
-                           "result_status": res.status})
+                           "result_status": status})
     else:
         job.state = "done"
-        job.events.append({"type": "complete", "state": "done", "result_status": res.status})
-        if job.source_url and res.status == "completed" and not job.chain_languages:
+        job.events.append({"type": "complete", "state": "done", "result_status": status})
+        if job.source_url and status == "completed" and not job.chain_languages:
             _mark_url_completed(job.source_url)
+    if resume:
+        with _dialogue_lock:
+            job.dialogue_revoice_prev = None
     _store.save(job)
 
 
@@ -2976,7 +3136,8 @@ def _cleanup_old_jobs():
     # Clean in-memory jobs exceeding limit
     if len(JOBS) > MAX_JOBS:
         completed = sorted(
-            [(jid, j) for jid, j in list(JOBS.items()) if j.state in ("done", "error")],
+            [(jid, j) for jid, j in list(JOBS.items())
+             if j.state in ("done", "error") and j.dialogue_revoice_prev is None],
             key=lambda x: x[1].created_at,
         )
         while len(JOBS) > MAX_JOBS and completed:
@@ -3733,11 +3894,19 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
         "tts_chunk_words": getattr(req, "tts_chunk_words", 0),
         "gap_mode": getattr(req, "gap_mode", "micro"),
         # ── Hindi dialogue review / outputs ──
+        # (output options a re-voice was given win; the container is the one
+        # the job's video was actually written in, a module param included)
         "dialogue_review": getattr(req, "dialogue_review", False),
-        "dialogue_keep_original_audio": getattr(req, "dialogue_keep_original_audio", False),
-        "dialogue_english_subtitles": getattr(req, "dialogue_english_subtitles", True),
-        "dialogue_burn_subtitles": getattr(req, "dialogue_burn_subtitles", False),
-        "dialogue_container": getattr(req, "dialogue_container", "mp4"),
+        "dialogue_keep_original_audio": (job.dialogue_output or {}).get(
+            "keep_original_audio", getattr(req, "dialogue_keep_original_audio", False)),
+        "dialogue_english_subtitles": (job.dialogue_output or {}).get(
+            "english_subtitles", getattr(req, "dialogue_english_subtitles", True)),
+        "dialogue_burn_subtitles": (job.dialogue_output or {}).get(
+            "burn_subtitles", getattr(req, "dialogue_burn_subtitles", False)),
+        "dialogue_container": (job.result_path.suffix.lstrip(".").lower()
+                               if job.result_path and job.result_path.suffix.lower() in (".mp4", ".mkv")
+                               else (job.dialogue_output or {}).get(
+                                   "container", getattr(req, "dialogue_container", "mp4"))),
     }
 
 
@@ -3784,12 +3953,22 @@ def get_job(job_id: str):
         # (None otherwise), and whether a re-voice can start now.
         "dialogue_review":    job.dialogue_review,
         "dialogue_revoice_ready": _dialogue_revoice_ready(job),
+        # a re-voice of this job is queued or running (DELETE stops only it)
+        "dialogue_revoice_running": _dialogue_revoice_running(job),
     }
 
 
+def _dialogue_revoice_running(job: Job) -> bool:
+    snap = job.dialogue_revoice_prev
+    return bool(snap is not None and not snap.get("restored") and job.state in ("queued", "running"))
+
+
 def _dialogue_revoice_ready(job: Job) -> bool:
+    worker = job.worker_thread
     try:
         return (_is_dialogue_job(job) and job.state in ("done", "error")
+                and job.dialogue_revoice_prev is None
+                and not (worker is not None and worker.is_alive())
                 and not job.cancel_event.is_set() and _dialogue_checkpoint(job).is_file())
     except OSError:
         return False
@@ -4147,7 +4326,9 @@ def _edits_from(body: Optional[DialogueEditsRequest]) -> Dict[str, Any]:
 @app.get("/api/jobs/{job_id}/dialogue/review")
 def get_dialogue_review(job_id: str):
     """The review packet: the live one while the job waits for review, else
-    the finished run's (job folder, then the saved copy)."""
+    the last run's (job folder, then the saved copy), else the before_voice
+    packet of a job stopped before voicing (server restart during the review
+    pause). "job_stage" says which one it is."""
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -4156,6 +4337,7 @@ def get_dialogue_review(job_id: str):
     candidates = [OUTPUTS / job.id / "dialogue_out" / "review.json"]
     if job.saved_folder:
         candidates.append(Path(job.saved_folder) / "review.json")
+    candidates.append(OUTPUTS / job.id / "work" / "review.json")
     for p in candidates:
         try:
             if p.is_file():
@@ -4193,28 +4375,50 @@ def _dialogue_srt_inputs(job: Job, req: JobCreateRequest) -> Dict[str, Path]:
             else {"translated_srt": srt})
 
 
-def _run_dialogue_revoice(job: Job, req: JobCreateRequest):
+def _run_dialogue_revoice(job: Job, req: JobCreateRequest,
+                          cancel_event: Optional[threading.Event] = None):
     """Re-voice a finished dialogue job from its own checkpoint (background
-    thread, one pipeline at a time like every other job)."""
+    thread, one pipeline at a time like every other job). `cancel_event` is
+    this re-voice's own flag: stopping it (DELETE) sets it and gives the job
+    a fresh one, so a later re-voice is not born cancelled."""
+    cancel = cancel_event or job.cancel_event
     job.message = "Waiting for a pipeline slot..."
-    _pipeline_semaphore.acquire()
+    while not _pipeline_semaphore.acquire(timeout=0.5):
+        if cancel.is_set():              # stopped while queued: DELETE put the job back
+            _end_revoice_unchanged(job, "cancelled")
+            return
     try:
-        if job.cancel_event.is_set():
-            return                       # cancelled while queued: the cancel marked the job
-        job.state = "running"
-        job.message = "Re-voicing from this job's checkpoint..."
+        with _dialogue_lock:             # DELETE decides queued-or-running under this lock
+            snap = job.dialogue_revoice_prev
+            go = not cancel.is_set() and snap is not None and not snap.get("restored")
+            if go:
+                job.state = "running"
+                job.message = "Re-voicing from this job's checkpoint..."
+        if not go:
+            _end_revoice_unchanged(job, "cancelled")
+            return
         _store.save(job)
-        _run_dialogue_mode(job, req, resume=True, **_dialogue_srt_inputs(job, req))
+        _run_dialogue_mode(job, req, resume=True, cancel_event=cancel,
+                           **_dialogue_srt_inputs(job, req))
     except Exception as e:
         import traceback
         print(f"[REVOICE ERROR] {e}\n{traceback.format_exc()}", flush=True)
         _crash_dump_job(job, e)
-        # The job folder (checkpoint, earlier outputs) stays for another try.
-        job.state = "error"
-        job.error = str(e)
-        job.message = f"Error: {e}"
-        job.events.append({"type": "complete", "state": "error", "error": str(e)})
-        _store.save(job)
+        snap = job.dialogue_revoice_prev
+        if snap is not None and snap.get("committing") and not snap.get("restored"):
+            # The re-voice had finished (its outputs are in place) but saving
+            # them failed: report that on the job as it now is.
+            with _dialogue_lock:
+                job.dialogue_revoice_prev = None
+            job.state = "error"
+            job.error = str(e)
+            job.message = f"Error: {e}"
+            job.events.append({"type": "complete", "state": "error", "error": str(e)})
+            _store.save(job)
+        else:
+            # Nothing changes: the earlier outputs, checkpoint and saved copy stay.
+            _recover_revoice_files(job)
+            _end_revoice_unchanged(job, "cancelled" if cancel.is_set() else "failed", str(e)[:300])
     finally:
         try:
             _purge_global_caches()
@@ -4242,7 +4446,8 @@ def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = N
         worker = job.worker_thread
         if not _is_dialogue_job(job):
             raise HTTPException(status_code=409, detail="Only Hindi dialogue jobs can be re-voiced")
-        if job.state not in ("done", "error") or (worker is not None and worker.is_alive()):
+        if job.state not in ("done", "error") or (worker is not None and worker.is_alive()) \
+                or job.dialogue_revoice_prev is not None:
             raise HTTPException(status_code=409, detail=f"Job is still running (state={job.state})")
         if job.cancel_event.is_set():
             # Cancel removes the job folder once its worker stops.
@@ -4251,12 +4456,19 @@ def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = N
             raise HTTPException(status_code=409,
                                 detail="This job has no checkpoint to re-voice from; run it again")
         req = job.original_req
-        # Output options given here replace the job's own (later re-voices keep them).
+        # The job as it is now: a re-voice that does not finish puts it back.
+        job.dialogue_revoice_prev = _revoice_snapshot(job)
+        # Output options given here replace the job's own, module matrix
+        # params included (later re-voices keep them).
+        output = dict(job.dialogue_output or {})
         for key in ("keep_original_audio", "english_subtitles", "burn_subtitles"):
             if getattr(body, key) is not None:
                 setattr(req, f"dialogue_{key}", bool(getattr(body, key)))
+                output[key] = bool(getattr(body, key))
         if container:
             req.dialogue_container = container
+            output["container"] = container
+        job.dialogue_output = output
         job.dialogue_edits = _merge_dialogue_edits(job.dialogue_edits or {}, edits)
         # A fresh run of the same job: same folders, new outcome.
         job.cancel_event = threading.Event()
@@ -4273,7 +4485,8 @@ def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = N
         job.step_times, job._step_start = {}, 0.0
         job.events.clear()   # in place: SSE generators re-sync on the shorter list
         _store.save(job)
-        t = threading.Thread(target=_run_dialogue_revoice, args=(job, req), daemon=True)
+        t = threading.Thread(target=_run_dialogue_revoice, args=(job, req, job.cancel_event),
+                             daemon=True)
         job.worker_thread = t
         t.start()
     return {"status": "started"}
@@ -4321,6 +4534,22 @@ class VoicePreviewRequest(BaseModel):
 VOICE_PREVIEW_TEXT = "नमस्ते, यह मेरी आवाज़ है।"
 
 
+def _pool_slot_ok(provider: str, voice: Any, pitch: Optional[str]) -> bool:
+    """(voice, pitch) is a voice a speaker of this job can have been bound to
+    with `provider`: any slot of its curated pools, child_like included, and,
+    for a provider with pitch but no child pool, a female voice raised to
+    +25Hz (SpeakerRegistry.bind_provider's child fallback)."""
+    from dubbing.dialogue.contracts import CATEGORY_CHILD, CATEGORY_FEMALE, CATEGORY_MALE
+    from dubbing.dialogue.speaker_registry import curated_pools
+    from dubbing.hindi_voices import split_slot
+    pool = curated_pools().get(provider) or {}
+    slots = [split_slot(s) for cat in (CATEGORY_MALE, CATEGORY_FEMALE, CATEGORY_CHILD)
+             for s in pool.get(cat) or []]
+    if pool.get("supports_pitch") and not pool.get(CATEGORY_CHILD):
+        slots += [(split_slot(s)[0], "+25Hz") for s in pool.get(CATEGORY_FEMALE) or []]
+    return any(v == voice and (pitch is None or p == pitch) for v, p in slots)
+
+
 @app.post("/api/dialogue/voice-preview")
 def dialogue_voice_preview(body: VoicePreviewRequest):
     """A short Hindi sample of one bindable voice, as WAV. Cached per
@@ -4336,7 +4565,7 @@ def dialogue_voice_preview(body: VoicePreviewRequest):
     opts = _dialogue_voice_options().get(prov_name)
     if opts is None:
         raise HTTPException(status_code=400, detail=f"Unknown TTS provider {prov_name!r}")
-    if not _voice_option_ok(opts, body.voice, pitch):
+    if not (_voice_option_ok(opts, body.voice, pitch) or _pool_slot_ok(prov_name, body.voice, pitch)):
         raise HTTPException(status_code=400, detail=f"{prov_name} has no voice {body.voice!r}"
                                                     + (f" with pitch {pitch}" if pitch else ""))
     if not opts.get("preview"):
@@ -4634,8 +4863,8 @@ def list_outputs():
             return outputs
         for folder in folders:
             try:
-                if not folder.is_dir():
-                    continue
+                if not folder.is_dir() or folder.name.endswith(".partial"):
+                    continue     # (a dialogue copy being written)
                 videos = list(folder.glob("*.mp4"))
                 desc_file = folder / "description.txt"
                 outputs.append({
@@ -4767,6 +4996,30 @@ def delete_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # A re-voice of a finished dialogue job (queued or running): stop only the
+    # re-voice. The job keeps its folder, checkpoint, earlier result and saved
+    # copy, and is back as it was at once; the worker then puts back the
+    # outputs it moved aside. (Asked again while it winds down: same answer.)
+    with _dialogue_lock:
+        snap = job.dialogue_revoice_prev
+        if snap is not None and (snap.get("restored") or job.state in ("queued", "running")):
+            if snap.get("restored"):
+                return {"status": "revoice_cancelled"}
+            if snap.get("committing"):
+                raise HTTPException(status_code=409,
+                                    detail="The re-voice has finished; its outputs are being saved")
+            job.cancel_event.set()
+            pipeline = getattr(job, "pipeline_ref", None)
+            if pipeline is not None and hasattr(pipeline, "_kill_all_procs"):
+                try:
+                    pipeline._kill_all_procs()
+                except Exception as e:
+                    print(f"[CANCEL] _kill_all_procs failed for {job_id}: {e}", flush=True)
+            _restore_revoice(job, "cancelled")
+            job.cancel_event = threading.Event()   # the worker keeps the one it was given
+            _store.save(job)
+            return {"status": "revoice_cancelled"}
 
     # A job paused for review still has a live worker (a hindi_dialogue job
     # holds the pipeline slot and polls the cancel flag while it waits).
@@ -5149,6 +5402,17 @@ def _on_startup():
         print(f"[STARTUP] Startup cleanup failed: {e}", flush=True)
 
     print("[STARTUP] Server ready.", flush=True)
+
+
+def _load_jobs() -> None:
+    """Job history from jobs.db. Runs once every helper above exists: a stored
+    request is rebuilt through its validators (uvicorn app:app imports this
+    module and reads the store before any request is served)."""
+    _store.load_all(JOBS)
+    _settle_loaded_jobs(JOBS, _store)
+
+
+_load_jobs()
 
 
 # ── Direct-launch entry point ─────────────────────────────────────────────

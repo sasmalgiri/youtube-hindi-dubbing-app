@@ -74,12 +74,23 @@ def _dict_to_job(data: dict) -> "Job":
         if data.get(field):
             data[field] = Path(data[field])
 
-    # Re-hydrate original_req (Pydantic model)
+    # Re-hydrate original_req (Pydantic model). It was valid when the job was
+    # created; a value that no longer validates (a voice since dropped from
+    # the curated pools) must not strip the job of its request, which would
+    # make a dialogue job look like a classic one (no review, no re-voice).
     if isinstance(data.get("original_req"), dict):
+        raw = data["original_req"]
         try:
-            data["original_req"] = JobCreateRequest(**data["original_req"])
-        except Exception:
-            data["original_req"] = None
+            data["original_req"] = JobCreateRequest(**raw)
+        except Exception as e:
+            print(f"[JobStore] job {data.get('id')}: stored request no longer validates "
+                  f"({type(e).__name__}: {str(e)[:300]}); kept as stored", flush=True)
+            try:
+                construct = getattr(JobCreateRequest, "model_construct", None) or JobCreateRequest.construct
+                data["original_req"] = construct(**raw)
+            except Exception as e2:
+                print(f"[JobStore] job {data.get('id')}: request dropped ({e2})", flush=True)
+                data["original_req"] = None
 
     # Strip keys unknown to the dataclass
     import dataclasses
@@ -124,11 +135,18 @@ class JobStore:
                 if effective_state not in ("queued", "running", "done", "error", "waiting_for_srt"):
                     effective_state = "error"
                 data["state"] = effective_state
-                # Jobs that were 'running' when the server died → mark as error
-                was_running = (effective_state == "running")
-                if was_running:
+                # Jobs that were 'running' when the server died → mark as error.
+                # A 'queued' one has no worker either (nothing re-queues it):
+                # left as is it would wait forever. (A queued dialogue
+                # re-voice is put back by app._settle_loaded_jobs.)
+                was_running = effective_state in ("running", "queued")
+                if effective_state == "running":
                     data["state"] = "error"
                     data["message"] = "Server restarted while job was running"
+                    data["error"] = "Server restarted"
+                elif effective_state == "queued":
+                    data["state"] = "error"
+                    data["message"] = "Server restarted before this job started — please resubmit"
                     data["error"] = "Server restarted"
                 # Ensure list fields default correctly when missing from old DB rows
                 if not isinstance(data.get("chain_languages"), list):

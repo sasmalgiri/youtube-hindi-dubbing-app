@@ -473,8 +473,15 @@ class TTSRouter:
         prov = self.providers.get(self.providers_for(speaker_id)[0])
         return bool(prov is not None and prov.native_rate)
 
+    def primary_for(self, speaker_id: str) -> str:
+        """The provider a speaker is meant to be voiced by: the one a reviewer
+        chose a voice on (registry.provider_pins), else the job's first."""
+        pin = (getattr(self.registry, "provider_pins", None) or {}).get(speaker_id)
+        return pin if pin in self.order else self.order[0]
+
     def providers_for(self, speaker_id: str) -> List[str]:
-        first = self.speaker_provider.get(speaker_id, self.order[0])
+        # speaker_provider: a speaker moved to a fallback provider by reroute
+        first = self.speaker_provider.get(speaker_id) or self.primary_for(speaker_id)
         return [first] + [p for p in self.order if p != first]
 
     def synthesize(self, turn: Turn, reason: str = "initial",
@@ -539,8 +546,9 @@ class TTSRouter:
 
     def _clip(self, turn: Turn, clip_id: str, prov_name: str, primary: str, binding: Dict,
               spoken: str, final: Path, dur: float, history: List[Dict]) -> Clip:
-        # Anything not voiced by the configured primary provider is degraded.
-        degraded = prov_name != self.order[0]
+        # Anything not voiced by the speaker's own provider (the job's primary,
+        # or the one the reviewer chose a voice on) is degraded.
+        degraded = prov_name != self.primary_for(turn.speaker_id)
         if prov_name != primary:
             errors = [h["error"] for h in history if h.get("error")]
             self.registry.record_fallback(turn.speaker_id, primary, prov_name,
@@ -572,12 +580,13 @@ class TTSRouter:
             by_spk.setdefault(c.speaker_id, {}).setdefault(c.provider, []).append(tid)
         unresolved = []
         for spk, provs in by_spk.items():
+            own = self.primary_for(spk)
             if len(provs) < 2:
                 only = next(iter(provs))
-                if only != self.order[0]:
+                if only != own:
                     self.speaker_provider[spk] = only
                 continue
-            target = max((p for p in provs if p != self.order[0]),
+            target = max((p for p in provs if p != own),
                          key=lambda p: len(provs[p]), default=None)
             if target is None:
                 continue

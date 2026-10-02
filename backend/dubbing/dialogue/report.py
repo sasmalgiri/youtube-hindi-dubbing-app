@@ -44,10 +44,13 @@ def derive_status(r: JobReport, aborted: str = "") -> Tuple[str, List[str]]:
     warn = [d for d in r.timing_deviations if d.get("severity") == "warning"]
     if warn:
         bump(STATUS_COMPLETED_WITH_WARNINGS, f"{len(warn)} turn(s) slightly overflow their slot")
-    if r.content_warnings:
-        bump(STATUS_COMPLETED_WITH_WARNINGS, f"{len(r.content_warnings)} content/speech warning(s)")
-    tw = [w for w in r.translation_warnings
-          if w.get("type") in ("critical_tokens", "non_contextual_translation", "translation_uncertain")]
+    # A warning about a line the reviewer deleted or rewrote is kept in the
+    # report, marked "resolved", and no longer counts against the dub.
+    cw = [w for w in r.content_warnings if not w.get("resolved")]
+    if cw:
+        bump(STATUS_COMPLETED_WITH_WARNINGS, f"{len(cw)} content/speech warning(s)")
+    tw = [w for w in r.translation_warnings if not w.get("resolved")
+          and w.get("type") in ("critical_tokens", "non_contextual_translation", "translation_uncertain")]
     if tw:
         bump(STATUS_COMPLETED_WITH_WARNINGS, f"{len(tw)} translation warning(s)")
     if r.unresolved_overlaps:
