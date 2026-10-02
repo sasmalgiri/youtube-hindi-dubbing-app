@@ -111,6 +111,12 @@ export interface JobCreateRequest {
     dialogue_verify?: 'auto' | 'on' | 'off';
     dialogue_preset?: string;               // module preset id (e.g. 'free-online')
     dialogue_modules_json?: string;         // JSON overrides {"<stage>": [...], "params": {...}}
+    dialogue_review?: boolean;              // pause after translation to review lines + voices
+    dialogue_voice_overrides_json?: string; // JSON {"<speaker_id>": {provider, voice, pitch}}
+    dialogue_keep_original_audio?: boolean; // original audio as a 2nd (non-default) track
+    dialogue_english_subtitles?: boolean;   // English subtitle track (default on)
+    dialogue_burn_subtitles?: boolean;      // burn the Hindi subtitles into the picture
+    dialogue_container?: 'mp4' | 'mkv';
 }
 
 export interface JobConfig {
@@ -187,6 +193,12 @@ export interface JobConfig {
     gap_mode?: string;
     tempo_match?: boolean;
     tempo_max_speedup?: number;
+    // Hindi dialogue output options (when the backend reports them)
+    dialogue_review?: boolean;
+    dialogue_keep_original_audio?: boolean;
+    dialogue_english_subtitles?: boolean;
+    dialogue_burn_subtitles?: boolean;
+    dialogue_container?: string;
 }
 
 export interface JobStatus {
@@ -226,6 +238,9 @@ export interface JobStatus {
     report_path?: string | null;
     // Subtitle file the backend serves at /api/jobs/{id}/srt (null = none)
     subtitles_path?: string | null;
+    // Live review packet of a hindi_dialogue job paused before voicing
+    // (state "review_translation"); GET .../dialogue/review is the source of truth.
+    dialogue_review?: ReviewPacket | null;
 }
 
 export interface TranscriptSegment {
@@ -461,6 +476,129 @@ export async function resolveDialogue(preset: string, overrides: DialogueOverrid
 
 export function dialogueReportUrl(id: string, fmt: 'md' | 'json' = 'md'): string {
     return `${API_BASE}/api/jobs/${id}/report?fmt=${fmt}`;
+}
+
+// ── Hindi dialogue review: pause before voicing / re-voice after a run ──
+export interface ReviewTurn {
+    turn_id: string;
+    speaker_id: string;
+    start: number;
+    end: number;
+    english: string;
+    hindi: string;
+    flags: string[];
+    required: boolean;
+    clip: string | null;         // file name in the job's clips folder (after_run only)
+    overflow_s: number | null;   // how far the voiced line runs past its slot
+}
+export interface ReviewSpeaker {
+    speaker_id: string;
+    voice_category: string;      // male_like | female_like | child_like | unknown
+    category_confidence: number | null;
+    total_speech_s: number;
+    turns: number;
+    provider: string;
+    voice: string;
+    pitch: string | null;
+    variant?: string | number | null;
+    reference_clip: string | null;
+    override: boolean;           // the voice is a user choice, not the automatic one
+}
+export interface VoiceOption { voice: string; pitch: string | null; label: string; }
+export interface ProviderVoiceOptions {
+    male_like?: VoiceOption[];
+    female_like?: VoiceOption[];
+    paid?: boolean;
+}
+export type VoiceOptions = Record<string, ProviderVoiceOptions>;
+export interface ReviewPacket {
+    job_stage: 'before_voice' | 'after_run';
+    turns: ReviewTurn[];
+    speakers: ReviewSpeaker[];
+    voice_options: VoiceOptions;
+    media_duration: number;
+}
+export interface VoiceOverride { provider: string; voice: string; pitch: string | null; }
+export interface TurnEdit { hi?: string; speaker_id?: string; delete?: boolean; }
+// Only what the user changed: every key is optional.
+export interface DialogueEdits {
+    turn_edits?: Record<string, TurnEdit>;
+    voice_overrides?: Record<string, VoiceOverride | { category: 'male_like' | 'female_like' }>;
+    speaker_merges?: Record<string, string>;
+}
+export interface DialogueOutputOptions {
+    keep_original_audio: boolean;
+    english_subtitles: boolean;
+    burn_subtitles: boolean;
+    container: 'mp4' | 'mkv';
+}
+export type DialogueRevoiceRequest = DialogueEdits & Partial<DialogueOutputOptions>;
+
+// FastAPI errors: {"detail": "..."} or a 422 list of {loc, msg}.
+async function errorDetail(res: Response, fallback: string): Promise<string> {
+    const body = await res.json().catch(() => null);
+    const d = body?.detail;
+    if (typeof d === 'string' && d) return d;
+    if (Array.isArray(d)) return d.map((e) => e?.msg || JSON.stringify(e)).join('; ') || fallback;
+    return `${fallback} (HTTP ${res.status})`;
+}
+
+/** The job's review packet: the live one while paused, else the last run's. null = none. */
+export async function getDialogueReview(jobId: string): Promise<ReviewPacket | null> {
+    const res = await fetch(`${API_BASE}/api/jobs/${jobId}/dialogue/review`, {
+        headers: { ...EXTRA_HEADERS }, cache: 'no-store',
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(await errorDetail(res, 'Failed to load the review'));
+    return res.json();
+}
+
+/** Resume a dialogue job paused before voicing, with the user's edits. */
+export async function submitDialogueReview(jobId: string, edits: DialogueEdits): Promise<unknown> {
+    const res = await fetch(`${API_BASE}/api/jobs/${jobId}/dialogue/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify(edits),
+    });
+    if (!res.ok) throw new Error(await errorDetail(res, 'Failed to send the review'));
+    return res.json().catch(() => ({}));
+}
+
+/** Re-voice a finished dialogue job from its own checkpoint (new run, same job). */
+export async function revoiceDialogue(jobId: string, body: DialogueRevoiceRequest): Promise<{ status: string }> {
+    const res = await fetch(`${API_BASE}/api/jobs/${jobId}/dialogue/revoice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await errorDetail(res, 'Failed to start the re-voice'));
+    return res.json();
+}
+
+/** Voices per TTS provider, same shape as a review packet's voice_options. */
+export async function fetchDialogueVoices(): Promise<VoiceOptions> {
+    const res = await fetch(`${API_BASE}/api/dialogue/voices`, { headers: { ...EXTRA_HEADERS } });
+    if (!res.ok) throw new Error(await errorDetail(res, 'Failed to load the voices'));
+    const data = await res.json();
+    // Accept a wrapped answer too ({"voice_options": {...}} / {"providers": {...}}).
+    return (data?.voice_options || data?.providers || data) as VoiceOptions;
+}
+
+/** A short Hindi sample in this voice. Returns an object URL: revoke it when done. */
+export async function previewVoice(req: { provider: string; voice: string; pitch?: string | null; text?: string }): Promise<string> {
+    const res = await fetch(`${API_BASE}/api/dialogue/voice-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(await errorDetail(res, 'Voice preview failed'));
+    return URL.createObjectURL(await res.blob());
+}
+
+/** A voiced line or speaker reference clip; `version` busts the browser cache after a re-voice. */
+export function dialogueClipUrl(jobId: string, name: string, version?: string | number): string {
+    const v = version != null ? `?v=${encodeURIComponent(String(version))}` : '';
+    return `${API_BASE}/api/jobs/${jobId}/dialogue/clip/${encodeURIComponent(name)}${v}`;
 }
 
 export function sourceSrtUrl(id: string): string {

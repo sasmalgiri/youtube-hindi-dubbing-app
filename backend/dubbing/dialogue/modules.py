@@ -207,6 +207,22 @@ STAGES: Tuple[Stage, ...] = (
                      cloud=True, requires=(Req("env", "GOOGLE_TTS_API_KEY", "set GOOGLE_TTS_API_KEY"), _NET)),
           ), default=("edge",), multi=True, fallback_order=("edge", "indic_parler")),
 
+    Stage("voice_match", "Sound like the original speaker", "EXPERIMENTAL. Changes the colour "
+          "(timbre) of each speaker's Hindi voice toward that speaker's own voice in the video. "
+          "Words, pronunciation and timing stay the Hindi voice's.",
+          (
+              Choice("off", "Off", "Keep the Hindi voices as the voice engine made them."),
+              Choice("openvoice", "OpenVoice tone colour (local, experimental)", "OpenVoice v2 "
+                     "tone colour converter (MIT), free and offline after a one-time download. "
+                     "Needs at least 3 s of clean speech per speaker (shorter ones keep their "
+                     "Hindi voice); a clip it cannot convert keeps its Hindi voice. Needs a GPU "
+                     "for usable speed. Listen to check: results vary.",
+                     requires=(Req("runtime", "openvoice",
+                                   "run setup_local_ai.bat: OpenVoice pins numpy 1.22 and librosa "
+                                   "0.9.1, so it gets its own Python env (OPENVOICE_PYTHON). Never "
+                                   "pip install it into the app's own Python"), _GPU)),
+          ), default=("off",), fallback_order=("off",)),
+
     Stage("background", "Background sound", "Keep the video's music/effects under the Hindi voice.",
           (
               Choice("keep", "Keep background", "Removes the English voice and keeps "
@@ -714,9 +730,26 @@ def resolve(preset: str = DEFAULT_PRESET, overrides: Optional[Dict[str, Any]] = 
     if sel.get("translation") and sel["translation"][0] in ("google_basic", "indictrans2"):
         warnings.append("Primary translator works line by line (no dialogue context); "
                         "gender/formality may be less consistent.")
+    if sel.get("voice_match") == ["openvoice"]:
+        warnings.append("Sound like the original speaker is experimental: only the voice colour "
+                        "changes, and how close it gets varies by speaker. Listen to check.")
 
     return Resolution(preset=p["id"], selections=sel, params=params, changes=changes,
                       warnings=warnings, blocking=blocking, config=to_config(sel, params))
+
+
+def _as_bool(v: Any) -> bool:
+    """A job option as a bool; form/JSON strings like "false" or "0" are False."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+# Job options passed through to DialogueConfig as-is when the caller sets them
+# (they are not modules: nothing on this PC can make them unavailable).
+PASSTHROUGH_BOOLS = ("review_before_voice", "keep_original_audio", "english_subtitles",
+                     "burn_subtitles")
+CONTAINERS = ("mp4", "mkv")
 
 
 def to_config(sel: Dict[str, List[str]], params: Dict[str, Any]) -> Dict[str, Any]:
@@ -726,6 +759,10 @@ def to_config(sel: Dict[str, List[str]], params: Dict[str, Any]) -> Dict[str, An
     llm_names = [t for t in translation if t in ("gemini", "groq", "cerebras", "openai", "ollama")]
     mt_names = [t for t in translation if t in ("indictrans2", "google_basic")]
     num = int(params.get("num_speakers") or 0)
+    extra: Dict[str, Any] = {k: _as_bool(params[k]) for k in PASSTHROUGH_BOOLS if k in params}
+    if "container" in params:
+        container = str(params["container"] or "").strip().lower()
+        extra["container"] = container if container in CONTAINERS else "mp4"
     return {
         "use_youtube_subs": False,   # YouTube-subtitle input was removed (092e758)
         "asr": {"whisper_local": "local", "groq": "groq"}.get(asr, "auto"),
@@ -741,4 +778,7 @@ def to_config(sel: Dict[str, List[str]], params: Dict[str, Any]) -> Dict[str, An
         "duration_rewrite": (sel.get("duration_rewrite") or ["off"])[0] == "on",
         "embed_subtitles": (sel.get("subtitles") or ["embed"])[0] == "embed",
         "max_stretch": float(params.get("max_stretch") or 1.15),
+        "voice_match": "openvoice" if (sel.get("voice_match") or ["off"])[0] == "openvoice"
+                       else "off",
+        **extra,
     }

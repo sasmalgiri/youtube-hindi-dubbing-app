@@ -39,7 +39,8 @@ Guarantees, each enforced in code and covered by tests:
 - **English is never used as background.** If background separation fails, the output is Hindi
   dialogue only.
 - **Nothing is reused across jobs.** Each job starts from scratch. The legacy cross-job ASR cache is
-  bypassed.
+  bypassed. Re-voicing a job reuses only that job's own checkpoint and caches (see
+  [Review, voices and re-voicing](#review-voices-and-re-voicing)).
 
 ## Result statuses
 
@@ -102,18 +103,70 @@ needs `--no-deps`.
   python -m dubbing.dialogue dub scene.mp4 --srt-en scene.en.srt      # English text supplied
   python -m dubbing.dialogue dub scene.mp4 --srt-hi scene.hi.srt      # Hindi text supplied
   python -m dubbing.dialogue dub scene.mp4 --limit-seconds 180        # try the first 3 minutes
+  python -m dubbing.dialogue dub scene.mp4 --out ..\dubs\scene --review              # check lines first
+  python -m dubbing.dialogue dub scene.mp4 --out ..\dubs\scene --resume --edits e.json  # re-voice
   ```
 
 Outputs (in `--out`, and copied to `dubbed_outputs\<title> [HI Dialogue <status>] (<job>)` for UI
 jobs):
 
-- `dubbed_hi.mp4`: the original video stream, the Hindi mix and soft Hindi subtitles.
+- `dubbed_hi.mp4` (or `dubbed_hi.mkv`): the original video stream, the Hindi mix (first, default
+  audio track) and soft Hindi subtitles, plus the options below.
 - `hindi_mix.wav`
 - `dialogue_track_N.wav`: one stem per simultaneous-speech track.
 - `subtitles_hi.srt` / `.vtt`: timed to the dubbed audio.
+- `subtitles_en.srt`: the English text on the original timing, without speaker labels.
 - `transcript_en_speakers.srt`
 - `report.md` / `report.json`
 - `turns.json`, `clips.json`, `speakers.json`
+- `review.json` and `clips/`: the after-run review packet, each accepted Hindi line as
+  `clips/<turn_id>.wav` and each speaker's original-voice reference as `clips/ref_<speaker>.wav`.
+
+### Output options
+
+| Option (API field / CLI flag) | Default | Notes |
+| --- | --- | --- |
+| `dialogue_keep_original_audio` / `--keep-original-audio` | off | Adds the original audio as a second, non-default track ("Original"). Hindi stays the first, default track. |
+| `dialogue_english_subtitles` / `--no-english-subs` | on | Writes `subtitles_en.srt` and, when subtitles are embedded, adds it as a second subtitle stream after the Hindi one. |
+| `dialogue_burn_subtitles` / `--burn-subs` | off | Burns the Hindi subtitles into the picture (the video is re-encoded with libx264 CRF 18). Otherwise the video stream is copied untouched. |
+| `dialogue_container` / `--container` | `mp4` | `mkv` writes `dubbed_hi.mkv` (SRT subtitle streams instead of mov_text). |
+
+## Review, voices and re-voicing
+
+**Review before voicing.** Tick *Review before voicing* in the UI (`dialogue_review`, CLI
+`--review`). After translation the job pauses ("Review the Hindi lines and voices, then
+continue") and shows every line with its speaker, English and Hindi, and every speaker with the
+voice it got and a short clip of the original speaker. You can:
+
+- correct a Hindi line (it is marked `edited` and voiced exactly as written),
+- move a line to another existing speaker,
+- delete a line (marked `deleted_by_user`; it is not voiced and does not count as missing),
+- merge two speakers that diarization split (all lines take the target speaker's voice; if the two
+  had different voice categories the report warns that gendered Hindi forms may need checking),
+- choose another voice for a speaker (a specific voice and pitch, or "male-like" / "female-like",
+  which picks a voice no other speaker uses whenever the pool has one).
+
+Then continue (or cancel). On the CLI the packet is `<work>/review.json`; write your changes to
+`<work>/review_edits.json` as `{"turn_edits": {...}, "voice_overrides": {...},
+"speaker_merges": {...}}` and press Enter. Every edit, applied or ignored with its reason, is listed
+in the report.
+
+**Re-voicing a finished job.** Each job saves a checkpoint after every stage up to translation in
+its own work folder (`work/checkpoint/state.json`, written atomically). Re-voicing (the job page's
+re-voice action, or `--resume` with the same `--out`, optionally with `--edits edits.json`) restores
+that checkpoint, applies the new edits and runs only synthesize, fit, verify and mix again. Lines
+whose text and voice did not change reuse their audio from the job's TTS cache (`work/tts_cache/`),
+and shortened lines come from `work/rewrite_cache.json`, so only what changed is voiced again. The
+report lists the stages taken from the checkpoint (`resumed_from_checkpoint`) and every edit
+(`applied_edits`). A checkpoint is used only for the same source (same input, length limit and
+SRTs); otherwise every stage runs again and the report says why. Nothing is ever shared between
+jobs, and a fresh run clears any earlier checkpoint and cache in its work folder.
+
+**Sound like the original speaker (experimental).** The `voice_match` module (`openvoice`) converts
+each Hindi clip toward the original speaker's voice, learned from up to three clean clips per
+speaker (≤ 12 s each, from the separated vocals when available). It is off by default. If it is not
+installed, cannot learn a speaker, or fails on a clip, the stock voice is kept and the report says
+so; the job never fails because of it.
 
 ## Presets and modules
 
@@ -218,5 +271,5 @@ Compare against the turn list in `report.md`.
   default (`unknown_voice_category = male_like`, Madhur) and are flagged `unknown`.
 - Diarization is run on the whole file with global clustering (no chunking). `reconcile_chunks` is
   available and tested for chunked runs, but it is not used by default.
-- There is no resume or checkpointing, in line with the owner's no-reuse preference. Every job starts
-  from scratch.
+- A job resumes only from its own checkpoint, and only the stages up to translation are skipped:
+  synthesize, fit, verify and mix always run again. Nothing is reused across jobs.

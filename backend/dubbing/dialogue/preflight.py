@@ -122,6 +122,17 @@ def run_preflight(work_root: Path = None, providers: List[str] = ("edge",),
         elif p == "google":
             add("GOOGLE_TTS_API_KEY", os.environ.get("GOOGLE_TTS_API_KEY"), "paid provider key")
 
+    # Optional, experimental: "Sound like the original speaker" (OpenVoice in
+    # its own venv; never installed into the app's Python).
+    from .local_workers import runtime_status
+    ov_ok, ov_why = runtime_status("openvoice")
+    set_up = (os.environ.get("OPENVOICE_PYTHON", "").strip()
+              or not ov_why.startswith("not installed in this Python"))
+    add("OpenVoice (optional, experimental: sound like the original speaker)", ov_ok,
+        f"{ov_why} (only needed for that option; GPU recommended)" if set_up else
+        "not set up (only needed for that option): run setup_local_ai.bat, which sets "
+        "OPENVOICE_PYTHON", level="warning", ok_detail=ov_why)
+
     # Links
     add("yt-dlp (links)", _module_version("yt_dlp") or shutil.which("yt-dlp"),
         "pip install yt-dlp; local files work without it", level="warning")

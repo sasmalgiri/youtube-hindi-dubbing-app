@@ -51,6 +51,8 @@ Nothing changes silently. Every change appears in the UI preview, in the job's e
 | | Indic Parler-TTS | free | local | parler-tts (separate venv), `HF_TOKEN`, GPU strongly recommended | next provider (whole speaker) |
 | | IndicF5 | free | local | curated authorised references in `backend/voices/indicf5/` | next provider |
 | | Sarvam / ElevenLabs / Google | **paid** | cloud | key(s) + Allow paid | next provider |
+| Sound like the original speaker (**experimental**) | Off (default) | free | – | – | – |
+| | OpenVoice tone colour | free | local | OpenVoice in its own venv (`OPENVOICE_PYTHON`), GPU strongly recommended | → **Off** (reported) |
 | Background | Keep background | free | local | audio-separator **or** demucs, torch | → **Hindi voice only** (reported) |
 | | Hindi voice only | free | – | – | – |
 | Speech check | Check speech | free | local | faster-whisper | → **Skip** (reported) |
@@ -58,6 +60,44 @@ Nothing changes silently. Every change appears in the UI preview, in the job's e
 | Subtitles | Embed / files only | free | – | – | – |
 
 The fallback order for an empty stage is in each stage's `fallback_order` in `modules.py`.
+
+Job options that are not modules pass straight through to the job when set in the
+`params` of `dialogue_modules_json` (or the API's own job fields): `review_before_voice`,
+`keep_original_audio`, `english_subtitles`, `burn_subtitles` (true/false) and `container`
+(`mp4` or `mkv`; anything else means `mp4`). Left out, the job's defaults apply.
+
+## Sound like the original speaker (experimental)
+
+Off by default in every preset. When on, every Hindi clip keeps its words, pronunciation and
+timing, but its voice **colour** (timbre) is changed toward the original speaker's own voice. The
+Hindi still comes from the voice engine (Edge, Indic Parler, …): OpenVoice does not speak Hindi
+itself, it only recolours what the engine said.
+
+- **Engine:** the tone colour converter of [OpenVoice v2](https://github.com/myshell-ai/OpenVoice)
+  (MIT), checkpoint `converter/` from
+  [myshell-ai/OpenVoiceV2](https://huggingface.co/myshell-ai/OpenVoiceV2) (about 130 MB, downloaded
+  into `backend/models/openvoice` on first use; to skip the download, copy `config.json` and
+  `checkpoint.pth` from OpenVoice's `checkpoints_v2/converter` into
+  `backend/models/openvoice/converter/`). The API calls follow OpenVoice's demo and SoniTranslate.
+- **Own Python env:** OpenVoice pins numpy 1.22.0 and librosa 0.9.1, so it runs in a persistent
+  worker under `OPENVOICE_PYTHON`, like Indic Parler-TTS. `setup_local_ai.bat` offers it at the end;
+  `setup_local_ai.bat openvoice` sets up only this. It is never installed into the app's Python.
+  The app does not require OpenVoice's demo UI and ASR pins (gradio, faster-whisper 0.9,
+  whisper-timestamped): the converter never imports them, so the setup retries without them if
+  they fail to install.
+- **References:** each speaker's reference is cut from that speaker's own clean speech in the
+  video (separated vocals when available). A speaker with **less than 3 s** of reference speech is
+  left with the plain Hindi voice, and the report says so.
+- **Timing never changes:** a converted clip keeps the clip's sample rate and exact length (the
+  converter's output is at most about one 12 ms hop off, which is padded or trimmed at the end);
+  anything else is refused and the clip keeps its Hindi voice. Any failure leaves the clip as the
+  voice engine made it and is listed in the report; the job continues.
+- **Speed:** **needs a GPU for usable speed.** On a 4-core CPU a clip took about as long as it
+  lasts (a 2.7 s clip in about 2 s), so a long video on the CPU adds a lot of time.
+- **Watermark:** OpenVoice adds its own inaudible watermark to the audio it converts.
+- **Quality:** experimental. How close the result gets varies by speaker and by the Hindi voice it
+  starts from; music or noise left in the reference makes it worse. Listen before you publish.
+  Use it only for voices you have the right to imitate.
 
 ## Presets
 
@@ -123,7 +163,11 @@ per-turn identity checks, honest draft statuses, and this module matrix.
    set `OLLAMA_MODEL=gemma3:12b` in `backend\.env`, or pick the model under *Ollama model*. If none is
    set, Ollama is switched off and the preview shows that fix. The app never guesses from your pulled
    models: a small fine-tune that cannot return the translator's JSON would translate nothing.
-4. Check with `python -m dubbing.dialogue modules --preset free-local`.
+4. **Sound like the original speaker (optional, experimental):** answer `y` when
+   `setup_local_ai.bat` offers OpenVoice, or run `setup_local_ai.bat openvoice`. It creates
+   `backend\.venvs\openvoice` and writes `OPENVOICE_PYTHON` to `backend\.env`. Then pick it under
+   *Customise modules*. `python -m dubbing.dialogue doctor` shows whether it can run.
+5. Check with `python -m dubbing.dialogue modules --preset free-local`.
 
 Background separation runs first, before any local model is loaded, and frees its GPU memory when
 it finishes. The local models load once per job, and their worker processes are closed before the
@@ -133,5 +177,10 @@ final mix.
 
 - **Checked here:** all resolver rules, presets and the UI/API wiring (unit and API tests); the
   worker protocol (with a stand-in worker); provider binding.
+- **OpenVoice:** run for real once in the cloud build environment (Linux, CPU, Python 3.10 venv
+  with torch 2.4.1 and OpenVoice without its demo/ASR pins): checkpoint download, reference
+  embedding with its cache, conversion of 24 kHz and 48 kHz clips with their exact length kept. The
+  unit tests use a stand-in worker and the real worker script against stub libraries.
 - **Not run here:** the real Indic Parler-TTS, IndicTrans2 and Ollama models (no GPU or weights in
-  the cloud build environment); `setup_local_ai.bat` on Windows; listening quality.
+  the cloud build environment); OpenVoice on a GPU and on real speech; `setup_local_ai.bat` on
+  Windows; listening quality.

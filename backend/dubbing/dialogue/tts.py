@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import math
 import os
 import random
 import re
+import shutil
 import threading
 import time
 import wave
@@ -389,10 +391,23 @@ def build_providers(names: Sequence[str]) -> Dict[str, BaseProvider]:
     return out
 
 
+def tts_cache_key(provider: str, voice: str, pitch: Optional[str], rate: Optional[str],
+                  speed: float, spoken_text: str) -> str:
+    """Within-job TTS cache key: the same line in the same voice is the same audio."""
+    raw = "|".join([provider, voice or "", pitch or "", rate or "", f"{float(speed):.4f}", spoken_text])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 class TTSRouter:
+    """``cache_dir`` (opt-in) keeps every synthesized clip under its
+    tts_cache_key, so a resumed run of the SAME job reuses unchanged lines
+    instead of calling the provider again. The orchestrator points it into
+    the job's own work_dir: nothing is shared across jobs."""
+
     def __init__(self, providers: Dict[str, BaseProvider], registry: SpeakerRegistry,
                  order: Sequence[str], clip_dir: Path, max_retries: int = 2,
-                 pronunciation: Optional[Dict[str, str]] = None):
+                 pronunciation: Optional[Dict[str, str]] = None,
+                 cache_dir: Optional[Path] = None):
         if not order:
             raise ValueError("at least one TTS provider is required")
         self.providers = providers
@@ -403,8 +418,45 @@ class TTSRouter:
         self.max_retries = max_retries
         self.pronunciation = pronunciation or {}
         self.speaker_provider: Dict[str, str] = {}
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_hits = 0
+        self._cache_keys: Dict[str, str] = {}     # clip_id -> cache key
         self._counter = 0
         self._lock = threading.Lock()
+
+    # within-job cache
+    def _cache_get(self, key: str, dst: Path) -> Optional[float]:
+        try:
+            shutil.copyfile(self.cache_dir / f"{key}.wav", dst)
+            dur = audio.probe_duration(dst)
+        except Exception:
+            return None
+        with self._lock:
+            self.cache_hits += 1
+        return dur
+
+    def _cache_put(self, key: str, src: Path):
+        tmp = self.cache_dir / f".{key}.{threading.get_ident()}.tmp"
+        try:
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, self.cache_dir / f"{key}.wav")
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def uncache(self, clip: Clip):
+        """Forget a clip's cached audio (it failed the checks): a resumed run
+        must synthesize that line again, not reuse the rejected audio."""
+        key = self._cache_keys.get(clip.clip_id)
+        if key and self.cache_dir is not None:
+            try:
+                (self.cache_dir / f"{key}.wav").unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _next_id(self) -> str:
         with self._lock:
@@ -426,9 +478,12 @@ class TTSRouter:
         return [first] + [p for p in self.order if p != first]
 
     def synthesize(self, turn: Turn, reason: str = "initial",
-                   only_provider: Optional[str] = None, speed: float = 1.0) -> Clip:
+                   only_provider: Optional[str] = None, speed: float = 1.0,
+                   use_cache: bool = True) -> Clip:
         """``speed`` > 1 asks a native-rate provider to speak faster (same
-        voice, same pitch); providers without native rate ignore it."""
+        voice, same pitch); providers without native rate ignore it.
+        ``use_cache=False`` (a regeneration) always calls the provider; the
+        new audio still replaces the cached one."""
         text = turn.speech_text
         if not text:
             raise TTSFailure(turn.turn_id, [{"error": "empty text"}])
@@ -448,6 +503,18 @@ class TTSRouter:
                 continue
             if abs(speed - 1.0) > 1e-3 and prov.native_rate:
                 binding = dict(binding, rate=rate_with_speed(binding.get("rate"), speed))
+            key = None
+            if self.cache_dir is not None:
+                key = tts_cache_key(prov_name, binding["voice"], binding.get("pitch"),
+                                    binding.get("rate"), speed, spoken)
+                if use_cache and (self.cache_dir / f"{key}.wav").exists():
+                    clip_id = self._next_id()
+                    final = self.clip_dir / f"{turn.turn_id}_{clip_id}.wav"
+                    dur = self._cache_get(key, final)
+                    if dur is not None:
+                        self._cache_keys[clip_id] = key
+                        return self._clip(turn, clip_id, prov_name, primary, binding, spoken, final,
+                                          dur, history + [{"reason": reason, "cache": "hit"}])
             for attempt in range(self.max_retries + 1):
                 if attempt and prov.retry_backoff_s > 0:
                     time.sleep(min(10.0, prov.retry_backoff_s * 2 ** (attempt - 1))
@@ -463,19 +530,27 @@ class TTSRouter:
                     history.append({"provider": prov_name, "voice": binding["voice"],
                                     "attempt": attempt + 1, "error": str(e)[:200]})
                     continue
-                # Anything not voiced by the configured primary provider is degraded.
-                degraded = prov_name != self.order[0]
-                if prov_name != primary:
-                    self.registry.record_fallback(turn.speaker_id, primary, prov_name,
-                                                  turn.turn_id, history[-1]["error"] if history else "")
-                return Clip(clip_id=clip_id, turn_id=turn.turn_id, speaker_id=turn.speaker_id,
-                            provider=prov_name, voice=binding["voice"], model=binding.get("model", ""),
-                            voice_params={"pitch": binding.get("pitch"), "variant": binding.get("variant"),
-                                          "rate": binding.get("rate")},
-                            spoken_text=spoken, path=str(final), natural_duration=dur,
-                            final_duration=dur, degraded=degraded,
-                            retry_history=history + [{"reason": reason}])
+                if key is not None:
+                    self._cache_put(key, final)
+                    self._cache_keys[clip_id] = key
+                return self._clip(turn, clip_id, prov_name, primary, binding, spoken, final, dur,
+                                  history + [{"reason": reason}])
         raise TTSFailure(turn.turn_id, history)
+
+    def _clip(self, turn: Turn, clip_id: str, prov_name: str, primary: str, binding: Dict,
+              spoken: str, final: Path, dur: float, history: List[Dict]) -> Clip:
+        # Anything not voiced by the configured primary provider is degraded.
+        degraded = prov_name != self.order[0]
+        if prov_name != primary:
+            errors = [h["error"] for h in history if h.get("error")]
+            self.registry.record_fallback(turn.speaker_id, primary, prov_name,
+                                          turn.turn_id, errors[-1] if errors else "")
+        return Clip(clip_id=clip_id, turn_id=turn.turn_id, speaker_id=turn.speaker_id,
+                    provider=prov_name, voice=binding["voice"], model=binding.get("model", ""),
+                    voice_params={"pitch": binding.get("pitch"), "variant": binding.get("variant"),
+                                  "rate": binding.get("rate")},
+                    spoken_text=spoken, path=str(final), natural_duration=dur,
+                    final_duration=dur, degraded=degraded, retry_history=history)
 
     def reroute_mixed_speakers(self, turns: Dict[str, Turn], clips: Dict[str, Clip],
                                synth: Optional[Callable[[Turn, str, str], Clip]] = None) -> List[Dict]:
