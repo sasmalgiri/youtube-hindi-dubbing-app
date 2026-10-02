@@ -400,6 +400,18 @@ class DialogueTranslator:
                 c.on_event = self._client_event
                 c.cancel_check = self.cancel_check
 
+    # ── checkpoint (resume of the same job) ──────────────────────────
+    def export_state(self) -> Dict[str, Any]:
+        """What a resumed run of this job needs to shorten lines exactly as
+        the first run would: the name spellings and the story brief."""
+        return {"name_map": dict(self.name_map), "brief": dict(self.brief),
+                "engines_used": sorted(self.engines_used)}
+
+    def restore_state(self, state: Dict[str, Any]):
+        self.name_map.update(state.get("name_map") or {})
+        self.brief = dict(state.get("brief") or {})
+        self.engines_used.update(state.get("engines_used") or [])
+
     # ── engine health ─────────────────────────────────────────────────
     def _call(self, client, system: str, user: str) -> str:
         try:

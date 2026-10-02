@@ -6,10 +6,13 @@
     python -m dubbing.dialogue dub D:\\videos\\clip.mp4 --out ..\\dubs\\clip
     python -m dubbing.dialogue dub clip.mp4 --srt-en clip.en.srt       # English text supplied
     python -m dubbing.dialogue dub clip.mp4 --srt-hi clip.hi.srt       # Hindi text supplied
+    python -m dubbing.dialogue dub clip.mp4 --out ..\\dubs\\clip --review    # check lines/voices first
+    python -m dubbing.dialogue dub clip.mp4 --out ..\\dubs\\clip --resume --edits edits.json
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -50,6 +53,28 @@ def _overrides(args):
     if getattr(args, "speakers", None):
         ov["params"]["num_speakers"] = args.speakers
     return ov
+
+
+def _cli_review(cfg):
+    """Review hook for the terminal: show where the packet is, wait for
+    Enter, then take the edits from <work>/review_edits.json if present."""
+    def review(packet):
+        path = Path(cfg.work_dir) / "review.json"
+        edits_path = Path(cfg.work_dir) / "review_edits.json"
+        print(f"\nReview packet: {path}")
+        print(f"  {len(packet.get('turns', []))} lines, {len(packet.get('speakers', []))} speakers.")
+        print(f"  To change lines or voices, write {edits_path}")
+        print('  as {"turn_edits": {...}, "voice_overrides": {...}, "speaker_merges": {...}}.')
+        try:
+            input("Press Enter to continue with the voices... ")
+        except EOFError:
+            pass
+        if not edits_path.exists():
+            return None
+        edits = json.loads(edits_path.read_text(encoding="utf-8"))
+        print(f"Applying edits from {edits_path}")
+        return edits
+    return review
 
 
 def _print_resolution(res):
@@ -104,6 +129,19 @@ def main(argv=None) -> int:
     r.add_argument("--verify", default="auto", choices=["auto", "on", "off"])
     r.add_argument("--max-stretch", type=float, default=1.15)
     r.add_argument("--limit-seconds", type=float, default=0.0, help="dub only the first N seconds")
+    r.add_argument("--review", action="store_true",
+                   help="pause after translation: edit the Hindi lines / voices, then press Enter "
+                        "(edits are read from <work>/review_edits.json)")
+    r.add_argument("--resume", action="store_true",
+                   help="re-voice this job: reuse its own checkpoint in the work folder (same --out)")
+    r.add_argument("--edits", type=Path, default=None,
+                   help="JSON file of edits to apply before voicing "
+                        "({turn_edits, voice_overrides, speaker_merges})")
+    r.add_argument("--keep-original-audio", action="store_true",
+                   help="keep the original audio as a second, non-default track")
+    r.add_argument("--no-english-subs", action="store_true", help="no English subtitles")
+    r.add_argument("--burn-subs", action="store_true", help="burn the Hindi subtitles into the picture")
+    r.add_argument("--container", default="mp4", choices=["mp4", "mkv"])
     args = ap.parse_args(argv)
     _load_env()
 
@@ -149,16 +187,28 @@ def main(argv=None) -> int:
         translation_engines=[e.strip() for e in args.engines.split(",") if e.strip()],
         background=args.background, content_verify=args.verify, max_stretch=args.max_stretch,
     ) if not module_kw else {}
+    edits = {}
+    if args.edits:
+        edits = json.loads(args.edits.read_text(encoding="utf-8"))
     cfg = DialogueConfig(
         source=args.source, work_dir=args.work or (out / "work"), output_dir=out,
         source_srt=args.srt_en, translated_srt=args.srt_hi, asr_model=args.asr_model,
         min_speakers=args.min_speakers, max_speakers=args.max_speakers,
         limit_seconds=args.limit_seconds, modules=modules, **legacy_kw, **module_kw)
+    cfg.review_before_voice = args.review
+    cfg.resume = args.resume
+    cfg.turn_edits = edits.get("turn_edits") or {}
+    cfg.voice_overrides = edits.get("voice_overrides") or {}
+    cfg.speaker_merges = edits.get("speaker_merges") or {}
+    cfg.keep_original_audio = args.keep_original_audio
+    cfg.english_subtitles = not args.no_english_subs
+    cfg.burn_subtitles = args.burn_subs
+    cfg.container = args.container
 
     def progress(step, frac, msg):
         print(f"[{step:>10}] {int(frac * 100):3d}%  {msg}", flush=True)
 
-    res = run_dialogue(cfg, on_progress=progress)
+    res = run_dialogue(cfg, on_progress=progress, review=_cli_review(cfg) if args.review else None)
     print()
     print(f"Status : {res.status}")
     for why in res.reasons:

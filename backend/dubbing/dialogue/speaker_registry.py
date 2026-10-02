@@ -4,7 +4,9 @@ Every synthesis path (first pass, retries, chunked synthesis, provider
 fallback, re-synthesis after a rewrite) must obtain its voice through
 ``SpeakerRegistry.resolve_voice(speaker_id, provider, policy)``. Bindings are
 made once per job and never change afterwards, so a speaker keeps the same
-voice across every turn and every retry.
+voice across every turn and every retry. A reviewer's voice override or
+speaker merge is applied before any clip is synthesized (``override_voice``,
+``override_category``, ``merge_speaker``) and is then just as fixed.
 
 Voice pools are curated per provider. When a pool has fewer voices than there
 are speakers of a category (Edge-TTS has one Hindi male and one Hindi female
@@ -16,9 +18,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-from ..hindi_voices import FEMALE_SLOTS, MALE_SLOTS, split_slot
+from ..hindi_voices import FEMALE_SLOTS, MALE_SLOTS, slot_label, split_slot
 from .contracts import (CATEGORY_CHILD, CATEGORY_FEMALE, CATEGORY_MALE,
                         CATEGORY_UNKNOWN, UNKNOWN_SPEAKER, SpeakerRecord)
 
@@ -234,6 +236,125 @@ class SpeakerRegistry:
         out["speaker_id"] = speaker_id
         return out
 
+    # ── user overrides (review / re-voice) ─────────────────────────────
+    # Applied before any clip is synthesized; the binding then stays fixed
+    # for the job like any other, so retries and fallbacks keep the voice.
+    def _new_binding(self, provider: str, pool: Dict[str, Any], voice: str, pitch: Optional[str],
+                     category: str, variant: int = 0) -> Dict[str, Any]:
+        b: Dict[str, Any] = {"provider": provider, "voice": voice, "model": pool.get("model", ""),
+                             "category_used": category, "pitch": pitch, "variant": variant,
+                             "override": True}
+        if pool.get("refs"):  # reference-based providers (IndicF5)
+            b.update(pool["refs"][voice])
+            b["reference_version"] = voice
+        return b
+
+    def _used_by_others(self, speaker_id: str, provider: str) -> set:
+        return {(b["voice"], b.get("pitch")) for sid, r in self.speakers.items()
+                if sid != speaker_id for b in [r.provider_voices.get(provider)] if b}
+
+    def override_voice(self, speaker_id: str, provider: str, voice: str,
+                       pitch: Optional[str] = None) -> Dict[str, Any]:
+        """Bind an explicitly chosen voice ("voice" or "voice|pitch" slot) for
+        one provider. Other speakers keep their bindings; when the choice is a
+        voice another speaker already has, the reuse is marked and reported."""
+        rec = self.speakers.get(speaker_id)
+        if rec is None:
+            raise VoiceResolutionError(f"Speaker '{speaker_id}' is not registered")
+        pool = self.pools.get(provider)
+        if pool is None:
+            raise VoiceResolutionError(f"No voice pool for provider '{provider}'")
+        v, slot_pitch = split_slot((voice or "").strip())
+        if not v:
+            raise VoiceResolutionError("empty voice name")
+        pitch = (pitch or slot_pitch or None)
+        if pool.get("refs") is not None and v not in pool.get("refs", {}):
+            raise VoiceResolutionError(f"'{v}' is not a curated {provider} reference voice")
+        cat = next((c for c in (CATEGORY_MALE, CATEGORY_FEMALE, CATEGORY_CHILD)
+                    if any(split_slot(s)[0] == v for s in pool.get(c) or [])),
+                   self._binding_category(rec, provider))
+        b = self._new_binding(provider, pool, v, pitch, cat)
+        if (v, pitch) in self._used_by_others(speaker_id, provider):
+            b["indistinguishable_reuse"] = True
+        rec.provider_voices[provider] = b
+        rec.mapping_origin = "user"
+        self._bound_providers.add(provider)
+        return dict(b)
+
+    def override_category(self, speaker_id: str, category: str,
+                          providers: Sequence[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Force a speaker's voice category and re-pick its voice on every
+        provider: the first pool slot no other speaker uses (most distinct
+        first), else the next shared slot as bind_provider would. A binding
+        already in the forced category is kept. A provider with no voice of
+        that category is left unbound (the router then uses the next one)."""
+        rec = self.speakers.get(speaker_id)
+        if rec is None:
+            raise VoiceResolutionError(f"Speaker '{speaker_id}' is not registered")
+        if category not in (CATEGORY_MALE, CATEGORY_FEMALE):
+            raise VoiceResolutionError(f"unsupported voice category '{category}'")
+        if rec.voice_category != category:
+            rec.category_evidence = dict(rec.category_evidence or {},
+                                         user_override={"from": rec.voice_category, "to": category})
+        rec.voice_category = category
+        rec.classification_unknown = False
+        rec.mapping_origin = "user"
+        out: Dict[str, Optional[Dict[str, Any]]] = {}
+        for provider in providers:
+            pool = self.pools.get(provider)
+            if pool is None:
+                continue
+            cat = self._binding_category(rec, provider)
+            old = rec.provider_voices.get(provider)
+            if old and old.get("category_used") == cat:
+                old["override"] = True
+                out[provider] = dict(old)
+                continue
+            rec.provider_voices.pop(provider, None)
+            voices = list(pool.get(cat) or [])
+            if not voices:
+                out[provider] = None
+                continue
+            used = self._used_by_others(speaker_id, provider)
+            free = [s for s in voices if split_slot(s) not in used]
+            if free:
+                slot, round_idx = free[0], 0
+            else:
+                n = sum(1 for sid, r in self.speakers.items() if sid != speaker_id
+                        and (r.provider_voices.get(provider) or {}).get("category_used") == cat)
+                slot, round_idx = voices[n % len(voices)], max(1, n // len(voices))
+            v, p = split_slot(slot)
+            b = self._new_binding(provider, pool, v, p, cat, variant=round_idx)
+            if round_idx > 0:
+                b["indistinguishable_reuse"] = True
+            rec.provider_voices[provider] = b
+            self._bound_providers.add(provider)
+            out[provider] = dict(b)
+        return out
+
+    def merge_speaker(self, from_id: str, into_id: str) -> SpeakerRecord:
+        """Drop `from_id` (its turns are relabelled by the caller); its speech
+        time counts toward `into_id`, whose voice the merged lines get."""
+        if from_id == into_id or from_id not in self.speakers or into_id not in self.speakers:
+            raise VoiceResolutionError(f"cannot merge '{from_id}' into '{into_id}'")
+        gone = self.speakers.pop(from_id)
+        into = self.speakers[into_id]
+        into.total_speech_s = round((into.total_speech_s or 0.0) + (gone.total_speech_s or 0.0), 2)
+        return gone
+
+    def voice_options(self, provider: str) -> Dict[str, List[Dict[str, Any]]]:
+        """The curated voices a user may pick for `provider`, per category:
+        {"male_like": [{"voice", "pitch", "label"}], "female_like": [...]}."""
+        pool = self.pools.get(provider) or {}
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for cat in (CATEGORY_MALE, CATEGORY_FEMALE):
+            out[cat] = []
+            for slot in pool.get(cat) or []:
+                v, p = split_slot(slot)
+                label = slot_label(slot) if provider == "edge" else (f"{v} {p}" if p else v)
+                out[cat].append({"voice": v, "pitch": p, "label": label})
+        return out
+
     def record_fallback(self, speaker_id: str, from_provider: str, to_provider: str,
                         turn_id: str, reason: str):
         rec = self.speakers.get(speaker_id)
@@ -264,8 +385,13 @@ class SpeakerRegistry:
 
     @classmethod
     def load(cls, path: Path) -> "SpeakerRegistry":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        reg = cls(unknown_default_category=data.get("unknown_default_category", CATEGORY_MALE))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any],
+                  pools: Optional[Dict[str, Dict[str, Any]]] = None) -> "SpeakerRegistry":
+        reg = cls(unknown_default_category=data.get("unknown_default_category", CATEGORY_MALE),
+                  pools=pools)
         for sid, d in data.get("speakers", {}).items():
             reg.speakers[sid] = SpeakerRecord(**d)
             for p in d.get("provider_voices", {}):

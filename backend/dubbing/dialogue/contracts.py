@@ -188,6 +188,10 @@ class JobReport:
     separation: Dict[str, Any] = field(default_factory=dict)
     unresolved_failures: List[str] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
+    # Stages a resumed run took from THIS job's checkpoint (never another
+    # job's), and every review/re-voice edit applied to the lines and voices.
+    resumed_from_checkpoint: List[str] = field(default_factory=list)
+    applied_edits: List[Dict[str, Any]] = field(default_factory=list)
     environment: Dict[str, Any] = field(default_factory=dict)
     outputs: Dict[str, str] = field(default_factory=dict)
     final_status: str = STATUS_COMPLETED
