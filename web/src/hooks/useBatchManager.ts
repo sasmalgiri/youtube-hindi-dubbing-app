@@ -55,6 +55,22 @@ export interface BatchSettings {
     dub_chain?: string[];
     enable_manual_review?: boolean;
     use_whisperx?: boolean;
+    // Pipeline mode + the Hindi Dialogue profile (stripModeBloat on the home
+    // page already turned the module choices into dialogue_modules_json).
+    pipeline_mode?: string;
+    dialogue_preset?: string;
+    dialogue_modules_json?: string;
+    dialogue_tts_providers?: string;
+    dialogue_translation_engines?: string;
+    dialogue_num_speakers?: number;
+    dialogue_background?: JobCreateRequest['dialogue_background'];
+    dialogue_verify?: JobCreateRequest['dialogue_verify'];
+    dialogue_review?: boolean;
+    dialogue_voice_overrides_json?: string;
+    dialogue_keep_original_audio?: boolean;
+    dialogue_english_subtitles?: boolean;
+    dialogue_burn_subtitles?: boolean;
+    dialogue_container?: JobCreateRequest['dialogue_container'];
 }
 
 interface UseBatchManagerReturn {
@@ -141,6 +157,10 @@ export function useBatchManager(): UseBatchManagerReturn {
                         updates.error = event.error || 'Job failed';
                         unsubscribesRef.current.get(jobId)?.();
                         unsubscribesRef.current.delete(jobId);
+                    } else if (event.state === 'review_translation') {
+                        // Dialogue job paused for review: it keeps its slot until reviewed.
+                        updates.step = 'Awaiting review';
+                        updates.message = 'Paused before voicing. Open the job page to review the Hindi lines.';
                     } else if (event.state === 'waiting_for_srt') {
                         updates.state = 'done'; // Free the queue slot
                         updates.step = 'Awaiting SRT';
@@ -258,6 +278,22 @@ export function useBatchManager(): UseBatchManagerReturn {
                     dub_chain: settings.dub_chain,
                     enable_manual_review: settings.enable_manual_review,
                     use_whisperx: settings.use_whisperx,
+                    // Without these every batch job ran the classic pipeline,
+                    // whatever mode was picked.
+                    pipeline_mode: settings.pipeline_mode,
+                    dialogue_preset: settings.dialogue_preset,
+                    dialogue_modules_json: settings.dialogue_modules_json,
+                    dialogue_tts_providers: settings.dialogue_tts_providers,
+                    dialogue_translation_engines: settings.dialogue_translation_engines,
+                    dialogue_num_speakers: settings.dialogue_num_speakers,
+                    dialogue_background: settings.dialogue_background,
+                    dialogue_verify: settings.dialogue_verify,
+                    dialogue_review: settings.dialogue_review,
+                    dialogue_voice_overrides_json: settings.dialogue_voice_overrides_json,
+                    dialogue_keep_original_audio: settings.dialogue_keep_original_audio,
+                    dialogue_english_subtitles: settings.dialogue_english_subtitles,
+                    dialogue_burn_subtitles: settings.dialogue_burn_subtitles,
+                    dialogue_container: settings.dialogue_container,
                 };
 
                 const { id } = isRemoteBackend

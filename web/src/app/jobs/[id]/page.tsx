@@ -7,6 +7,7 @@ import { useJobProgress } from '@/hooks/useJobProgress';
 import ProgressPipeline from '@/components/ProgressPipeline';
 import VideoPlayer from '@/components/VideoPlayer';
 import TranscriptViewer from '@/components/TranscriptViewer';
+import DialogueReviewPanel from '@/components/DialogueReviewPanel';
 import { resultVideoUrl, originalVideoUrl, resultSrtUrl, sourceSrtUrl, uploadTranslatedSrt, deleteJob, continueJob, dialogueReportUrl, getJob, type JobStatus } from '@/lib/api';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
@@ -47,8 +48,17 @@ export default function JobPage() {
         error,
         eta,
         restart,
+        followNewRun,
     } = useJobProgress(jobId);
     const [continuing, setContinuing] = useState(false);
+
+    // Hindi Dialogue jobs get their own review: paused before voicing (state
+    // review_translation) and, once finished, a re-voice from the same editor.
+    const isDialogue = status?.config?.pipeline_mode === 'hindi_dialogue';
+    const dialoguePaused = isDialogue && status?.state === 'review_translation';
+    const videoExt = status?.saved_video
+        ? (/\.mkv$/i.test(status.saved_video) ? 'mkv' : 'mp4')
+        : (status?.config?.dialogue_container === 'mkv' ? 'mkv' : 'mp4');
 
     // The Subtitles button is shown only when the backend has a subtitle file
     // for this job (the old always-on button 404ed). A one-part split job (the
@@ -147,7 +157,7 @@ export default function JobPage() {
                             )}
                             <a
                                 href={resultVideoUrl(jobId)}
-                                download={status?.video_title ? `${status.video_title} - Dubbed.mp4` : `dubbed_${jobId}.mp4`}
+                                download={status?.video_title ? `${status.video_title} - Dubbed.${videoExt}` : `dubbed_${jobId}.${videoExt}`}
                                 className="btn-primary text-sm flex items-center gap-2"
                             >
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -356,6 +366,21 @@ export default function JobPage() {
                             )}
                         </div>
                     </div>
+                )}
+
+                {/* Hindi Dialogue: fix lines and voices, then re-voice (collapsed until opened) */}
+                {isDialogue && (isComplete || isError) && (
+                    <DialogueReviewPanel
+                        jobId={jobId}
+                        mode="after_run"
+                        initialOutput={{
+                            keep_original_audio: status?.config?.dialogue_keep_original_audio,
+                            english_subtitles: status?.config?.dialogue_english_subtitles,
+                            burn_subtitles: status?.config?.dialogue_burn_subtitles,
+                            container: videoExt,
+                        }}
+                        onSubmitted={followNewRun}
+                    />
                 )}
 
                 {/* QA Score Badge */}
@@ -606,8 +631,13 @@ export default function JobPage() {
                     </div>
                 )}
 
+                {/* Hindi Dialogue paused before voicing: review lines, speakers and voices */}
+                {dialoguePaused && (
+                    <DialogueReviewPanel jobId={jobId} mode="before_voice" />
+                )}
+
                 {/* Step-by-step review panel */}
-                {isReviewing && (
+                {isReviewing && !dialoguePaused && (
                     <div className="space-y-4">
                         <div className="p-4 rounded-xl bg-yellow-400/10 border border-yellow-400/30">
                             <div className="flex items-center justify-between mb-3">

@@ -7,7 +7,7 @@ import LanguageSelector, { LANGUAGES } from '@/components/LanguageSelector';
 import SettingsPanel, { type DubbingSettings } from '@/components/SettingsPanel';
 import WordTimingPanel from '@/components/WordTimingPanel';
 import PresetTabs from '@/components/PresetTabs';
-import DialogueModulesPanel from '@/components/DialogueModulesPanel';
+import DialogueModulesPanel, { DIALOGUE_RUN_OPTION_KEYS, pickDialogueRunOptions } from '@/components/DialogueModulesPanel';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
 import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
@@ -152,8 +152,12 @@ export default function HomePage() {
             if (cleaned.dialogue_modules && Object.keys(cleaned.dialogue_modules).length > 0) {
                 cleaned.dialogue_modules_json = JSON.stringify(cleaned.dialogue_modules);
             }
+            // Review pause + output options are always sent, so a saved link's
+            // older preset (spread first) cannot override what is shown now.
+            Object.assign(cleaned, pickDialogueRunOptions(cleaned));
         } else {
             delete cleaned.dialogue_preset;
+            for (const k of DIALOGUE_RUN_OPTION_KEYS) delete cleaned[k];
         }
         delete cleaned.dialogue_modules;
         return cleaned;
@@ -237,6 +241,11 @@ export default function HomePage() {
         const presetError = srtOnlyPresetError(settings);
         if (presetError) {
             setError(presetError);
+            return;
+        }
+        // Batch jobs now run the picked mode; SRT Direct needs its own SRT per video.
+        if (settings.pipeline_mode === 'srtdub') {
+            setError('SRT Direct needs a translated SRT for each video: start those jobs one at a time, or pick another mode for the batch.');
             return;
         }
         // Auto-save all batch URLs with current preset — stripped of blob fields
@@ -382,6 +391,8 @@ export default function HomePage() {
                         overrides={(settings as any).dialogue_modules || {}}
                         sourceKind={settings._input_mode === 'upload' ? 'file' : 'url'}
                         onChange={(preset, overrides) => setSettings(s => ({ ...s, dialogue_preset: preset, dialogue_modules: overrides } as any))}
+                        runOptions={pickDialogueRunOptions(settings as any)}
+                        onRunOptionsChange={(o) => setSettings(s => ({ ...s, ...o } as any))}
                     />
                 )}
 

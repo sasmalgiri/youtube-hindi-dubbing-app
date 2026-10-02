@@ -17,7 +17,13 @@ interface JobProgress {
     error: string | null;
     eta: string;
     restart: () => void;
+    // Follow a new run of a finished job (dialogue re-voice): polling only.
+    followNewRun: () => void;
 }
+
+// After a re-voice is accepted the job may still read done/error for a moment
+// before its new run starts: those reads are skipped for this long.
+const NEW_RUN_GRACE_MS = 20000;
 
 function formatEta(seconds: number): string {
     if (seconds <= 0 || !isFinite(seconds)) return '';
@@ -45,6 +51,10 @@ export function useJobProgress(jobId: string | null): JobProgress {
     const pollRef = useRef<NodeJS.Timeout | null>(null);
     const startTimeRef = useRef<number>(Date.now());
     const lastProgressRef = useRef<number>(0);
+    // followNewRun(): skip terminal states until this time (0 = off), and time
+    // the ETA from the new run's start instead of the job's creation.
+    const newRunGraceRef = useRef<number>(0);
+    const newRunRef = useRef(false);
 
     const updateEta = useCallback((progress: number, jobCreatedAt?: number) => {
         if (progress > 0.01 && progress < 1) {
@@ -67,12 +77,21 @@ export function useJobProgress(jobId: string | null): JobProgress {
         pollRef.current = setInterval(async () => {
             try {
                 const job = await getJob(id);
+                const terminal = job.state === 'done' || job.state === 'error';
+                if (newRunGraceRef.current) {
+                    if (terminal && Date.now() < newRunGraceRef.current) return;   // new run not started yet
+                    newRunGraceRef.current = 0;
+                }
                 setStatus(job);
                 setStep(job.current_step);
                 setStepProgress(job.step_progress);
                 setOverallProgress(job.overall_progress);
                 setMessage(job.message);
-                updateEta(job.overall_progress, job.created_at);
+                updateEta(job.overall_progress, newRunRef.current ? undefined : job.created_at);
+                if (job.state !== 'review_transcription' && job.state !== 'review_translation') {
+                    // Continued after a review: the review panel must go away.
+                    setIsReviewing(false);
+                }
                 if (job.state === 'done') {
                     setIsComplete(true);
                     setIsError(false);
@@ -118,10 +137,13 @@ export function useJobProgress(jobId: string | null): JobProgress {
         setIsComplete(false);
         setIsError(false);
         setIsWaitingForSrt(false);
+        setIsReviewing(false);
         setError(null);
         setEta('');
         startTimeRef.current = Date.now();
         lastProgressRef.current = 0;
+        newRunRef.current = false;
+        newRunGraceRef.current = 0;
 
         // Always start polling for reliable progress updates
         startPolling(jobId);
@@ -193,6 +215,7 @@ export function useJobProgress(jobId: string | null): JobProgress {
         setEta('');
         startTimeRef.current = Date.now();
         lastProgressRef.current = 0;
+        newRunGraceRef.current = 0;
 
         // Start polling as reliable fallback (same as initial setup)
         startPolling(jobId);
@@ -239,5 +262,27 @@ export function useJobProgress(jobId: string | null): JobProgress {
         unsubRef.current = unsub;
     }, [jobId, startPolling, updateEta]);
 
-    return { status, step, stepProgress, overallProgress, message, isComplete, isError, isWaitingForSrt, isReviewing, reviewStep, error, eta, restart };
+    const followNewRun = useCallback(() => {
+        if (!jobId) return;
+        // The finished run's SSE stream already ended; its events may still
+        // hold the old "complete", so the new run is followed by polling.
+        if (unsubRef.current) unsubRef.current();
+        unsubRef.current = null;
+        setIsComplete(false);
+        setIsError(false);
+        setIsWaitingForSrt(false);
+        setIsReviewing(false);
+        setError(null);
+        setStepProgress(0);
+        setOverallProgress(0);
+        setMessage('Starting the re-voice...');
+        setEta('');
+        startTimeRef.current = Date.now();
+        lastProgressRef.current = 0;
+        newRunRef.current = true;
+        newRunGraceRef.current = Date.now() + NEW_RUN_GRACE_MS;
+        startPolling(jobId);
+    }, [jobId, startPolling]);
+
+    return { status, step, stepProgress, overallProgress, message, isComplete, isError, isWaitingForSrt, isReviewing, reviewStep, error, eta, restart, followNewRun };
 }
