@@ -174,6 +174,17 @@ export default function DialogueModulesPanel({ preset, overrides, onChange, sour
                 </div>
             )}
 
+            <label className="block rounded-lg border border-border px-3 py-2 text-xs space-y-1">
+                <span className="block text-text-primary">Dialogue speaker labels</span>
+                <select className="w-full bg-background border border-border rounded px-2 py-1"
+                    value={String(params.speaker_label_policy || 'audio')}
+                    onChange={(e) => setParam('speaker_label_policy', e.target.value)}>
+                    <option value="audio">Detect speakers from English audio</option>
+                    <option value="supplied">Use supplied SRT labels (every cue must be labelled)</option>
+                </select>
+                <span className="block text-text-muted">Use supplied labels only for a reviewed English or Hindi SRT.
+                    Each cue must begin with [SPEAKER_00] or another numbered speaker ID.</span>
+            </label>
             {/* Review pause + output options */}
             {onRunOptionsChange && (
                 <div className="rounded-lg border border-border px-3 py-2 space-y-2 text-xs">

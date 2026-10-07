@@ -1115,7 +1115,7 @@ def _parse_voice_overrides_json(raw: str) -> Dict[str, Dict]:
 def _clean_dialogue_edits(body: Dict[str, Any]) -> Dict[str, Any]:
     """Validated {turn_edits, voice_overrides, speaker_merges} (empty parts
     dropped). Raises ValueError naming the first bad entry."""
-    for key in ("turn_edits", "speaker_merges"):
+    for key in ("turn_edits", "speaker_merges", "speaker_names"):
         if not isinstance(body.get(key) or {}, dict):
             raise ValueError(f"{key} must be an object")
     turn_edits: Dict[str, Dict] = {}
@@ -1145,7 +1145,13 @@ def _clean_dialogue_edits(body: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(into, str) or not into.strip() or into.strip() == frm:
             raise ValueError(f"speaker_merges[{frm}] must name another speaker")
         merges[str(frm)] = into.strip()
-    out = {"turn_edits": turn_edits,
+    names = {}
+    for sid, name in (body.get("speaker_names") or {}).items():
+        if (not isinstance(name, str) or len(name.strip()) > 80
+                or any(ord(c) < 32 for c in name)):
+            raise ValueError(f"speaker_names[{sid}] must be a name of at most 80 characters")
+        names[str(sid)] = name.strip()
+    out = {"speaker_names": names, "turn_edits": turn_edits,
            "voice_overrides": _check_voice_overrides(body.get("voice_overrides") or {}),
            "speaker_merges": merges}
     return {k: v for k, v in out.items() if v}
@@ -1167,7 +1173,8 @@ def _merge_dialogue_edits(base: Dict[str, Any], new: Dict[str, Any]) -> Dict[str
         for k, v in list(merges.items()):
             if v == frm:
                 merges[k] = into
-    out = {"turn_edits": turn_edits, "voice_overrides": voice_overrides, "speaker_merges": merges}
+    out = {"turn_edits": turn_edits, "voice_overrides": voice_overrides, "speaker_merges": merges,
+           "speaker_names": {**(base.get("speaker_names") or {}), **(new.get("speaker_names") or {})}}
     return {k: v for k, v in out.items() if v}
 
 
@@ -1420,7 +1427,8 @@ def _run_dialogue_mode(job: Job, req: JobCreateRequest, translated_srt: Optional
         edits = job.dialogue_edits or {}
         conf.update(resume=True, review_before_voice=False,
                     turn_edits=dict(edits.get("turn_edits") or {}),
-                    speaker_merges=dict(edits.get("speaker_merges") or {}))
+                    speaker_merges=dict(edits.get("speaker_merges") or {}),
+                    speaker_names=dict(edits.get("speaker_names") or {}))
         conf["voice_overrides"] = {**(conf.get("voice_overrides") or {}),
                                    **(edits.get("voice_overrides") or {})}
     known = {f.name for f in _dc_fields(DialogueConfig)}
@@ -4302,6 +4310,7 @@ def get_dialogue_report(job_id: str, fmt: str = "md"):
 
 
 class DialogueEditsRequest(BaseModel):
+    speaker_names: Dict[str, str] = {}
     turn_edits: Dict[str, Dict[str, Any]] = {}      # turn_id -> {"hi"?, "speaker_id"?, "delete"?}
     voice_overrides: Dict[str, Dict[str, Any]] = {} # speaker_id -> {"provider","voice","pitch"} | {"category"}
     speaker_merges: Dict[str, str] = {}             # from speaker_id -> into speaker_id
@@ -4316,7 +4325,7 @@ class DialogueRevoiceRequest(DialogueEditsRequest):
 
 
 def _edits_from(body: Optional[DialogueEditsRequest]) -> Dict[str, Any]:
-    raw = {k: getattr(body, k) for k in ("turn_edits", "voice_overrides", "speaker_merges")} if body else {}
+    raw = {k: getattr(body, k) for k in ("turn_edits", "voice_overrides", "speaker_merges", "speaker_names")} if body else {}
     try:
         return _clean_dialogue_edits(raw)
     except ValueError as e:
