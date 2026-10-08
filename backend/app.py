@@ -496,8 +496,9 @@ OUTPUTS.mkdir(parents=True, exist_ok=True)
 
 # Final saved dubbed videos go here, organized by title
 # Use D: drive folder if available (user's preferred location), else fallback to local
-_preferred_save = Path("D:/Shirshendu sasmal/youtube dubbed")
-SAVED_DIR = _preferred_save if _preferred_save.exists() else BASE_DIR / "dubbed_outputs"
+# VOICEDUB_SAVED_DIR: test runs save elsewhere instead of into the real library.
+_preferred_save = Path(os.environ.get("VOICEDUB_SAVED_DIR") or "D:/Shirshendu sasmal/youtube dubbed")
+SAVED_DIR = _preferred_save if _preferred_save.exists() or os.environ.get("VOICEDUB_SAVED_DIR")     else BASE_DIR / "dubbed_outputs"
 SAVED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Job persistence: SQLite ─────────────────────────────────────────────────

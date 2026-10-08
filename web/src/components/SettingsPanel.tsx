@@ -629,12 +629,28 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                     {/* SRT Mode: lock transcription + translation (SRT already has translated text) */}
                     {isSrtMode && (
-                        <div className="rounded-lg bg-purple-500/5 border border-purple-500/20 p-3">
-                            <p className="text-xs font-medium text-purple-400">SRT Dub Mode</p>
-                            <p className="text-[10px] text-text-muted mt-1">
-                                Transcription + Translation are skipped — your SRT file provides the text.
-                                Only TTS, Audio, and Assembly settings apply.
-                            </p>
+                        <div className="rounded-lg bg-purple-500/5 border border-purple-500/20 p-3 space-y-3">
+                            <div>
+                                <p className="text-xs font-medium text-purple-400">SRT Dub Mode</p>
+                                <p className="text-[10px] text-text-muted mt-1">
+                                    Transcription + Translation are skipped — your SRT file provides the text.
+                                    The video is never retimed: your SRT&apos;s timing is the timeline. A dense script is
+                                    spoken a little faster and may start a second or two after its subtitle, never
+                                    overlapping; cues that are only punctuation stay silent.
+                                </p>
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
+                                    <p className="text-xs text-text-muted">Detect each speaker in the original audio and give men male and women female voices (an already-translated SRT; a script with [SPEAKER_00] labels always uses them)</p>
+                                </div>
+                                <button
+                                    type="button" title="Toggle Multi-speaker" onClick={() => update({ multi_speaker: !settings.multi_speaker })}
+                                    className={`w-11 h-6 rounded-full transition-colors relative ${settings.multi_speaker ? 'bg-primary' : 'bg-white/10'}`}
+                                >
+                                    <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-transform ${settings.multi_speaker ? 'translate-x-6' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
                         </div>
                     )}
 

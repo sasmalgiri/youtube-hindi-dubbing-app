@@ -372,7 +372,8 @@ def turns_from_translated_cues(cues: Sequence[Dict], diar: Optional[DiarizationR
             flags.append("speaker_unknown" if spk == UNKNOWN_SPEAKER else "single_voice")
         t = Turn(turn_id=f"t{n:04d}", speaker_id=spk, source_start=s, source_end=e,
                  source_text=c.get("text_source", ""), hi_raw=text, hi_fit=text,
-                 hi_display=text, required=bool(text))
+                 hi_display=text,
+                 required=any(ch.isalnum() for ch in text))   # '...' has nothing to voice
         for f in flags:
             t.add_flag(f)
         turns.append(t)

@@ -228,7 +228,8 @@ def _tts_all_cues(cues: List[Dict], work_dir: Path, voice: str, rate: str,
             if cancel_check():
                 return
             text = cue["text"].strip()
-            if not text:
+            if not text or not any(ch.isalnum() for ch in text):
+                # empty, or punctuation only ("...", a music mark): nothing to speak
                 cue["_mp3"] = None
                 return
             mp3 = work_dir / f"sd_tts_{i:04d}.mp3"
