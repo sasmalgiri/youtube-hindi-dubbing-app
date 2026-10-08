@@ -94,8 +94,11 @@ def words_from_asr_segments(segments: Iterable[Dict]) -> List[WordRecord]:
 def words_from_cues(cues: Iterable[Dict], text_key: str = "text") -> List[WordRecord]:
     counter = [0]
     out: List[WordRecord] = []
-    for c in cues:
-        out += _even_words(c.get(text_key, ""), float(c["start"]), float(c["end"]), "s", counter)
+    for ci, c in enumerate(cues):
+        words = _even_words(c.get(text_key, ""), float(c["start"]), float(c["end"]), "s", counter)
+        for word in words:
+            word.attribution["cue_index"] = ci
+        out += words
     return out
 
 
@@ -142,6 +145,7 @@ def align_text_to_words(cues: Sequence[Dict], asr_words: Sequence[WordRecord],
         else:
             rec.timing_estimated = True
             rec.attribution = {"text_source": "subtitle", "timing_source": "interpolated"}
+        rec.attribution["cue_index"] = s["cue"]
         out.append(rec)
     _interpolate_unanchored(out, sub, cues)
     return out
@@ -336,12 +340,14 @@ def mark_overlaps(turns: List[Turn], min_overlap_s: float = 0.1):
 def turns_from_translated_cues(cues: Sequence[Dict], diar: Optional[DiarizationResult],
                                text_key: str = "text_translated",
                                second_speaker_share: float = 0.25,
-                               default_speaker: str = UNKNOWN_SPEAKER) -> List[Turn]:
+                               default_speaker: str = UNKNOWN_SPEAKER,
+                               prefer_labels: bool = False) -> List[Turn]:
     """One turn per Hindi cue; speaker from audio diarization over the cue span.
 
     A Hindi cue cannot be split word-by-word against English audio, so cues
     spanning a speaker change are flagged `multi_speaker_cue` instead.
-    SRT [SPEAKER_XX] labels are used only when diarization is unavailable.
+    SRT [SPEAKER_XX] labels are authoritative with prefer_labels=True;
+    otherwise they are used only when no audio speaker overlaps the cue.
     A cue with neither gets `default_speaker` (one known speaker when speaker
     detection is switched off, so the narrator's voice is still analysed).
     """
@@ -358,7 +364,14 @@ def turns_from_translated_cues(cues: Sequence[Dict], diar: Optional[DiarizationR
             if ov > 0:
                 shares[k] = shares.get(k, 0.0) + ov
         flags = ["pre_translated"]
-        if shares:
+        if prefer_labels and c.get("speaker_id"):
+            spk = c["speaker_id"]
+            flags.append("speaker_from_srt_label")
+            if len(shares) > 1:
+                ranked = sorted(shares.values(), reverse=True)
+                if ranked[1] / sum(ranked) >= second_speaker_share:
+                    flags.append("multi_speaker_cue")
+        elif shares:
             total = sum(shares.values())
             ranked = sorted(shares.items(), key=lambda kv: -kv[1])
             spk = ranked[0][0]

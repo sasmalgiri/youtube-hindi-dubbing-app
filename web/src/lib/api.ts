@@ -493,6 +493,7 @@ export interface ReviewTurn {
 }
 export interface ReviewSpeaker {
     speaker_id: string;
+    display_name?: string;
     voice_category: string;      // male_like | female_like | child_like | unknown
     category_confidence: number | null;
     total_speech_s: number;
@@ -522,6 +523,7 @@ export interface VoiceOverride { provider: string; voice: string; pitch: string 
 export interface TurnEdit { hi?: string; speaker_id?: string; delete?: boolean; }
 // Only what the user changed: every key is optional.
 export interface DialogueEdits {
+    speaker_names?: Record<string, string>;
     turn_edits?: Record<string, TurnEdit>;
     voice_overrides?: Record<string, VoiceOverride | { category: 'male_like' | 'female_like' }>;
     speaker_merges?: Record<string, string>;

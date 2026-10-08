@@ -56,6 +56,7 @@ class SpeakerRecord:
     reference_transcript: Optional[str] = None
     embedding_provenance: Optional[str] = None
     total_speech_s: float = 0.0
+    display_name: str = ""  # user label; identity remains speaker_id
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

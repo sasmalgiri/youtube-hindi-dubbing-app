@@ -14,6 +14,7 @@ import type {
 } from './api';
 
 export interface ReviewDraft {
+    names?: Record<string, string>;         // display labels, never speaker identities
     hi: Record<string, string>;            // turn_id -> edited Hindi line
     speaker: Record<string, string>;       // turn_id -> other existing speaker
     deleted: Record<string, boolean>;      // turn_id -> drop this line
@@ -99,6 +100,13 @@ export function resolveMerges(merges: Record<string, string>): Record<string, st
     return out;
 }
 
+export function withName(d: ReviewDraft, s: ReviewSpeaker, name: string): ReviewDraft {
+    const names = { ...d.names };
+    if (name === (s.display_name || '')) delete names[s.speaker_id];
+    else names[s.speaker_id] = name;
+    return { ...d, names };
+}
+
 /** Request body: only the fields the user changed, empty groups left out. */
 export function buildEdits(packet: ReviewPacket, d: ReviewDraft): DialogueEdits {
     const turn_edits: Record<string, TurnEdit> = {};
@@ -122,13 +130,21 @@ export function buildEdits(packet: ReviewPacket, d: ReviewDraft): DialogueEdits 
         voice_overrides[s.speaker_id] = { provider: v.provider, voice: v.voice, pitch: v.pitch || null };
     }
     const edits: DialogueEdits = {};
+    const names: Record<string, string> = {};
+    for (const s of packet.speakers) {
+        const name = d.names?.[s.speaker_id];
+        if (name !== undefined && !merges[s.speaker_id] && name.trim() !== (s.display_name || '')) {
+            names[s.speaker_id] = name.trim();
+        }
+    }
+    if (Object.keys(names).length) edits.speaker_names = names;
     if (Object.keys(turn_edits).length) edits.turn_edits = turn_edits;
     if (Object.keys(voice_overrides).length) edits.voice_overrides = voice_overrides;
     if (Object.keys(merges).length) edits.speaker_merges = merges;
     return edits;
 }
 
-export interface EditSummary { lines: number; deleted: number; relabelled: number; voices: number; merges: number; total: number; }
+export interface EditSummary { lines: number; deleted: number; relabelled: number; voices: number; merges: number; names: number; total: number; }
 
 export function summarizeEdits(e: DialogueEdits): EditSummary {
     const te = Object.values(e.turn_edits || {});
@@ -138,8 +154,9 @@ export function summarizeEdits(e: DialogueEdits): EditSummary {
         relabelled: te.filter((x) => x.speaker_id !== undefined).length,
         voices: Object.keys(e.voice_overrides || {}).length,
         merges: Object.keys(e.speaker_merges || {}).length,
+        names: Object.keys(e.speaker_names || {}).length,
     };
-    return { ...s, total: s.lines + s.deleted + s.relabelled + s.voices + s.merges };
+    return { ...s, total: s.lines + s.deleted + s.relabelled + s.voices + s.merges + s.names };
 }
 
 // ── Search & replace across the Hindi lines ──────────────────────────────
@@ -205,7 +222,7 @@ export function isFlagged(t: ReviewTurn): boolean {
 
 // Flags that mean the line probably sounds wrong (the rest are informational).
 export const SERIOUS_FLAGS = new Set([
-    'translation_failed', 'tts_failed', 'timing_overflow', 'speaker_unknown', 'critical_token_warning', 'translation_uncertain',
+    'multi_speaker_cue', 'translation_failed', 'tts_failed', 'timing_overflow', 'speaker_unknown', 'critical_token_warning', 'translation_uncertain',
 ]);
 
 export const flagLabel = (f: string) => f.replace(/_/g, ' ');

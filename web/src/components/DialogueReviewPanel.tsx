@@ -24,7 +24,7 @@ import {
 import {
     EMPTY_DRAFT, SERIOUS_FLAGS, applyReplace, buildEdits, countMatches, currentHindi, flagLabel, formatTime,
     isFlagged, isTurnEdited, overflowLabel, parseVoiceKey, previewReplace, resolveMerges, shortVoiceLabel,
-    summarizeEdits, voiceGroups, voiceKey, voiceProviders, withDeleted, withHindi, withMerge, withSpeaker,
+    withName, summarizeEdits, voiceGroups, voiceKey, voiceProviders, withDeleted, withHindi, withMerge, withSpeaker,
     withVoice, type ReviewDraft,
 } from '@/lib/dialogueReview';
 
@@ -353,9 +353,11 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
         }
         return m;
     }, [turns]);
-    const speakerChoices = useMemo(() => speakerIds.map((id) => ({
-        id, label: merges[id] ? `${id} → ${merges[id]}` : id,
-    })), [speakerIds, merges]);
+    const speakerChoices = useMemo(() => speakerIds.map((id) => {
+        const name = draft.names?.[id] ?? speakers.find((s) => s.speaker_id === id)?.display_name;
+        const label = name ? `${name} (${id})` : id;
+        return { id, label: merges[id] ? `${label} → ${merges[id]}` : label };
+    }), [speakerIds, merges, draft.names, speakers]);
 
     const edits = useMemo(() => (packet ? buildEdits(packet, draft) : {}), [packet, draft]);
     const summary = useMemo(() => summarizeEdits(edits), [edits]);
@@ -413,6 +415,7 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
     }
 
     const changesText = summary.total === 0 ? 'No changes yet' : [
+        summary.names && `${summary.names} character name${summary.names === 1 ? '' : 's'} changed`,
         summary.lines && `${summary.lines} line${summary.lines === 1 ? '' : 's'} edited`,
         summary.deleted && `${summary.deleted} deleted`,
         summary.relabelled && `${summary.relabelled} relabelled`,
@@ -511,6 +514,11 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
                                     <div className="flex flex-wrap items-center gap-2">
                                         <span className={`px-1.5 py-0.5 rounded font-medium ${cat.cls}`}>{cat.short}</span>
                                         <span className="font-medium text-text-primary">{s.speaker_id}</span>
+                                        <input aria-label={`Character name for ${s.speaker_id}`}
+                                            placeholder="Character name (optional)" maxLength={80}
+                                            disabled={!!into || busy} className={SELECT}
+                                            value={draft.names?.[s.speaker_id] ?? s.display_name ?? ''}
+                                            onChange={(e) => setDraft((d) => withName(d, s, e.target.value))} />
                                         <span className="text-text-muted">
                                             {cat.label}{s.category_confidence != null ? ` ${Math.round(s.category_confidence * 100)}%` : ''}
                                             {' · '}{s.turns} line{s.turns === 1 ? '' : 's'} · {Math.round(s.total_speech_s || 0)}s

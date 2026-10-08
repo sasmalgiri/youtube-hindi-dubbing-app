@@ -760,6 +760,10 @@ def to_config(sel: Dict[str, List[str]], params: Dict[str, Any]) -> Dict[str, An
     mt_names = [t for t in translation if t in ("indictrans2", "google_basic")]
     num = int(params.get("num_speakers") or 0)
     extra: Dict[str, Any] = {k: _as_bool(params[k]) for k in PASSTHROUGH_BOOLS if k in params}
+    policy = params.get("speaker_label_policy", "audio")
+    if policy not in ("audio", "supplied"):
+        raise ValueError("speaker_label_policy must be audio or supplied")
+    extra["speaker_label_policy"] = policy
     if "container" in params:
         container = str(params["container"] or "").strip().lower()
         extra["container"] = container if container in CONTAINERS else "mp4"
