@@ -9,7 +9,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 pydantic==2.10.4
-edge-tts==7.2.7
+edge-tts==7.3.1   # 7.2.x got HTTP 403 on every call from 2026-10-14 (Microsoft token change)
 faster-whisper==1.1.1
 deep-translator==1.11.4
 google-genai>=1.0.0

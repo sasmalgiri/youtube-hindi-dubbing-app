@@ -3643,6 +3643,11 @@ async def create_job_with_srt(
     dialogue_container: str = Form("mp4"),
     sd_srt_content: str = Form(""),
     sd_max_stretch: float = Form(20.0),
+    # visual transforms: the UI sends them for every mode; undeclared fields are dropped
+    visual_transforms: str = Form("true"),
+    vx_hflip: str = Form("false"),
+    vx_hue: float = Form(4.0),
+    vx_zoom: float = Form(1.04),
 ):
     """Create a dubbing job from a video (URL or file) + SRT file.
     If srt_needs_translation=true: English SRT → translate → TTS → assembly.
@@ -3745,6 +3750,10 @@ async def create_job_with_srt(
             dialogue_container=dialogue_container,
             sd_srt_content=sd_srt_content,
             sd_max_stretch=sd_max_stretch,
+            visual_transforms=_bool(visual_transforms),
+            vx_hflip=_bool(vx_hflip),
+            vx_hue=vx_hue,
+            vx_zoom=vx_zoom,
         )
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
