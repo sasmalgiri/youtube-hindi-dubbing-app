@@ -283,7 +283,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                 const isNew = mode === 'new';
                 const isOneFlow = mode === 'oneflow';
                 const isSrtDub = mode === 'srtdub';
-                const isSrtMode = settings._input_mode === 'srt';
+                const isSrtMode = settings._input_mode === 'srt' || settings._input_mode === 'story';
 
                 // ── Dependency flags ──
                 const isVoiceClone = settings.audio_untouchable && settings.use_coqui_xtts && !settings.use_edge_tts;

@@ -1350,6 +1350,9 @@ class PipelineConfig:
     # up in the next pause) instead of forcing each cue into its own slot. Only used
     # together with tempo_match; set by run_from_srt / run_from_source_srt.
     tempo_elastic: bool = False
+    # Story jobs: the video is generated and silent, so a speaker's gender cannot be
+    # heard; the script's cast supplies it ({'SPEAKER_00': 'male', ...}).
+    srt_speaker_genders: Optional[Dict[str, str]] = None
     tempo_max_speedup: float = 1.5       # total speech speedup ceiling (engine rate x atempo)
     tempo_gap_borrow_ms: int = 500       # max trailing-silence borrow per segment (ms)
     # Dynamic worker scaling for Edge-TTS — adjusts concurrency based on
@@ -3399,8 +3402,13 @@ class Pipeline:
                 if seg.get("speaker_id"):
                     speaker_ranges.setdefault(seg["speaker_id"], []).append((seg["start"], seg["end"]))
             _wav16 = self.cfg.work_dir / "audio_16k.wav"
-            speaker_genders = self._detect_speaker_genders(
-                _wav16 if _wav16.exists() else audio_raw, speaker_ranges)
+            given = getattr(self.cfg, "srt_speaker_genders", None) or {}
+            if given:
+                speaker_genders = {s: given.get(s, self._default_voice_gender()) for s in speakers_found}
+                self._speaker_speech_sec = {s: sum(e - b for b, e in rs) for s, rs in speaker_ranges.items()}
+            else:
+                speaker_genders = self._detect_speaker_genders(
+                    _wav16 if _wav16.exists() else audio_raw, speaker_ranges)
             if speaker_genders:
                 self._voice_map = self._assign_voices_to_speakers(speaker_genders)
                 self._speaker_genders = speaker_genders

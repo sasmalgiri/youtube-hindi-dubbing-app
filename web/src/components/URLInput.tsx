@@ -4,13 +4,14 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { extractYouTubeId, isValidYouTubeUrl, getThumbnailUrl } from '@/lib/utils';
 import { addLink, type LinkPreset } from '@/lib/api';
 
-type InputMode = 'url' | 'upload' | 'batch' | 'srt';
+type InputMode = 'url' | 'upload' | 'batch' | 'srt' | 'story';
 
 interface URLInputProps {
     onSubmit: (url: string) => void;
     onFileSubmit: (file: File) => void;
     onBatchSubmit?: (urls: string[]) => void;
     onSrtSubmit?: (srtFile: File, videoSource: { url?: string; file?: File }, needsTranslation?: boolean) => void;
+    onStorySubmit?: (story: { text?: string; file?: File; title?: string; maxScenes?: number }) => void;
     onModeChange?: (mode: InputMode) => void;
     disabled?: boolean;
     url?: string;
@@ -22,7 +23,7 @@ interface URLInputProps {
 
 export { type InputMode };
 
-export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, onModeChange, disabled, url: controlledUrl, onUrlChange, getPreset, dubDuration = 0, onDubDurationChange }: URLInputProps) {
+export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, onStorySubmit, onModeChange, disabled, url: controlledUrl, onUrlChange, getPreset, dubDuration = 0, onDubDurationChange }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
     const [internalUrl, setInternalUrl] = useState('');
 
@@ -44,6 +45,12 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
     const [srtVideoMode, setSrtVideoMode] = useState<'url' | 'file'>('url');
     const srtFileInputRef = useRef<HTMLInputElement>(null);
     const srtVideoFileInputRef = useRef<HTMLInputElement>(null);
+    // Story mode state
+    const [storyText, setStoryText] = useState('');
+    const [storyFile, setStoryFile] = useState<File | null>(null);
+    const [storyTitle, setStoryTitle] = useState('');
+    const [storyMaxScenes, setStoryMaxScenes] = useState(0);
+    const storyFileInputRef = useRef<HTMLInputElement>(null);
 
     const videoId = extractYouTubeId(url);
     const isValid = isValidYouTubeUrl(url);
@@ -195,6 +202,20 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                         <line x1="16" y1="17" x2="8" y2="17" />
                     </svg>
                     SRT Dub
+                </button>
+                <button
+                    onClick={() => { setMode('story'); onModeChange?.('story'); }}
+                    className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+                        mode === 'story'
+                            ? 'bg-primary text-white shadow-sm'
+                            : 'text-text-secondary hover:text-text-primary'
+                    }`}
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                    </svg>
+                    Story
                 </button>
             </div>
 
@@ -421,6 +442,59 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                                 Upload &amp; Start Dubbing
                             </>
                         )}
+                    </button>
+                </>
+            )}
+
+            {/* Story Mode: a written story -> generated clips (local Wan 2.1) -> Hindi voices */}
+            {mode === 'story' && (
+                <>
+                    <div className="glass-card p-4 space-y-4">
+                        <div className="flex items-center gap-2 p-2.5 rounded-lg bg-primary/10 border border-primary/20">
+                            <p className="text-xs text-primary-light">
+                                <strong>Story → video</strong> — the story is split into scenes with Hindi dialogue, every scene is
+                                generated as 3-second clips on this PC&apos;s GPU (480p, silent, about 7 minutes per clip), then voiced
+                                per character. One minute of story is roughly 2.5 hours of rendering. The script is saved next to the video.
+                            </p>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">Title</label>
+                            <input type="text" value={storyTitle} onChange={(e) => setStoryTitle(e.target.value)}
+                                placeholder="Story title (optional)" className="input-field w-full px-4 py-2.5 text-sm" disabled={disabled} />
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">Story (paste text, or upload .txt / .docx)</label>
+                            <textarea value={storyText} onChange={(e) => { setStoryText(e.target.value); if (e.target.value.trim()) setStoryFile(null); }}
+                                placeholder="Paste the story here, in English or Hindi..." rows={8}
+                                className="input-field w-full px-4 py-3 text-sm font-mono" disabled={disabled} />
+                            <input ref={storyFileInputRef} type="file" accept=".txt,.md,.docx" className="hidden"
+                                onChange={(e) => { const f = e.target.files?.[0] || null; setStoryFile(f); if (f) setStoryText(''); }} />
+                            <div onClick={() => storyFileInputRef.current?.click()}
+                                className={`mt-2 cursor-pointer border-2 border-dashed rounded-xl p-3 text-center transition-all ${
+                                    storyFile ? 'border-green-500/50 bg-green-500/5' : 'border-border hover:border-primary/50 hover:bg-primary/5'}`}>
+                                <p className="text-sm text-text-muted">{storyFile ? `${storyFile.name} (${formatFileSize(storyFile.size)})` : 'or click to upload a story file'}</p>
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-text-muted mb-1.5">How much to make</label>
+                            <div className="grid grid-cols-4 gap-1.5">
+                                {[{ value: 3, label: 'First 3 scenes (test)' }, { value: 10, label: 'First 10 scenes' }, { value: 0, label: 'Whole story' }].map((m) => (
+                                    <button key={m.value} type="button" onClick={() => setStoryMaxScenes(m.value)}
+                                        className={`py-1.5 rounded-lg text-xs font-medium transition-all border ${storyMaxScenes === m.value
+                                            ? 'bg-primary/20 border-primary text-primary-light' : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10'}`}>
+                                        {m.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                    <button
+                        onClick={() => { if (disabled) return; if (!storyFile && storyText.trim().length < 40) return;
+                            onStorySubmit?.({ text: storyFile ? undefined : storyText, file: storyFile || undefined, title: storyTitle || undefined, maxScenes: storyMaxScenes || undefined }); }}
+                        disabled={disabled || (!storyFile && storyText.trim().length < 40)}
+                        className="btn-primary w-full py-4 text-base font-semibold flex items-center justify-center gap-2"
+                    >
+                        {disabled ? 'Processing...' : 'Make the video'}
                     </button>
                 </>
             )}

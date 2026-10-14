@@ -10,7 +10,7 @@ import PresetTabs from '@/components/PresetTabs';
 import DialogueModulesPanel, { DIALOGUE_RUN_OPTION_KEYS, pickDialogueRunOptions } from '@/components/DialogueModulesPanel';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
-import { createJob, createJobUpload, createJobWithSrt, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
+import { createJob, createJobUpload, createJobWithSrt, createJobStory, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
 
 // The "My Hindi SRT" dialogue preset (text_source = hindi_srt) voices a Hindi
 // SRT. A link or an uploaded video gives it none — the preset panel shows it
@@ -263,6 +263,18 @@ export default function HomePage() {
         router.push('/batch');
     }, [sourceLanguage, targetLanguage, settings, router, stripModeBloat, stripForPreset]);
 
+    const handleStorySubmit = useCallback(async (story: { text?: string; file?: File; title?: string; maxScenes?: number }) => {
+        setSubmitting(true);
+        setError(null);
+        try {
+            const { id } = await createJobStory({ ...story, voice: settings.voice });
+            router.push(`/jobs/${id}`);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Failed to start the story');
+            setSubmitting(false);
+        }
+    }, [settings.voice, router]);
+
     const handleSrtSubmit = useCallback(async (srtFile: File, videoSource: { url?: string; file?: File }, needsTranslation?: boolean) => {
         setSubmitting(true);
         setError(null);
@@ -301,7 +313,7 @@ export default function HomePage() {
                     </div>
 
                     {/* URL Input */}
-                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} onSrtSubmit={handleSrtSubmit} onModeChange={(m) => setSettings(s => ({ ...s, _input_mode: m }))} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} dubDuration={settings.dub_duration} onDubDurationChange={(v) => setSettings(s => ({ ...s, dub_duration: v }))} />
+                    <URLInput onSubmit={handleSubmit} onFileSubmit={handleFileSubmit} onBatchSubmit={handleBatchSubmit} onSrtSubmit={handleSrtSubmit} onStorySubmit={handleStorySubmit} onModeChange={(m) => setSettings(s => ({ ...s, _input_mode: m }))} disabled={submitting} url={currentUrl} onUrlChange={setCurrentUrl} getPreset={() => ({ source_language: sourceLanguage, target_language: targetLanguage, ...settings })} dubDuration={settings.dub_duration} onDubDurationChange={(v) => setSettings(s => ({ ...s, dub_duration: v }))} />
 
                     {/* Saved Links */}
                     <div className="mt-4">
@@ -347,7 +359,7 @@ export default function HomePage() {
                 />
 
                 {/* Pipeline Switcher — 7 modes (hidden in SRT mode — only Classic applies) */}
-                {settings._input_mode !== 'srt' && (
+                {settings._input_mode !== 'srt' && settings._input_mode !== 'story' && (
                     <div className="flex flex-col gap-2 px-1">
                         <div className="flex flex-wrap gap-1 rounded-xl border border-border p-1">
                             {[
@@ -385,7 +397,7 @@ export default function HomePage() {
                 )}
 
                 {/* Hindi Dialogue: module matrix (presets + auto on/off per this PC) */}
-                {settings.pipeline_mode === 'hindi_dialogue' && settings._input_mode !== 'srt' && (
+                {settings.pipeline_mode === 'hindi_dialogue' && settings._input_mode !== 'srt' && settings._input_mode !== 'story' && (
                     <DialogueModulesPanel
                         preset={(settings as any).dialogue_preset || ''}
                         overrides={(settings as any).dialogue_modules || {}}

@@ -403,6 +403,7 @@ class JobCreateRequest(BaseModel):
     sd_vx_hue: float = 5.0              # Hue shift in degrees (-30..+30)
     sd_vx_zoom: float = 1.05            # Zoom then crop back (1.0 = off, 1.05 = 5% zoom)
     srt_needs_translation: bool = False  # True = English SRT needs translation before TTS
+    srt_speaker_genders: Optional[Dict[str, str]] = None   # story jobs: cast gender per [SPEAKER_xx] label
     transcript_srt_content: str = ""     # Paste/upload English SRT to skip transcription → go straight to translation
     preset_name: str = ""                 # Name of preset used (for display only)
     # ── AV Sync Modules ──
@@ -1769,6 +1770,7 @@ def _run_job(job: Job, req: JobCreateRequest):
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%'),
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130),
             srt_needs_translation=req.srt_needs_translation,
+            srt_speaker_genders=getattr(req, 'srt_speaker_genders', None),
             # ── AV Sync Modules ──
             av_sync_mode=getattr(req, 'av_sync_mode', 'original'),
             max_audio_speedup=getattr(req, 'max_audio_speedup', 1.30),
@@ -2456,6 +2458,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%'),
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130),
             srt_needs_translation=req.srt_needs_translation,
+            srt_speaker_genders=getattr(req, 'srt_speaker_genders', None),
             av_sync_mode=getattr(req, 'av_sync_mode', 'original'),
             max_audio_speedup=getattr(req, 'max_audio_speedup', 1.30),
             min_video_speed=getattr(req, 'min_video_speed', 0.70),
@@ -2608,6 +2611,7 @@ def _run_job_split(job: Job, req: JobCreateRequest, voice: str):
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%'),
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130),
             srt_needs_translation=req.srt_needs_translation,
+            srt_speaker_genders=getattr(req, 'srt_speaker_genders', None),
             av_sync_mode=getattr(req, 'av_sync_mode', 'original'),
             max_audio_speedup=getattr(req, 'max_audio_speedup', 1.30),
             min_video_speed=getattr(req, 'min_video_speed', 0.70),
@@ -3478,6 +3482,7 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
             tts_rate_ceiling=getattr(req, 'tts_rate_ceiling', '+25%'),
             tts_rate_target_wpm=getattr(req, 'tts_rate_target_wpm', 130),
             srt_needs_translation=req.srt_needs_translation,
+            srt_speaker_genders=getattr(req, 'srt_speaker_genders', None),
             # ── AV Sync Modules ──
             av_sync_mode=getattr(req, 'av_sync_mode', 'original'),
             max_audio_speedup=getattr(req, 'max_audio_speedup', 1.30),
@@ -3578,6 +3583,146 @@ def _run_job_with_srt(job: Job, req: JobCreateRequest, srt_path: Path):
         except Exception:
             pass
         _pipeline_semaphore.release()
+
+
+# ── Story -> video (local Wan 2.1 clips + the SRT dub path) ──────────────────
+# Weights: breakdown is quick, clip generation is most of the job (minutes per
+# 5 s clip on a 12 GB GPU); the SRT dub that follows uses the classic weights,
+# so generation must end exactly where "translate" starts there (0.45).
+STORY_STEP_WEIGHTS = {"download": 0.05, "extract": 0.40, "transcribe": 0.0,
+                      "translate": 0.15, "synthesize": 0.30, "assemble": 0.10}
+
+
+@app.post("/api/jobs/story")
+async def create_job_story(
+    story_file: Optional[UploadFile] = File(None),
+    story_text: str = Form(""),
+    title: str = Form(""),
+    voice: str = Form("hi-IN-MadhurNeural"),
+    video_steps: int = Form(20),
+    max_scenes: int = Form(0),          # >0: only the first N scenes (a quick test)
+):
+    """A written story becomes a Hindi short drama: script (LLM) -> clips (local
+    Wan 2.1) -> silent video + SRT -> the SRT dub path (voices per character)."""
+    _cleanup_old_jobs()
+    text = (story_text or "").strip()
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = OUTPUTS / job_id
+    work_dir = job_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if story_file and story_file.filename:
+        ext = Path(story_file.filename).suffix.lower() or ".txt"
+        src = work_dir / f"story{ext}"
+        with open(src, "wb") as f:
+            while chunk := await story_file.read(1024 * 1024):
+                f.write(chunk)
+        from dubbing.story.breakdown import read_story_file
+        try:
+            text = read_story_file(src).strip()
+        except Exception as e:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"Could not read the story file: {e}")
+        title = title or Path(story_file.filename).stem
+    if len(text) < 40:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Paste or upload a story (at least a few sentences)")
+    (work_dir / "story.txt").write_text(text, encoding="utf-8")
+    job = Job(id=job_id, source_url=f"story:{(title or text[:40]).strip()}", target_language="hi")
+    job.video_title = (title or "").strip() or "Story"
+    JOBS[job_id] = job
+    _store.save(job)
+    t = threading.Thread(target=_run_story_job, args=(job, text, job.video_title, voice, int(video_steps), int(max_scenes)),
+                         daemon=True)
+    job.worker_thread = t
+    t.start()
+    return {"id": job_id}
+
+
+@app.get("/api/jobs/{job_id}/story")
+def get_story_script(job_id: str):
+    """The generated script (cast, scenes, shots, Hindi lines) of a story job."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    for folder in (OUTPUTS / job_id / "story", Path(job.saved_folder or "") if job.saved_folder else None):
+        if folder and (folder / "story.json").exists():
+            return json.loads((folder / "story.json").read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="No script yet")
+
+
+def _run_story_job(job: Job, text: str, title: str, voice: str, steps: int, max_scenes: int):
+    from dubbing.story.breakdown import break_down
+    from dubbing.story.generate import WanGenerator
+    from dubbing.story.assemble import assemble
+    from dubbing.dialogue.translation import default_llm_clients
+
+    job_dir = OUTPUTS / job.id
+    story_dir = job_dir / "story"
+    story_dir.mkdir(parents=True, exist_ok=True)
+    cb = _make_progress_callback(job, STORY_STEP_WEIGHTS)
+    job.message = "Waiting in queue..."
+    _pipeline_semaphore.acquire()
+    gen = None
+    try:
+        job.state = "running"
+        _store.save(job)
+        # 1. script
+        clients = default_llm_clients(["groq", "gemini", "cerebras"])
+        if not clients:
+            raise RuntimeError("No LLM available to write the script (set GROQ_API_KEY or GEMINI_API_KEY)")
+        story = break_down(text, clients[0], title_hint=title,
+                           on_progress=lambda p, m: cb("download", p, m))
+        if max_scenes > 0:
+            story.scenes = story.scenes[:max_scenes]
+        story.save(story_dir / "story.json")
+        job.video_title = story.title or title
+        if job.cancel_event.is_set():
+            raise RuntimeError("Job cancelled by user")
+        # 2. clips (local GPU, minutes per clip: the worker reports every step)
+        cb("extract", 0.0, f"Loading the video model for {story.total_shots} clips...")
+        gen = WanGenerator(story_dir / "clips", steps=steps)
+        gen.start(lambda p, m: cb("extract", 0.0, m))
+        clips = gen.generate_all(story, lambda p, m: cb("extract", p, m), cancel_check=job.cancel_event.is_set)
+        gen.close()
+        gen = None
+        failed = [c for c in clips if c.error]
+        if failed:
+            job.status_reasons = [f"{c.scene_id} shot {c.index + 1} not generated: {c.error[:120]}" for c in failed][:50]
+        # 3. silent video + SRT
+        cb("extract", 1.0, "Joining the clips...")
+        out = assemble(story, clips, story_dir, ffmpeg=shutil.which("ffmpeg") or "ffmpeg")
+        req = JobCreateRequest(
+            url=str(out["video"]), source_language="en", target_language="hi", voice=voice,
+            multi_speaker=False, mix_original=False, audio_untouchable=True, post_tts_level="none",
+            visual_transforms=False, split_duration=0, pipeline_mode="classic",
+            srt_needs_translation=False,
+            srt_speaker_genders={c.id: c.gender for c in story.cast})
+        job.original_req = req
+        job.source_url = f"story:{story.title}"
+    except Exception as e:
+        if gen is not None:
+            gen.close()
+        job.state = "error"
+        job.error = str(e)
+        job.message = f"Error: {e}"
+        job.events.append({"type": "complete", "state": "error", "error": str(e)})
+        _store.save(job)
+        _pipeline_semaphore.release()
+        return
+    _pipeline_semaphore.release()
+    # 4. voices + subtitles + final video (acquires the semaphore itself)
+    _run_job_with_srt(job, req, out["srt"])
+    if job.state == "done":
+        try:
+            if job.saved_folder:
+                shutil.copy2(story_dir / "story.json", Path(job.saved_folder) / "story.json")
+                missing = out.get("missing") or []
+                if missing:
+                    job.status_reasons = [f"not generated (dark card shown): {m}" for m in missing] + job.status_reasons
+                    job.result_status = job.result_status or "completed_with_warnings"
+                _store.save(job)
+        except Exception:
+            pass
 
 
 @app.post("/api/jobs/with-srt")

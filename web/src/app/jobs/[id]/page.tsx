@@ -155,6 +155,12 @@ export default function JobPage() {
                                     Subtitles
                                 </a>
                             )}
+                            {(status?.source_url || '').startsWith('story:') && (
+                                <a href={`${API_BASE}/api/jobs/${jobId}/story`} target="_blank" rel="noreferrer"
+                                    className="btn-secondary text-sm flex items-center gap-2" title="The generated script: cast, scenes, shots and Hindi lines">
+                                    Script
+                                </a>
+                            )}
                             <a
                                 href={resultVideoUrl(jobId)}
                                 download={status?.video_title ? `${status.video_title} - Dubbed.${videoExt}` : `dubbed_${jobId}.${videoExt}`}

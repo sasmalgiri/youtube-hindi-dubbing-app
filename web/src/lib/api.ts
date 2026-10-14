@@ -317,6 +317,24 @@ export async function createJobUpload(
     return res.json();
 }
 
+export async function createJobStory(
+    story: { text?: string; file?: File; title?: string; voice?: string; videoSteps?: number; maxScenes?: number },
+): Promise<{ id: string }> {
+    const form = new FormData();
+    if (story.file) form.append('story_file', story.file);
+    if (story.text) form.append('story_text', story.text);
+    if (story.title) form.append('title', story.title);
+    if (story.voice) form.append('voice', story.voice);
+    if (story.videoSteps) form.append('video_steps', String(story.videoSteps));
+    if (story.maxScenes) form.append('max_scenes', String(story.maxScenes));
+    const res = await fetch(`${API_BASE}/api/jobs/story`, { method: 'POST', headers: { ...EXTRA_HEADERS }, body: form });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
+        throw new Error(err.detail || 'Failed to start the story');
+    }
+    return res.json();
+}
+
 export async function createJobWithSrt(
     srtFile: File,
     settings: Omit<JobCreateRequest, 'url'>,

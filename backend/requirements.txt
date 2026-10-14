@@ -39,3 +39,4 @@ supabase>=2.0.0
 # torch>=2.2
 # whisperx>=3.8.0        # forced alignment for tighter word timestamps (on by default)
 demucs>=4.0.0          # vocal/background stem separation for "keep background music"
+diffusers==0.34.0      # Story -> video (Wan 2.1 clips); see constraints.txt for why not newer

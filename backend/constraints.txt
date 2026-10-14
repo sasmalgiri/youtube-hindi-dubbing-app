@@ -42,3 +42,7 @@ onnxruntime-gpu==1.23.2
 # newer one can need another cuDNN.
 torchvision==0.19.1
 ctranslate2==4.7.1
+
+# Story -> video clips (Wan 2.1 through diffusers). 0.35+ needs torch >= 2.5 (custom-op
+# registration / SDPA enable_gqa); 0.34 is the last that runs on the pinned torch.
+diffusers==0.34.0

@@ -273,3 +273,13 @@ Compare against the turn list in `report.md`.
   available and tested for chunked runs, but it is not used by default.
 - A job resumes only from its own checkpoint, and only the stages up to translation are skipped:
   synthesize, fit, verify and mix always run again. Nothing is reused across jobs.
+
+## Story → video (local, experimental)
+
+The **Story** tab turns a written story (paste, `.txt` or `.docx`) into a Hindi short drama on this PC:
+
+1. Groq writes the script: cast (with gender and look), scenes, shots, Hindi lines with emotions. Saved as `story.json` next to the output ("Script" button on the job page).
+2. Every 3-second shot is rendered by Wan 2.1 (1.3B) through diffusers 0.34 on the GPU, 832x480, silent. Measured on the RTX 3060: about 7 minutes per clip at 20 steps (peak ~11 GB VRAM); one minute of story is roughly 2.5 hours. The first run downloads ~17 GB of weights into the Hugging Face cache.
+3. The clips are joined, the lines become an SRT with `[SPEAKER_xx]` labels, and the usual SRT dub path adds one voice per character (gender from the script), subtitles and the final video. A shot that failed to render is a dark card so timing never shifts, and is listed in the job's warnings.
+
+Limits: the characters' faces are not consistent between clips (text-to-video only), lips do not move with the words, and the narrator uses the job's default voice. "First 3 scenes (test)" is the quick way to see a result.
