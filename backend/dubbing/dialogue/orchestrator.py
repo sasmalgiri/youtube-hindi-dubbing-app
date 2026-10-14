@@ -99,6 +99,7 @@ class DialogueConfig:
     output_dir: Path
     source_srt: Optional[Path] = None        # English SRT: text source, audio still analysed
     translated_srt: Optional[Path] = None    # Hindi SRT: translation skipped
+    speaker_label_policy: str = "audio"  # audio | supplied (every cue must be labelled)
     use_youtube_subs: bool = True
     asr: str = "auto"                        # auto | local | groq
     asr_model: str = "large-v3"
@@ -140,6 +141,7 @@ class DialogueConfig:
     turn_edits: Dict[str, Dict] = field(default_factory=dict)       # turn_id -> {"hi", "speaker_id", "delete"}
     voice_overrides: Dict[str, Dict] = field(default_factory=dict)  # speaker_id -> {"provider","voice","pitch"} | {"category"}
     speaker_merges: Dict[str, str] = field(default_factory=dict)    # from speaker_id -> into speaker_id
+    speaker_names: Dict[str, str] = field(default_factory=dict)
     resume: bool = False                     # reuse THIS job's own checkpoint in work_dir (never another job's)
     # Output options
     keep_original_audio: bool = False        # original audio as a second, non-default track
@@ -933,7 +935,7 @@ class DialogueOrchestrator:
                     except DiarizationUnavailable as e:
                         st.status = "degraded"
                         st.detail = str(e)[:300]
-                if diar is None and cfg.diarization:
+                if diar is None and cfg.diarization and cfg.speaker_label_policy != "supplied":
                     r.unresolved_failures.append(
                         "speaker diarization unavailable: all dialogue voiced by the default voice "
                         "(speakers not separated)")
@@ -949,13 +951,20 @@ class DialogueOrchestrator:
                 # female voice, not the unknown-speaker default).
                 if mode == "translated_srt":
                     self.turns = turns_from_translated_cues(
-                        cues, diar, default_speaker=UNKNOWN_SPEAKER if cfg.diarization else SINGLE_SPEAKER)
+                        cues, diar, default_speaker=UNKNOWN_SPEAKER if cfg.diarization else SINGLE_SPEAKER,
+                        prefer_labels=cfg.speaker_label_policy == "supplied")
                 else:
                     if mode == "asr":
                         words = asr_words
                     else:
                         words = align_text_to_words(cues, asr_words) if asr_words else words_from_cues(cues)
-                    if cfg.diarization:
+                    if cfg.speaker_label_policy == "supplied":
+                        for word in words:
+                            cue_idx = word.attribution["cue_index"]
+                            word.speaker_id = cues[cue_idx]["speaker_id"]
+                            word.attribution["method"] = "supplied_srt_label"
+                        stats = {"method": "supplied_srt_labels", "words": len(words)}
+                    elif cfg.diarization:
                         stats = assign_words(words, diar)
                     else:
                         stats = assign_single_speaker(words, SINGLE_SPEAKER)
@@ -1111,6 +1120,8 @@ class DialogueOrchestrator:
         state, why = checkpoint.load(w)
         if state is not None:
             why = checkpoint.unusable_reason(state, self._identity, w, source=cfg.source)
+        if not why and state.get("speaker_label_policy", "audio") != cfg.speaker_label_policy:
+            raise ResumeError("Speaker label policy changed. Start a new job to rebuild speaker assignments.")
         if not why:
             try:
                 self._restore(state)
@@ -1119,7 +1130,7 @@ class DialogueOrchestrator:
         if not why:
             self._restored = set(checkpoint.completed_prefix(state))
             self._ckpt_stages = {s["name"]: s for s in state.get("stages") or [] if s.get("name")}
-        n_edits = sum(len(x) for x in (cfg.turn_edits, cfg.speaker_merges, cfg.voice_overrides)
+        n_edits = sum(len(x) for x in (cfg.turn_edits, cfg.speaker_merges, cfg.voice_overrides, cfg.speaker_names)
                       if isinstance(x, dict))
         had_lines = on_disk is None or "turns" in on_disk
         if n_edits and had_lines and "turns" not in self._restored:
@@ -1237,6 +1248,7 @@ class DialogueOrchestrator:
             "completed": list(checkpoint.STAGES[:idx + 1]),
             "files": {k: checkpoint.rel(getattr(self, k, None), w)
                       for k in ("video", "audio_48k", "audio_16k", "vocals_48k", "vocals_16k")},
+            "speaker_label_policy": self.cfg.speaker_label_policy,
             "media_dur": getattr(self, "media_dur", 0.0),
             "sep": sep,
             "mode": getattr(self, "mode", None),
@@ -1276,6 +1288,9 @@ class DialogueOrchestrator:
         lock = threading.Lock()
 
         def cached(t: Turn, current_hi: str, ratio: float) -> Optional[str]:
+            if "edited" in t.flags:
+                t.add_flag("reviewed_text_preserved")
+                return None
             key = cache.key(t.turn_id, current_hi, ratio)
             with lock:
                 again = key in asked
@@ -1312,16 +1327,22 @@ class DialogueOrchestrator:
 
     def _text_source(self):
         cfg = self.cfg
+        if cfg.speaker_label_policy not in ("audio", "supplied"):
+            raise ValueError("speaker_label_policy must be audio or supplied")
+        if cfg.speaker_label_policy == "supplied" and not (cfg.source_srt or cfg.translated_srt):
+            raise ValueError("Supplied speaker labels require an English or Hindi SRT")
         from srt_utils import parse_srt
         if cfg.translated_srt:
             cues = parse_srt(Path(cfg.translated_srt), text_key="text_translated")
             if not cues:
                 raise RuntimeError("translated SRT is empty or invalid")
+            self._validate_speaker_labels(cues)
             return "translated_srt", cues
         if cfg.source_srt:
             cues = cues_from_turn_like(parse_srt(Path(cfg.source_srt), text_key="text"))
             if not cues:
                 raise RuntimeError("English SRT is empty or invalid")
+            self._validate_speaker_labels(cues)
             return "english_srt", cues
         if cfg.use_youtube_subs and _is_url(cfg.source) and self.c.fetch_subtitles:
             try:
@@ -1342,15 +1363,22 @@ class DialogueOrchestrator:
                     return "youtube_subs", cues
         return "asr", []
 
+    def _validate_speaker_labels(self, cues):
+        if self.cfg.speaker_label_policy == "supplied":
+            missing = [i + 1 for i, c in enumerate(cues) if not c.get("speaker_id")]
+            if missing:
+                raise ValueError(f"Supplied labels mode requires [SPEAKER_00] style labels "
+                                 f"on every cue; missing at cues {missing[:10]}")
+
     def _build_registry(self):
         diar = self.diar
-        speech = diar.speech_seconds() if diar else {}
+        speech = diar.speech_seconds() if diar and self.cfg.speaker_label_policy == "audio" else {}
         refs = self.cfg.work_dir / "speaker_refs"
         speaker_ranges = {}
         for spk in sorted({t.speaker_id for t in self.turns}):
             if spk == UNKNOWN_SPEAKER:
                 continue
-            ranges = diar.clean_ranges(spk) if diar else []
+            ranges = (diar.clean_ranges(spk) if diar and self.cfg.speaker_label_policy == "audio" else [])
             if not ranges:  # speaker from SRT label only: use its turn spans
                 ranges = [(t.source_start, t.source_end) for t in self.turns
                           if t.speaker_id == spk and "multi_speaker_cue" not in t.flags]
@@ -1379,13 +1407,16 @@ class DialogueOrchestrator:
             else:
                 ev = dict(ev, classifier="unavailable (F0 decision used)")
             origin = ""
-            if not diar:
+            if self.cfg.speaker_label_policy == "supplied":
+                origin = "srt_label"
+            elif not diar:
                 single = not self.cfg.diarization and spk == SINGLE_SPEAKER
                 origin = "single_voice" if single else "srt_label"
             rec = self.registry.register(
                 spk, voice_category=cat, category_confidence=conf, category_evidence=ev,
                 total_speech_s=round(speech.get(spk, sum(e - s for s, e in ranges)), 2),
-                embedding_provenance=(diar.backend if diar and spk in diar.embeddings else None),
+                embedding_provenance=(diar.backend if diar and self.cfg.speaker_label_policy == "audio"
+                                      and spk in diar.embeddings else None),
                 mapping_origin=origin)
             self._save_reference(rec, ranges, refs)
         for prov in self.c.tts_providers:
@@ -1417,7 +1448,7 @@ class DialogueOrchestrator:
         applied = 0
         self._edits_in_effect = 0
         requested = {"turn_edits": cfg.turn_edits, "voice_overrides": cfg.voice_overrides,
-                     "speaker_merges": cfg.speaker_merges}
+                     "speaker_merges": cfg.speaker_merges, "speaker_names": cfg.speaker_names}
         if any(requested.values()):
             applied += self.apply_edits(requested, via="request")
         hooked = False
@@ -1434,9 +1465,9 @@ class DialogueOrchestrator:
                     edits = self.review(packet)
                 except Cancelled:
                     raise
-                except Exception as e:  # noqa: BLE001 - the dub goes on without review edits
-                    r.limitations.append(f"the review step failed ({type(e).__name__}: {str(e)[:120]}); "
-                                         f"the lines were voiced without review edits")
+                except Exception as e:
+                    raise RuntimeError("Review failed; no speech was generated. "
+                                       "Retry review from this job's checkpoint.") from e
             self._check_cancel()
             if edits:
                 applied += self.apply_edits(edits, via="review")
@@ -1479,6 +1510,17 @@ class DialogueOrchestrator:
             recs.append(self._merge_speakers(src, dst, asked))
         for sid, ov in (overrides.items() if isinstance(overrides, dict) else []):
             recs.append(self._override_voice(str(sid), ov))
+        for sid, name in (edits.get("speaker_names") or {}).items():
+            # A name for a merged-away speaker must not overwrite the survivor.
+            sp = self.registry.speakers.get(sid)
+            rec = {"kind": "speaker_name", "speaker_id": sid}
+            if sp is None or not isinstance(name, str) or len(name.strip()) > 80:
+                rec.update(ignored="unknown speaker or invalid name", _state="ignored")
+            else:
+                name = name.strip()
+                rec.update(name=name, _state="in_effect" if sp.display_name == name else "changed")
+                sp.display_name = name
+            recs.append(rec)
         return sum(1 for rec in recs if self._log_edit(dict(rec, via=via)) == "changed")
 
     def _log_edit(self, rec: Dict[str, Any]) -> str:
@@ -1796,7 +1838,7 @@ class DialogueOrchestrator:
                 chain = ([first] if first else []) + [p for p in providers if p != first]
             prov = next((p for p in chain if rec.provider_voices.get(p)), chain[0] if chain else None)
             b = rec.provider_voices.get(prov) or {}
-            speakers.append({"speaker_id": sid, "voice_category": rec.voice_category,
+            speakers.append({"speaker_id": sid, "display_name": rec.display_name, "voice_category": rec.voice_category,
                              "category_confidence": rec.category_confidence,
                              "total_speech_s": rec.total_speech_s,
                              "turns": sum(1 for t in self.turns if t.speaker_id == sid and t.required),

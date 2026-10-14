@@ -91,6 +91,9 @@ needs `--no-deps`.
 
 ## Running
 
+For the practical character-review workflow and supplied speaker labels, see
+[Character workflow](CHARACTER_WORKFLOW.md).
+
 - **Web / desktop app:** pick the **Hindi Dialogue** mode button, then paste a link or upload a
   file. When the job finishes, the job page shows the status and an **Open report** link. Uploading
   a Hindi SRT with "SRT provided" skips translation; speakers still come from the audio.

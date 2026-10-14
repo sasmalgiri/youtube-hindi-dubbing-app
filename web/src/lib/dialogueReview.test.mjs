@@ -117,3 +117,15 @@ test('display helpers', () => {
     assert.equal(isFlagged(turn('a', 'S', 'x', { flags: ['nonlexical'] })), true);
     assert.equal(isFlagged(turn('a', 'S', 'x')), false);
 });
+
+test('character names are editable labels; merges discard obsolete names', async () => {
+    const { withName } = await import('./dialogueReview.ts');
+    let d = withName(EMPTY_DRAFT, packet.speakers[0], 'Male lead');
+    assert.deepEqual(buildEdits(packet, d), { speaker_names: { S0: 'Male lead' } });
+    assert.equal(summarizeEdits(buildEdits(packet, d)).total, 1);
+    d = withMerge(d, 'S0', 'S1');
+    assert.equal(buildEdits(packet, d).speaker_names, undefined);
+    const namedPacket = { ...packet, speakers: [ { ...packet.speakers[0], display_name: 'Lead' } ] };
+    const cleared = withName(EMPTY_DRAFT, namedPacket.speakers[0], '');
+    assert.deepEqual(buildEdits(namedPacket, cleared), { speaker_names: { S0: '' } });
+});
