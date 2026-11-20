@@ -1030,3 +1030,33 @@ export const getSessions = () => authFetch<{ current: string; sessions: SessionI
 export const revokeSession = (id: string) => authFetch<{ revoked: number }>(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 export const signOutEverywhere = () => authFetch<{ revoked: number }>('/api/auth/sessions/revoke-all', { method: 'POST' });
 export const getBalance = () => authFetch<Record<'standard' | 'premium', CreditBalance>>('/api/account/balance');
+
+// ── Creator submission (W2) ─────────────────────────────────────────────────
+
+export interface DraftInfo {
+    id: string; filename: string; size: number; sha256: string; duration: number; created_at: number;
+    probe: { duration: number; container: string; video: { codec: string; width: number; height: number }[];
+             audio: { codec: string; channels: number; language?: string }[]; rotation: number; warnings: string[] };
+}
+export interface QuoteInfo {
+    id: string; interval: [number, number]; languages: string[]; minutes: number; expires_at: number;
+    standard_seconds: number; premium_seconds: number; cash_seconds: number; cash_minor: number; tax_minor: number;
+    notes: string[]; display: { cash: string; tax: string; standard: string; premium: string; billed: string };
+}
+
+export async function uploadDraft(file: File): Promise<DraftInfo> {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${API_BASE}/api/drafts`, { method: 'POST', body: form, credentials: 'include', headers: { ...EXTRA_HEADERS } });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(typeof err.detail === 'string' ? err.detail : `Upload failed (HTTP ${res.status})`);
+    }
+    return res.json();
+}
+export const getDraft = (id: string) => authFetch<DraftInfo>(`/api/drafts/${encodeURIComponent(id)}`);
+export const getRights = () => authFetch<{ version: string; text: string }>('/api/rights');
+export const getQuote = (body: { draft_id: string; languages: string[]; minutes: number; style: string; quality: string }) =>
+    authFetch<QuoteInfo>('/api/quotes', { method: 'POST', body: JSON.stringify(body) });
+export const submitDraft = (draftId: string, body: { quote_id: string; idempotency_key: string; rights_accepted: boolean; rights_version: string }) =>
+    authFetch<{ id: string; duplicate: boolean }>(`/api/drafts/${encodeURIComponent(draftId)}/submit`, { method: 'POST', body: JSON.stringify(body) });

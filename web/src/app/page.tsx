@@ -31,8 +31,10 @@ export default function HomePage() {
     const auth = useAuth();
     const router = useRouter();
     useEffect(() => {
-        if (auth.loaded && auth.config?.required && !auth.user) router.push('/signin');
-    }, [auth.loaded, auth.config?.required, auth.user, router]);
+        if (!auth.loaded) return;
+        if (auth.config?.required && !auth.user) router.push('/signin');
+        else if (auth.config?.profile === 'hosted') router.push('/create');   // the paid creator form (W2)
+    }, [auth.loaded, auth.config?.required, auth.config?.profile, auth.user, router]);
     // The app is locked to English -> Hindi: 'auto' made Whisper guess the
     // source language instead of being told it is English.
     const [sourceLanguage, setSourceLanguage] = useState('en');

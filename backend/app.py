@@ -226,6 +226,7 @@ JobState = Literal["queued", "running", "done", "error", "waiting_for_srt", "rev
 class Job:
     id: str
     owner_id: Optional[str] = None      # W1: account that owns this job (None = unassigned legacy/local)
+    billing: Optional[Dict[str, Any]] = None   # W4: ledger reservation {account, reserve_key, seconds, split, quote_id, closed}
     state: JobState = "queued"
     current_step: str = ""
     step_progress: float = 0.0
@@ -812,6 +813,209 @@ def account_balance(request: Request):
         led.close()
     return {t: {"spendable_seconds": v.spendable, "reserved_seconds": v.reserved, "consumed_seconds": v.consumed,
                 "debt_seconds": v.debt} for t, v in b.items()}
+
+
+# ── Creator submission + funded jobs (W2, W4, W6 core) ──────────────────────
+import submission as _submission
+
+
+def _submissions() -> "_submission.SubmissionStore":
+    st = getattr(_submissions, "_store", None)
+    if st is None:
+        st = _submission.SubmissionStore(STATE_DIR / "submission.db", STATE_DIR / "drafts")   # never under OUTPUTS (served by /static/jobs)
+        _submissions._store = st
+    return st
+
+
+def _ledger():
+    from billing.ledger import Ledger
+    return Ledger(STATE_DIR / "ledger.db")
+
+
+def _account_key(owner: Optional[str]) -> str:
+    return owner or "local"
+
+
+def _require_owner(request: Request) -> Optional[str]:
+    """Hosted: a signed-in account is required. Local: optional (None = this PC)."""
+    owner = _owner_of(request)
+    if owner is None and _features.profile() == "hosted":
+        raise HTTPException(status_code=401, detail="Sign in first")
+    return owner
+
+
+def _submit_error(e: "_submission.SubmitError"):
+    raise HTTPException(status_code=e.status, detail=str(e))
+
+
+def _reconcile_billing(jobs) -> None:
+    """After a restart: a funded job that is no longer running settles (if its
+    result exists) or releases its reservation. Idempotent."""
+    for job in list(jobs.values()):
+        b = getattr(job, "billing", None)
+        if b and not b.get("closed") and getattr(job, "state", "") != "running":
+            try:
+                out = _submission.close_billing(job, _ledger, _store.save)
+                print(f"[BILLING] reconciled {job.id}: {out}", flush=True)
+            except Exception as e:
+                print(f"[BILLING] reconcile failed for {job.id}: {e}", flush=True)
+
+
+@app.post("/api/drafts")
+async def create_draft(request: Request, file: UploadFile = File(...)):
+    """Upload the original media: streamed with a size limit, checksummed and
+    probed before any quote (P01, Q01). Nothing is charged here."""
+    owner = _require_owner(request)
+    try:
+        return await _submissions().save_upload(file, owner)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
+@app.get("/api/drafts/{draft_id}")
+def get_draft(draft_id: str, request: Request):
+    try:
+        d = _submissions().draft(draft_id, _require_owner(request))
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    d.pop("path", None)
+    return d
+
+
+@app.get("/api/rights")
+def get_rights():
+    return {"version": _submission.RIGHTS_VERSION, "text": _submission.RIGHTS_TEXT}
+
+
+class QuoteRequest(BaseModel):
+    draft_id: str
+    languages: List[str] = ["hi"]
+    minutes: int = 0                     # 0 = full video, N = first N minutes
+    style: str = "dialogue"
+    quality: str = "standard"
+
+
+@app.post("/api/quotes")
+def create_quote(body: QuoteRequest, request: Request):
+    owner = _require_owner(request)
+    if body.minutes < 0 or body.minutes > 24 * 60:
+        raise HTTPException(status_code=422, detail="minutes must be 0 (full video) or a positive number")
+    led = _ledger()
+    try:
+        available = led.spendable(_account_key(owner))
+    finally:
+        led.close()
+    try:
+        q = _submissions().make_quote(draft_id=body.draft_id, owner_id=owner, languages=body.languages,
+                                      minutes=body.minutes, style=body.style, quality=body.quality,
+                                      batch=False, available=available)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    return q
+
+
+class SubmitRequest(BaseModel):
+    quote_id: str
+    idempotency_key: str
+    rights_accepted: bool = False
+    rights_version: str = ""
+
+
+@app.post("/api/drafts/{draft_id}/submit")
+def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
+    """Start a funded job. Same key twice = the same job (duplicate click);
+    a quote is single-use (two tabs); the reservation and the job are
+    created in one request and released again if anything fails."""
+    from billing import catalog
+    from billing.ledger import InsufficientBalance
+    owner = _require_owner(request)
+    st = _submissions()
+    try:
+        existing = st.claim(owner, body.idempotency_key, body.quote_id)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    if existing:
+        return {"id": existing, "duplicate": True}
+    acct = _account_key(owner)
+    reserved = False
+    job_id = uuid.uuid4().hex[:12]
+    try:
+        q = st.quote(body.quote_id, owner)
+        if q["draft_id"] != draft_id:
+            raise _submission.SubmitError("This quote is for another upload", 409)
+        if q.get("used_job_id"):
+            raise _submission.SubmitError("This quote was already used; get a new quote", 409)
+        if int(time.time()) >= q["expires_at"]:
+            raise _submission.SubmitError("The quote expired; get a new quote", 409)
+        if q["price_version"] != catalog.PRICE_VERSION:
+            raise _submission.SubmitError("Prices changed; get a new quote", 409)
+        st.record_rights(owner, draft_id, body.rights_accepted, body.rights_version)
+        if q["cash_minor"] > 0:
+            raise _submission.SubmitError(
+                f"Your balance does not cover this job ({catalog.fmt_money(q['cash_minor'])} due). "
+                f"Buy prepaid time first; checkout opens with the Razorpay step.", 402)
+        d = st.draft(draft_id, owner)
+        hosted = _features.profile() == "hosted"
+        req = JobCreateRequest(
+            url=d["path"], source_language="en", target_language=q["languages"][0], dub_duration=int(q.get("minutes") or 0),
+            use_edge_tts=_features.is_on("tts.edge"),
+            use_google_tts=(not _features.is_on("tts.edge")) and _features.is_on("tts.google"),
+            multi_speaker=False, visual_transforms=False if hosted else True)
+        msg = _features.job_refusal(req, "upload")
+        if msg:
+            raise _submission.SubmitError(msg, 400)
+        seconds = int(q["standard_seconds"]) + int(q["premium_seconds"])
+        led = _ledger()
+        try:
+            split = led.reserve(acct, job_id, seconds)
+        except InsufficientBalance:
+            raise _submission.SubmitError("Your balance changed since the quote; get a new quote", 409)
+        finally:
+            led.close()
+        reserved = True
+        if not st.use_quote(body.quote_id, job_id):
+            raise _submission.SubmitError("This quote was already used; get a new quote", 409)
+        job_dir = OUTPUTS / job_id / "work"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        src = job_dir / ("source" + Path(d["path"]).suffix)
+        shutil.copy2(d["path"], src)              # the draft stays immutable
+        req.url = str(src)
+        job = Job(id=job_id, source_url=f"upload:{d['filename']}", target_language=req.target_language)
+        job.original_req = req
+        job.owner_id = owner
+        job.billing = {"account": acct, "reserve_key": job_id, "seconds": seconds, "split": split,
+                       "quote_id": body.quote_id, "price_version": q["price_version"]}
+        JOBS[job_id] = job
+        _store.save(job)
+        st.complete_claim(owner, body.idempotency_key, job_id)
+    except _submission.SubmitError as e:
+        st.drop_claim(owner, body.idempotency_key)
+        if reserved:
+            led = _ledger()
+            try:
+                led.release(acct, job_id, note="submission failed before start")
+            finally:
+                led.close()
+        _submit_error(e)
+    except BaseException:
+        st.drop_claim(owner, body.idempotency_key)
+        if reserved:
+            led = _ledger()
+            try:
+                led.release(acct, job_id, note="submission failed before start")
+            finally:
+                led.close()
+        raise
+    t = threading.Thread(target=_submission.run_billed,
+                         args=(job, _ledger, lambda: _job_runner()(job, req), _store.save), daemon=True)
+    job.worker_thread = t
+    t.start()
+    return {"id": job_id, "duplicate": False, "reserved": split}
+
+
+def _job_runner():
+    """The pipeline entry point for submitted jobs (tests replace it)."""
+    return _run_job
 
 
 def _refuse_switched_off(req, input_mode, cleanup: Optional[Path] = None) -> None:
@@ -5849,6 +6053,7 @@ def _load_jobs() -> None:
     module and reads the store before any request is served)."""
     _store.load_all(JOBS)
     _settle_loaded_jobs(JOBS, _store)
+    _reconcile_billing(JOBS)
 
 
 _load_jobs()

@@ -103,3 +103,11 @@ backend/.venvs/
 
 # Downloaded AI model weights (audio-separator BS-Roformer is ~640 MB; never commit)
 backend/models/
+
+# Commercial-release state (accounts, sessions, ledger, drafts, switches): never commit
+backend/accounts.db*
+backend/accounts.pepper
+backend/ledger.db*
+backend/submission.db*
+backend/drafts/
+backend/features.json
