@@ -54,6 +54,7 @@ class Module:
 # Order = display order. Groups:
 GROUPS = (
     ("input", "Input modes"),
+    ("billing", "Payments"),
     ("pipeline", "Pipelines"),
     ("asr", "Speech-to-text"),
     ("mt", "Translation"),
@@ -72,6 +73,9 @@ _M: List[Module] = [
     Module("input.upload", "input", "Upload a file", "Start a job from an uploaded video.", hosted=True, input="upload"),
     Module("input.batch", "input", "Batch", "Queue many links/files.", hosted=False, input="batch",
            why="S04: batches must be server records first"),
+    Module("billing.checkout", "billing", "Buy prepaid time", "Razorpay checkout, receipts and payment webhooks.",
+           hosted=True, routes=(("POST", "/api/checkout"), ("POST", "/api/checkout/verify"),
+                                ("POST", "/api/webhooks/razorpay"))),
     Module("input.premium_batch", "input", "Premium batch", "Several uploads in one server-side batch, funded by Premium time.",
            hosted=True, routes=(("GET", "/api/batches"), ("POST", "/api/batches"), ("GET", "/api/batches/{id}"),
                                 ("POST", "/api/batches/{id}/submit"), ("POST", "/api/batches/{id}/retry-failed"))),

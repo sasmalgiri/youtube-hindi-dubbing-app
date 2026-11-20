@@ -236,7 +236,7 @@ class GoogleProvider(BaseProvider):
         if not self.key:
             raise TTSProviderError("GOOGLE_TTS_API_KEY not set")
         pitch = 0.0
-        if binding.get("pitch"):
+        if binding.get("pitch") and "-Chirp" not in binding["voice"]:   # Chirp 3 HD rejects pitch
             try:  # "+8Hz" -> ~ semitones (rough, only to separate shared voices)
                 pitch = max(-20.0, min(20.0, float(binding["pitch"].rstrip("Hz")) / 6.0))
             except ValueError:
@@ -246,7 +246,7 @@ class GoogleProvider(BaseProvider):
             json={"input": {"text": text},
                   "voice": {"languageCode": "hi-IN", "name": binding["voice"]},
                   "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000,
-                                  "pitch": pitch}}, timeout=60)
+                                  **({} if "-Chirp" in binding["voice"] else {"pitch": pitch})}}, timeout=60)
         if r.status_code != 200:
             raise TTSProviderError(f"google HTTP {r.status_code}: {r.text[:160]}")
         p = out.with_suffix(".wav")

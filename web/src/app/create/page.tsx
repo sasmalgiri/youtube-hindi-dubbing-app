@@ -155,7 +155,7 @@ export default function CreatePage() {
                     </dl>
                     {cashDue && (
                         <p className="text-sm text-amber-300">
-                            Your balance does not cover this job. Buying prepaid time opens with the payment step (coming next); nothing is charged here.
+                            Your balance does not cover this job. <Link href="/account#buy" className="underline">Buy prepaid time</Link>, then get a new price.
                         </p>
                     )}
                     {rights && (

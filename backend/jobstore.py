@@ -43,6 +43,8 @@ _SKIP_FIELDS = {"events", "cancel_event"}
 # Fields that are Path objects and need str conversion
 _PATH_FIELDS = {"result_path"}
 
+EVENTS_KEPT = 200
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -62,6 +64,13 @@ def _job_to_dict(job: "Job") -> dict:
                 d[k] = None
         else:
             d[k] = v
+    # P07: the latest progress events survive a restart, so a reconnecting
+    # page replays the steps instead of starting blank.
+    try:
+        tail = list(getattr(job, "events", None) or [])[-EVENTS_KEPT:]
+        d["events_tail"] = [e for e in tail if isinstance(e, dict)]
+    except Exception:
+        d["events_tail"] = []
     return d
 
 
@@ -92,6 +101,8 @@ def _dict_to_job(data: dict) -> "Job":
                 print(f"[JobStore] job {data.get('id')}: request dropped ({e2})", flush=True)
                 data["original_req"] = None
 
+    events_tail = data.pop("events_tail", None) or []
+
     # Strip keys unknown to the dataclass
     import dataclasses
     known = {f.name for f in dataclasses.fields(Job)}
@@ -99,6 +110,11 @@ def _dict_to_job(data: dict) -> "Job":
 
     # cancel_event and events are transient — create fresh instances
     job = Job(**data)
+    if events_tail:
+        try:
+            job.events = list(events_tail)
+        except Exception:
+            pass
     return job
 
 

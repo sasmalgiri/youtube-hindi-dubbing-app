@@ -10093,8 +10093,9 @@ class Pipeline:
 
         if self.cfg.use_google_tts:
             google_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-            if google_creds or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip():
-                self._report("synthesize", 0.05, "Using Google Cloud TTS (WaveNet/Neural2)...")
+            if google_creds or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip() \
+                    or os.environ.get("GOOGLE_TTS_API_KEY", "").strip():
+                self._report("synthesize", 0.05, "Using Google Cloud TTS (Chirp 3 HD / Neural2)...")
                 try:
                     return self._salvage_with_sarvam(segments, self._tts_google_cloud(segments))
                 except Exception as e:
@@ -11307,6 +11308,9 @@ class Pipeline:
         multiple service-account JSONs so multiple billing accounts can be used
         together — see backend/dubbing/google_tts_pool.py for env config.
         """
+        from dubbing import chirp_tts
+        if chirp_tts.api_key():
+            return self._tts_google_rest(segments)
         from google.cloud import texttospeech
         from dubbing.google_tts_pool import load_pool_from_env
 
@@ -11413,6 +11417,57 @@ class Pipeline:
                 f"Synthesized {i + 1}/{len(segments)} segments (Google Cloud TTS)...",
             )
 
+        return tts_data
+
+    def _tts_google_rest(self, segments):
+        """Google TTS with an API key (Chirp 3 HD by default, OQ5). A segment
+        that fails falls back to Sarvam; Edge only outside the hosted profile."""
+        from dubbing import chirp_tts
+        voice = chirp_tts.voice_for(self.cfg.target_language)
+        hosted = os.environ.get("VOICEDUB_PROFILE", "").strip().lower() == "hosted"
+        tts_data = []
+        fallbacks = 0
+        for i, seg in enumerate(segments):
+            self._check_cancelled()
+            text = seg.get("text_translated", seg.get("text", "")).strip()
+            if not text:
+                continue
+            wav_path = self.cfg.work_dir / f"tts_{i:04d}.wav"
+            raw = self.cfg.work_dir / f"tts_{i:04d}_raw.wav"
+            ok = False
+            try:
+                raw.write_bytes(chirp_tts.synthesize(text, voice, self.SAMPLE_RATE))
+                ok = True
+            except Exception as e:
+                fallbacks += 1
+                mp3 = self.cfg.work_dir / f"tts_{i:04d}.mp3"
+                self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
+                             f"Google TTS failed on seg {i+1} ({str(e)[:80]}) — trying Sarvam")
+                try:
+                    ok = bool(self._sarvam_tts_single_mp3(text, mp3)) and mp3.exists()
+                except Exception:
+                    ok = False
+                if not ok and not hosted:
+                    try:
+                        asyncio.run(self._edge_tts_single(text, mp3))
+                        ok = mp3.exists()
+                    except Exception:
+                        ok = False
+                if ok:
+                    raw = mp3
+            if not ok:
+                continue
+            self._run_proc([self._ffmpeg, "-y", "-i", str(raw), "-ar", str(self.SAMPLE_RATE),
+                            "-ac", str(self.N_CHANNELS), str(wav_path)], check=True, capture_output=True)
+            raw.unlink(missing_ok=True)
+            if not wav_path.exists() or wav_path.stat().st_size == 0:
+                continue
+            tts_data.append({"start": seg["start"], "end": seg["end"], "wav": wav_path,
+                             "duration": self._get_duration(wav_path)})
+            self._report("synthesize", 0.1 + 0.8 * ((i + 1) / len(segments)),
+                         f"Synthesized {i + 1}/{len(segments)} segments (Google {voice.split('-')[-1]})...")
+        if fallbacks:
+            self._report("synthesize", 0.9, f"Google TTS: {fallbacks} segment(s) used the fallback voice")
         return tts_data
 
     # ── Fish Speech 1.5 ────────────────────────────────────────────────

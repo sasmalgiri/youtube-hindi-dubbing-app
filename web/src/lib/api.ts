@@ -1080,3 +1080,21 @@ export const submitBatch = (id: string, body: BatchStart) =>
     authFetch<{ id: string; duplicate: boolean }>(`/api/batches/${encodeURIComponent(id)}/submit`, { method: 'POST', body: JSON.stringify(body) });
 export const retryBatchFailures = (id: string, body: BatchStart) =>
     authFetch<{ id: string; retried: number }>(`/api/batches/${encodeURIComponent(id)}/retry-failed`, { method: 'POST', body: JSON.stringify(body) });
+
+// ── Prepaid-time checkout (W5) ──
+export interface PackInfo { id: string; credit_type: 'standard' | 'premium'; seconds: number; price_minor: number; display: { price: string; time: string; tax: string } }
+export interface CatalogInfo { price_version: string; currency: string; checkout: { configured: boolean; test_mode: boolean }; packs: PackInfo[] }
+export interface CheckoutOrder {
+    order_id: string; razorpay_order_id: string; key_id: string; amount_minor: number; currency: string; pack_id: string;
+    display: { amount: string; tax: string; time: string }; test_mode: boolean; prefill: { email: string; name: string };
+}
+export interface OrderInfo {
+    id: string; pack_id: string; credit_type: string; seconds: number; amount_minor: number; status: string;
+    receipt_no: string | null; paid_at: number | null; display: { amount: string; tax: string; net: string; time: string };
+}
+export const getCatalog = () => authFetch<CatalogInfo>('/api/catalog');
+export const startCheckout = (pack_id: string) => authFetch<CheckoutOrder>('/api/checkout', { method: 'POST', body: JSON.stringify({ pack_id }) });
+export const verifyCheckout = (body: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) =>
+    authFetch<OrderInfo>('/api/checkout/verify', { method: 'POST', body: JSON.stringify(body) });
+export const getOrders = () => authFetch<OrderInfo[]>('/api/account/orders');
+export const receiptUrl = (orderId: string) => `${API_BASE}/api/account/receipts/${encodeURIComponent(orderId)}`;

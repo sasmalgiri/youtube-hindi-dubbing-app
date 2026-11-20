@@ -109,5 +109,8 @@ backend/accounts.db*
 backend/accounts.pepper
 backend/ledger.db*
 backend/submission.db*
+backend/payments.db*
+backend/queue.db*
+backend/manifests/
 backend/drafts/
 backend/features.json

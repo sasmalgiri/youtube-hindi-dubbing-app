@@ -799,6 +799,101 @@ def auth_revoke_one(session_id: str, request: Request):
     return {"revoked": 1}
 
 
+# ── Prepaid-time checkout (W5: M03, M05, M07) ───────────────────────────────
+from billing import payments as _payments
+
+
+def _payments_store() -> "_payments.PaymentStore":
+    st = getattr(_payments_store, "_store", None)
+    if st is None:
+        st = _payments.PaymentStore(STATE_DIR / "payments.db", _ledger)
+        _payments_store._store = st
+    return st
+
+
+def _pay_error(e: "_payments.PaymentError"):
+    raise HTTPException(status_code=e.status, detail=str(e))
+
+
+def _signed_in(request: Request):
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    return sess
+
+
+@app.get("/api/catalog")
+def get_catalog():
+    from billing import catalog
+    return {"price_version": catalog.PRICE_VERSION, "currency": catalog.CURRENCY,
+            "checkout": {"configured": _payments.configured(), "test_mode": _payments.test_mode()},
+            "packs": [{"id": p.id, "credit_type": p.credit_type, "seconds": p.seconds, "price_minor": p.price_minor,
+                       "display": {"price": catalog.fmt_money(p.price_minor), "time": catalog.fmt_seconds(p.seconds),
+                                   "tax": catalog.fmt_money(catalog.tax_inclusive_share(p.price_minor))}}
+                      for p in catalog.PACKS.values()]}
+
+
+class CheckoutRequest(BaseModel):
+    pack_id: str
+
+
+@app.post("/api/checkout")
+def start_checkout(body: CheckoutRequest, request: Request):
+    sess = _signed_in(request)
+    try:
+        out = _payments_store().create(sess.user.id, body.pack_id)
+    except _payments.PaymentError as e:
+        _pay_error(e)
+    out["prefill"] = {"email": sess.user.email, "name": sess.user.name or ""}
+    return out
+
+
+class VerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@app.post("/api/checkout/verify")
+def verify_checkout(body: VerifyRequest, request: Request):
+    sess = _signed_in(request)
+    try:
+        return _payments_store().verify(sess.user.id, body.razorpay_order_id, body.razorpay_payment_id,
+                                        body.razorpay_signature)
+    except _payments.PaymentError as e:
+        _pay_error(e)
+
+
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(request: Request):
+    raw = await request.body()
+    try:
+        outcome = _payments_store().webhook(raw, request.headers.get("x-razorpay-signature", ""),
+                                            request.headers.get("x-razorpay-event-id", ""))
+    except _payments.PaymentError as e:
+        _pay_error(e)
+    print(f"[PAYMENTS] webhook: {outcome}", flush=True)
+    return {"ok": True, "outcome": outcome}
+
+
+@app.get("/api/account/orders")
+def account_orders(request: Request):
+    return _payments_store().orders(_signed_in(request).user.id)
+
+
+@app.get("/api/account/receipts/{order_id}")
+def account_receipt(order_id: str, request: Request):
+    from fastapi.responses import HTMLResponse
+    sess = _signed_in(request)
+    try:
+        o = _payments_store().order(order_id, sess.user.id)
+    except _payments.PaymentError as e:
+        _pay_error(e)
+    if not o["receipt_no"]:
+        raise HTTPException(status_code=404, detail="No receipt for this order")
+    return HTMLResponse(_payments.receipt_html(o, sess.user.email))
+
+
 @app.get("/api/account/balance")
 def account_balance(request: Request):
     """Prepaid time per credit type (W4). Seconds are integers; money is not mixed in."""
@@ -5214,6 +5309,52 @@ def _job_srt(job: Job) -> Optional[Path]:
         return next((p for p in candidates if p.is_file()), None)
     except OSError:
         return None
+
+
+# ── Expiring download links (W7: P08, R01) ─────────────────────────────────
+LINK_TTL_SECONDS = int(os.environ.get("VOICEDUB_LINK_TTL", "900") or 900)
+
+
+def _link_key() -> bytes:
+    import hashlib as _h, hmac as _hm
+    return _hm.new(_accounts._pepper.encode(), b"download-links-v1", _h.sha256).digest()
+
+
+def _sign_link(job_id: str, kind: str, exp: int) -> str:
+    import hashlib as _h, hmac as _hm
+    sig = _hm.new(_link_key(), f"{job_id}|{kind}|{exp}".encode(), _h.sha256).hexdigest()[:32]
+    return f"{job_id}.{kind}.{exp}.{sig}"
+
+
+@app.get("/api/jobs/{job_id}/links")
+def job_download_links(job_id: str):
+    """Short-lived links that work without the sign-in cookie (phones, download
+    managers). The caller already passed the ownership gate for this job."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.state != "done" or not job.result_path:
+        raise HTTPException(status_code=409, detail="Job not complete")
+    exp = int(time.time()) + LINK_TTL_SECONDS
+    out = {"expires_at": exp, "video": f"/api/dl/{_sign_link(job_id, 'video', exp)}", "srt": None}
+    if _job_srt(job) is not None:
+        out["srt"] = f"/api/dl/{_sign_link(job_id, 'srt', exp)}"
+    return out
+
+
+@app.get("/api/dl/{token}")
+def download_by_link(token: str):
+    import hmac as _hm
+    try:
+        job_id, kind, exp_s, sig = token.split(".")
+        exp = int(exp_s)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Link not found")
+    if kind not in ("video", "srt") or not _hm.compare_digest(_sign_link(job_id, kind, exp), token):
+        raise HTTPException(status_code=404, detail="Link not found")
+    if time.time() > exp:
+        raise HTTPException(status_code=410, detail="This link expired; open the job again for a new one")
+    return get_result(job_id) if kind == "video" else get_srt(job_id)
 
 
 @app.get("/api/jobs/{job_id}/srt")

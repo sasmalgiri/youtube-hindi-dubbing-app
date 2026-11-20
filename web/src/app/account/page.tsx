@@ -3,8 +3,23 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getBalance, getSessions, revokeSession, signOut, signOutEverywhere, type CreditBalance, type SessionInfo } from '@/lib/api';
+import { getBalance, getCatalog, getOrders, getSessions, receiptUrl, revokeSession, signOut, signOutEverywhere, startCheckout, verifyCheckout, type CatalogInfo, type CreditBalance, type OrderInfo, type SessionInfo } from '@/lib/api';
 import { refreshAuth, useAuth } from '@/hooks/useAuth';
+
+type RzpResponse = { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string };
+type RzpInstance = { open: () => void; on: (e: string, f: (r: { error?: { description?: string } }) => void) => void };
+declare global { interface Window { Razorpay?: new (o: Record<string, unknown>) => RzpInstance } }
+
+function loadRazorpay(): Promise<void> {
+    if (typeof window !== 'undefined' && window.Razorpay) return Promise.resolve();
+    return new Promise((ok, bad) => {
+        const s = document.createElement('script');
+        s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+        s.onload = () => ok();
+        s.onerror = () => bad(new Error('Could not load the payment window'));
+        document.body.appendChild(s);
+    });
+}
 
 function fmtTime(seconds: number) {
     const h = Math.floor(seconds / 3600);
@@ -19,11 +34,15 @@ export default function AccountPage() {
     const [balance, setBalance] = useState<Record<'standard' | 'premium', CreditBalance> | null>(null);
     const [sessions, setSessions] = useState<{ current: string; sessions: SessionInfo[] } | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [catalog, setCatalog] = useState<CatalogInfo | null>(null);
+    const [orders, setOrders] = useState<OrderInfo[]>([]);
+    const [buying, setBuying] = useState<string | null>(null);
+    const [notice, setNotice] = useState<string | null>(null);
 
     const load = useCallback(async () => {
         try {
-            const [b, s] = await Promise.all([getBalance(), getSessions()]);
-            setBalance(b); setSessions(s);
+            const [b, s, c, o] = await Promise.all([getBalance(), getSessions(), getCatalog(), getOrders()]);
+            setBalance(b); setSessions(s); setCatalog(c); setOrders(o);
         } catch (e) {
             setError(e instanceof Error ? e.message : 'Could not load the account');
         }
@@ -39,6 +58,33 @@ export default function AccountPage() {
             </main>
         );
     }
+
+    const buy = async (packId: string) => {
+        setError(null); setNotice(null); setBuying(packId);
+        try {
+            const o = await startCheckout(packId);
+            await loadRazorpay();
+            const rz = new window.Razorpay!({
+                key: o.key_id, order_id: o.razorpay_order_id, amount: o.amount_minor, currency: o.currency,
+                name: 'VoiceDub', description: `${o.display.time} prepaid time`, prefill: o.prefill,
+                handler: async (r: RzpResponse) => {
+                    try {
+                        const done = await verifyCheckout(r);
+                        setNotice(`Payment received. ${done.display.time} added. Receipt ${done.receipt_no}.`);
+                        await load();
+                    } catch (e) {
+                        setError(`Payment taken but not yet confirmed (${e instanceof Error ? e.message : 'error'}). It is added automatically when the payment provider confirms it.`);
+                    } finally { setBuying(null); }
+                },
+                modal: { ondismiss: () => setBuying(null) },
+            });
+            rz.on('payment.failed', (r) => { setError(`Payment failed: ${r.error?.description || 'declined'}. Nothing was charged.`); setBuying(null); });
+            rz.open();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Could not start checkout');
+            setBuying(null);
+        }
+    };
 
     const out = async (everywhere: boolean) => {
         if (everywhere && !confirm('Sign out on every device, including this one?')) return;
@@ -75,6 +121,39 @@ export default function AccountPage() {
                     ))}
                 </div>
             </section>
+
+            <section className="glass-card p-4" id="buy" data-testid="buy">
+                <h2 className="text-sm font-semibold text-text-primary mb-3">Buy prepaid time</h2>
+                {catalog && !catalog.checkout.configured && <p className="text-xs text-amber-300 mb-2">Checkout is not switched on yet.</p>}
+                {catalog?.checkout.test_mode && <p className="text-xs text-amber-300 mb-2">Test mode: use Razorpay test cards; no real money moves.</p>}
+                <div className="grid sm:grid-cols-3 gap-3">
+                    {(catalog?.packs || []).map((p) => (
+                        <div key={p.id} className="rounded-lg border border-white/10 p-3 space-y-1">
+                            <p className="text-xs text-text-muted capitalize">{p.credit_type}</p>
+                            <p className="text-lg font-semibold text-text-primary">{p.display.time}</p>
+                            <p className="text-sm text-text-primary">{p.display.price} <span className="text-[11px] text-text-muted">incl. GST {p.display.tax}</span></p>
+                            <button type="button" className="btn-primary w-full py-1.5 text-sm" disabled={!catalog?.checkout.configured || !!buying}
+                                onClick={() => buy(p.id)}>{buying === p.id ? 'Opening…' : 'Buy'}</button>
+                        </div>
+                    ))}
+                </div>
+                {notice && <p role="status" className="text-sm text-emerald-300 mt-3">{notice}</p>}
+            </section>
+
+            {orders.length > 0 && (
+                <section className="glass-card p-4" data-testid="receipts">
+                    <h2 className="text-sm font-semibold text-text-primary mb-3">Payments and receipts</h2>
+                    <ul className="divide-y divide-white/5 text-sm">
+                        {orders.map((o) => (
+                            <li key={o.id} className="py-2 flex items-center gap-3">
+                                <span className="flex-1 text-text-primary">{o.display.time} {o.credit_type} · {o.display.amount}
+                                    <span className="text-[11px] text-text-muted"> · {o.paid_at ? new Date(o.paid_at * 1000).toLocaleDateString() : ''} · {o.status}</span></span>
+                                {o.receipt_no && <a className="text-xs underline text-text-muted" href={receiptUrl(o.id)} target="_blank" rel="noreferrer">Receipt {o.receipt_no}</a>}
+                            </li>
+                        ))}
+                    </ul>
+                </section>
+            )}
 
             <section className="glass-card p-4">
                 <h2 className="text-sm font-semibold text-text-primary mb-3">Signed-in devices</h2>
