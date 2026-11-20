@@ -19,12 +19,12 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 | ID | W | Owner | Deps | Files / routes | Acceptance case | Evidence | Status | Blocker |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A01 | W? | Eng | – | all | Inventory of routes, pages, entries, workers, providers with purpose/boundary/hosted class | [INVENTORY.md](INVENTORY.md) | implementing | owner + test columns partly "–" |
-| A02 | W? | Eng | A01 | manifests, `web/`, `.github/workflows` | Clean install, `next build`, backend start, full `pytest --collect-only`; record versions/counts/skips; CI added | – | planned | – |
+| A02 | W? | Eng | A01 | manifests, `web/`, `.github/workflows` | Clean install, `next build`, backend start, full `pytest --collect-only`; record versions/counts/skips; CI added | `next build` OK, full pytest 396 passed (20m51s) 2026-11-20, local Windows; CI in `.github/workflows/ci.yml` (not yet run on GitHub) | implementing | – |
 | A03 | W? | Eng | A02 | `backend/tests_dialogue/fixtures/` | Small licensed offline fixture set (synthetic speech + generated video) | – | planned | – |
 | A04 | W? | Eng | – | this file | One tracker row per acceptance item | this file | implementing | W1–W9 (OQ1) |
 | A05 | W? | Eng | S01, M02 | all hosted paths | Vertical slice on staging: sign in → upload owned video → quote → buy test credits → one voice → verified MP4/SRT → private history → receipt | – | planned | OQ2 (auth), OQ3 (Razorpay test keys), OQ4 (staging host) |
-| A06 | W? | Eng | X01 | `backend/features.py`, launch config | Separate desktop/local and hosted profiles; explicit hosted route allowlist; both exercised; legacy local history kept, unknown-owner artifacts private + unassigned | – | planned | – |
-| X01 | – | Eng | – | `backend/features.py`, `/api/features`, Settings UI | **Module on/off matrix** (owner request): every existing mode/engine/option is a switchable module; off = hidden in UI **and** rejected by API; nothing deleted; per-profile defaults | – | implementing | – |
+| A06 | W? | Eng | X01 | `backend/features.py`, launch config | Separate desktop/local and hosted profiles; explicit hosted route allowlist; both exercised; legacy local history kept, unknown-owner artifacts private + unassigned | profiles + route gate + CORS in `features.py`/`app.py`; hosted profile not yet run on a host | implementing | – |
+| X01 | – | Eng | – | `backend/features.py`, `/api/features`, Settings UI | **Module on/off matrix** (owner request): every existing mode/engine/option is a switchable module; off = hidden in UI **and** rejected by API; nothing deleted; per-profile defaults | `test_features.py` 18 tests + browser run 16/16 (Edge, Playwright) 2026-11-20, local Windows | verified | – |
 
 ## S · Confirmed starting points (§1 table)
 
@@ -69,10 +69,10 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 
 | ID | W | Owner | Deps | Files / routes | Acceptance case | Evidence | Status | Blocker |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| M01 | W? | Eng | – | catalog | ₹400 = 14,400 Std s; ₹500 = 14,400 Premium s; ₹100 = 3,600 Std s; no renewal; no expiry; Std used first on singles, Premium only on batches; integer seconds, minor-unit money | – | planned | – |
-| M02 | W? | Eng | M01, S01 | quote API | 15 min Std 1 lang = ₹25; 30 min × 2 langs = 3,600 s; ₹400 − 2.5 h → 5,400 s a year later; +₹100 → 9,000 s; quote binds account/source/interval/langs/style/quality/price version/tax/currency/expiry/max cash; any change → new quote | – | planned | – |
+| M01 | W? | Eng | – | catalog | ₹400 = 14,400 Std s; ₹500 = 14,400 Premium s; ₹100 = 3,600 Std s; no renewal; no expiry; Std used first on singles, Premium only on batches; integer seconds, minor-unit money | `billing/catalog.py`, `test_billing.py` 2026-11-20, local Windows | implementing | – |
+| M02 | W? | Eng | M01, S01 | quote API | 15 min Std 1 lang = ₹25; 30 min × 2 langs = 3,600 s; ₹400 − 2.5 h → 5,400 s a year later; +₹100 → 9,000 s; quote binds account/source/interval/langs/style/quality/price version/tax/currency/expiry/max cash; any change → new quote | `billing/quote.py`: ₹25/15 min, 3,600 s, 5,400→9,000 tests pass 2026-11-20, local Windows; no API until S01 | implementing | – |
 | M03 | W? | Eng + Pay | M01 | Razorpay orders/webhooks | Server-side orders; verify signature, payment state, capture, amount, currency, env, order, account; raw-body webhook check; failed/abandoned/delayed/duplicate/out-of-order events; duplicate payment ID under new event ID | – | planned | OQ3 |
-| M04 | W? | Eng | M01 | ledger | Immutable grant/reserve/settle/release/refund/adjust with unique business keys; single-transaction reserve; two tabs/two workers/final-minute race; property tests for conservation | – | planned | – |
+| M04 | W? | Eng | M01 | ledger | Immutable grant/reserve/settle/release/refund/adjust with unique business keys; single-transaction reserve; two tabs/two workers/final-minute race; property tests for conservation | `billing/ledger.py`: immutable triggers, final-minute race (8 threads), 25 random sequences 2026-11-20, local Windows; not wired to jobs | implementing | – |
 | M05 | W? | Eng + Pay | M04 | refunds | Failed/cancelled pre-delivery releases seconds; captured cash refunded to original method with status; settle once; chargeback mid-batch gives no spendable duplicate | – | planned | OQ3 |
 | M06 | W? | Eng | M04, S04 | batch | Itemized child quotes; batch survives logout; per-child idempotency/output/funding/retry/cancel; mixed success restores only failed portions; unfunded or Standard-only batch rejected server-side | – | planned | – |
 | M07 | W? | Eng + Acct | M03 | reconciliation job | Daily match orders, captures, fees, settlements, refunds, balances, delivered jobs; alerts on orphan/duplicate/negative/stale/mismatch; idempotent repair with audit | – | planned | – |
@@ -90,14 +90,14 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 | L05 | W? | Eng + Counsel | Q05 | AI disclosure | Machine-readable marking survives final mux; user-visible disclosure; EU AI Act Art. 50 assessment | – | planned | Counsel |
 | L06 | W? | Founder + Counsel | – | terms, providers | Terms/refund/credit/retention/closure per market; **commercial rights for every provider** (Edge TTS consumer endpoint has none documented) | – | blocked | Counsel, provider contracts |
 | L07 | W? | Eng | A02 | SBOM / licences | Inventory APIs, voices, weights, datasets, libs, FFmpeg build, fonts, music; SBOM + notices from the release; unapproved provider not selectable by request | – | planned | – |
-| L08 | W? | Eng | X01 | UI + docs copy | Remove "break Content ID" / evasion claims; keep ordinary visual-editing controls | – | planned | – |
+| L08 | W? | Eng | X01 | UI + docs copy | Remove "break Content ID" / evasion claims; keep ordinary visual-editing controls | browser run: no Content-ID/fingerprint wording on home 2026-11-20, local Windows | verified | – |
 
 ## T · Review, security, test matrix (§6)
 
 | ID | W | Owner | Deps | Files / routes | Acceptance case | Evidence | Status | Blocker |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | T01 | W? | Eng | A02 | all | Static/build: lint, types, migrations, dependency/secret/licence scans, SBOM, artifact scan | – | planned | – |
-| T02 | W? | Eng | M04 | money, SRT, permissions | Unit + property tests: quote units, rounding, interval clipping, ledger conservation, consent scope, SRT timing, cue coverage, speaker continuity | – | planned | – |
+| T02 | W? | Eng | M04 | money, SRT, permissions | Unit + property tests: quote units, rounding, interval clipping, ledger conservation, consent scope, SRT timing, cue coverage, speaker continuity | money/ledger property tests done; SRT/consent/speaker parts open | implementing | – |
 | T03 | W? | Eng | OQ4 | staging | Integration/contract on real DB/queue/storage/Razorpay test/provider sandbox; every result labelled mocked/sandbox/staging/production | – | planned | OQ4 |
 | T04 | W? | Eng | S01 | every route | Tenant ownership on API/SSE/retries/downloads/previews/signed URLs/caches/admin; CSRF, CORS, keys, TLS, SSRF denial, unprivileged media workers, log redaction (OWASP ASVS) | – | planned | – |
 | T05 | W? | Eng | A03 | media | Codecs, mono/stereo, multi-track, VFR, rotation, Unicode/RTL, damaged, no audio, long silence, overlap, SRT BOM/CRLF/order/out-of-range, 1 h and max size | – | planned | – |

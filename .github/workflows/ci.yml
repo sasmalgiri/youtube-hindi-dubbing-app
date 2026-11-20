@@ -1,0 +1,58 @@
+# Offline CI (tracker A02, T01). Runs on every push and pull request.
+#
+# What this proves: the module matrix, billing/ledger, tracker alignment, the
+# web type-check and production build. What it does NOT run: GPU models,
+# provider calls, or the full dialogue suite (those need the owner's CUDA
+# environment; see docs/release/TRACKER.md "evidence" for where they ran).
+# The manual scripts backend/test_google_tts.py, test_sarvam_tts.py and
+# test_srtdub_runtime.py call live/paid providers and are never run here.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install the light test set (versions match the owner's working environment)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install fastapi==0.115.6 pydantic==2.10.4 starlette==0.41.3 sse-starlette==2.1.0 \
+            httpx==0.28.1 python-multipart==0.0.20 pytest==8.4.2 numpy==2.2.6 python-dotenv==1.1.1 \
+            requests==2.32.3 uvicorn==0.34.0
+      - name: Tracker and TODO cover each other
+        run: python docs/release/check_alignment.py
+      - name: Module matrix and billing tests
+        working-directory: backend
+        env:
+          VOICEDUB_PROFILE: local
+        run: python -m pytest tests_dialogue/test_features.py tests_dialogue/test_billing.py -q -p no:cacheprovider
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit -p .
+      - run: npm run build
