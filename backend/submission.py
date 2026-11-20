@@ -279,6 +279,35 @@ def run_billed(job, ledger_factory: Callable[[], Any], run: Callable[[], None], 
         close_billing(job, ledger_factory, save)
 
 
+def verify_result(path: Path, min_seconds: float = 1.0, silence_db: float = -60.0) -> Optional[str]:
+    """Check a delivered file before it counts as Complete: it decodes, has an
+    audio stream, is long enough and is not silent. Returns a reason or None."""
+    import re
+    try:
+        if path.stat().st_size == 0:
+            return "empty file"
+        pr = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+                            capture_output=True, text=True, timeout=60)
+        if pr.returncode != 0:
+            return "file does not decode"
+        info = json.loads(pr.stdout or "{}")
+        if not any(st.get("codec_type") == "audio" for st in info.get("streams", [])):
+            return "no audio track"
+        dur = float(info.get("format", {}).get("duration") or 0)
+        if dur < min_seconds:
+            return f"too short ({dur:.1f}s)"
+        vd = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+                             "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True, timeout=600)
+        m = re.search(r"max_volume:\s*(-?[\d.]+|-inf) dB", vd.stderr or "")
+        if not m:
+            return "audio could not be measured"
+        if m.group(1) == "-inf" or float(m.group(1)) < silence_db:
+            return "audio is silent"
+        return None
+    except Exception as e:                    # a check that cannot run must not pass
+        return f"check failed ({type(e).__name__})"
+
+
 def close_billing(job, ledger_factory: Callable[[], Any], save: Callable[[Any], None]) -> Optional[str]:
     b = getattr(job, "billing", None)
     if not b or b.get("closed"):
@@ -287,6 +316,13 @@ def close_billing(job, ledger_factory: Callable[[], Any], save: Callable[[Any], 
     try:
         delivered = job.state == "done" and bool(getattr(job, "result_path", None)) and \
             Path(str(job.result_path)).exists()
+        if delivered:
+            problem = verify_result(Path(str(job.result_path)))
+            if problem:                       # P07: never "Complete" (or charged) on a bad output
+                delivered = False
+                job.state = "error"
+                job.error = f"Result failed the delivery check: {problem}"
+                job.message = "The output did not pass the delivery check; your time was returned."
         if delivered:
             led.settle(b["account"], b["reserve_key"])
             b["closed"] = "settled"

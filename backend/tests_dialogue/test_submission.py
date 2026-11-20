@@ -56,11 +56,19 @@ class Runner:
         self.calls.append(job.id)
         if self.gate:
             self.gate.wait(10)
+        out = Path(req.url).parent / "dubbed.mp4"
         if self.outcome == "done":
-            out = Path(req.url).parent / "dubbed.mp4"
-            out.write_bytes(b"x" * 2000)
+            shutil.copy2(req.url, out)            # a real, audible file passes the delivery check
             job.result_path = out
             job.state = "done"
+        elif self.outcome in ("silent", "garbage"):
+            if self.outcome == "silent":
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                                "-t", "5", "-c:a", "aac", str(out)], check=True)
+            else:
+                out.write_bytes(b"x" * 2000)
+            job.result_path = out
+            job.state = "done"                    # the pipeline claims success; the check must catch it
         else:
             job.state = "error"
 
@@ -318,3 +326,26 @@ def test_restart_reconciliation_releases_an_interrupted_job(env, media):
     b = balance(env, uid)
     assert (b.spendable, b.reserved) == (3_600, 0)
     env["runner"].gate.set()
+
+
+@pytest.mark.parametrize("outcome,reason", [("silent", "silent"), ("garbage", "decode")])
+def test_bad_output_is_never_complete_and_is_not_charged(env, media, outcome, reason):
+    c, uid = env["client"]("a@example.com")
+    grant(env, uid, 3_600, "pay:t1")
+    env["runner"].outcome = outcome
+    did = upload(c, media["ok"]).json()["id"]
+    qid = c.post("/api/quotes", json={"draft_id": did}).json()["id"]
+    jid = c.post(f"/api/drafts/{did}/submit", json={"quote_id": qid, "idempotency_key": "k1",
+                                                    "rights_accepted": True, "rights_version": rights(c)}).json()["id"]
+    assert wait_closed(env, jid) == "released"
+    assert balance(env, uid).spendable == 3_600
+    j = c.get(f"/api/jobs/{jid}").json()
+    assert j["state"] == "error" and reason in (j.get("error") or "")
+
+
+def test_verify_result_checks(media, tmp_path):
+    import submission
+    assert submission.verify_result(media["ok"]) is None
+    assert submission.verify_result(media["silent_video"]) == "no audio track"
+    assert submission.verify_result(media["garbage"]) == "file does not decode"
+    assert submission.verify_result(tmp_path / "missing.mp4").startswith("check failed")
