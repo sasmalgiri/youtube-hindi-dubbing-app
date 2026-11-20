@@ -3480,6 +3480,7 @@ def list_jobs(request: Request):
                 "chain_parent_id": getattr(j, "chain_parent_id", None),
                 "total_words": getattr(j, "total_words", None),
                 "total_sentences": getattr(j, "total_sentences", None),
+                "subtitles_path": (str(_job_srt(j)) if getattr(j, "state", "") == "done" and _job_srt(j) else None),
             })
         except Exception:
             # Skip corrupt jobs instead of crashing the entire list
