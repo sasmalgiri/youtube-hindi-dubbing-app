@@ -94,6 +94,11 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module._submissions, "_store", st, raising=False)
     runner = Runner()
     monkeypatch.setattr(app_module, "_job_runner", lambda: runner)
+    import workqueue
+    wq = workqueue.WorkQueue(tmp_path / "queue.db", app_module._run_funded, on_give_up=app_module._give_up_funded,
+                             max_global=4, max_per_account=4)
+    monkeypatch.setattr(app_module._queue, "_q", wq, raising=False)
+    wq.start()
     # hosted voices: Google TTS on (Edge is off in hosted)
     features.set_state("tts.google", True)
     from fastapi.testclient import TestClient
@@ -105,7 +110,8 @@ def env(tmp_path, monkeypatch):
         uid = c.post("/api/auth/email/verify", json={"email": email, "code": outbox[-1][1]}).json()["user"]["id"]
         return c, uid
 
-    yield {"app": app_module, "client": client, "runner": runner, "tmp": tmp_path, "store": st}
+    yield {"app": app_module, "client": client, "runner": runner, "tmp": tmp_path, "store": st, "queue": wq}
+    wq.close()
     acc.close()
     st.close()
 

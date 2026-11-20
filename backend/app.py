@@ -853,7 +853,7 @@ def _reconcile_billing(jobs) -> None:
     result exists) or releases its reservation. Idempotent."""
     for job in list(jobs.values()):
         b = getattr(job, "billing", None)
-        if b and not b.get("closed") and getattr(job, "state", "") != "running":
+        if b and not b.get("closed") and getattr(job, "state", "") not in ("running", "queued"):
             try:
                 out = _submission.close_billing(job, _ledger, _store.save)
                 print(f"[BILLING] reconciled {job.id}: {out}", flush=True)
@@ -911,6 +911,8 @@ def create_quote(body: QuoteRequest, request: Request):
                                       batch=False, available=available)
     except _submission.SubmitError as e:
         _submit_error(e)
+    c = _queue().counts()
+    q["queue"] = {"ahead": int(c.get("queued", 0)) + int(c.get("running", 0)), "workers": _queue().max_global}
     return q
 
 
@@ -984,7 +986,10 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
         job.original_req = req
         job.owner_id = owner
         job.billing = {"account": acct, "reserve_key": job_id, "seconds": seconds, "split": split,
-                       "quote_id": body.quote_id, "price_version": q["price_version"]}
+                       "quote_id": body.quote_id, "price_version": q["price_version"], "draft_id": draft_id}
+        job.state = "queued"
+        job.message = "Waiting for a free worker"
+        _write_manifest(job, d, q, req, body.rights_version)
         JOBS[job_id] = job
         _store.save(job)
         st.complete_claim(owner, body.idempotency_key, job_id)
@@ -1006,16 +1011,366 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
             finally:
                 led.close()
         raise
-    t = threading.Thread(target=_submission.run_billed,
-                         args=(job, _ledger, lambda: _job_runner()(job, req), _store.save), daemon=True)
-    job.worker_thread = t
-    t.start()
-    return {"id": job_id, "duplicate": False, "reserved": split}
+    q_ = _queue()
+    q_.enqueue(job_id, acct)
+    return {"id": job_id, "duplicate": False, "reserved": split, "queue_position": q_.position(job_id)}
 
 
 def _job_runner():
     """The pipeline entry point for submitted jobs (tests replace it)."""
     return _run_job
+
+
+# ── Durable queue for funded jobs (W3: R01, S03, Q00) ───────────────────────
+import workqueue as _workqueue
+
+MANIFEST_VERSION = 1
+
+
+def _manifest_path(job_id: str) -> Path:
+    return STATE_DIR / "manifests" / f"{job_id}.json"
+
+
+def _write_manifest(job, draft: dict, quote: dict, req, rights_version: str) -> None:
+    """Q00: one versioned record of what this job was asked to make. Kept in
+    STATE_DIR (work folders are wiped after a run)."""
+    import subprocess as _sp
+    try:
+        commit = _sp.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(BASE_DIR), capture_output=True,
+                         text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        commit = None
+    m = {
+        "manifest_version": MANIFEST_VERSION, "job_id": job.id, "created_at": int(time.time()),
+        "source": {"draft_id": draft["id"], "filename": draft["filename"], "sha256": draft.get("sha256"),
+                   "size": draft.get("size"), "duration": draft.get("duration"),
+                   "tracks": {k: (draft.get("probe") or {}).get(k) for k in ("video", "audio")}},
+        "interval": {"start": 0, "minutes": int(quote.get("minutes") or 0)},
+        "source_language": "en", "targets": list(quote.get("languages") or []),
+        "style": quote.get("style"), "quality": quote.get("quality"),
+        "voices": {"edge": bool(req.use_edge_tts), "google": bool(req.use_google_tts)},
+        "quote": {"id": quote["id"], "price_version": quote["price_version"],
+                  "standard_seconds": quote["standard_seconds"], "premium_seconds": quote["premium_seconds"],
+                  "cash_minor": quote["cash_minor"]},
+        "consent": {"rights_version": rights_version},
+        "code_version": commit, "profile": _features.profile(),
+    }
+    path = _manifest_path(job.id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(m, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _run_funded(job_id: str) -> None:
+    """Queue worker: run one funded job, then close its billing exactly once."""
+    job = JOBS.get(job_id)
+    if job is None or (job.billing or {}).get("closed"):
+        return
+    req = job.original_req
+    src = Path(req.url)
+    if not src.exists():                          # a retry after the work folder was wiped
+        d = _submissions().draft(job.billing["draft_id"], job.owner_id)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(d["path"], src)
+    job.state = "running"
+    job.error = None
+    job.message = "Starting"
+    _store.save(job)
+    _submission.run_billed(job, _ledger, lambda: _job_runner()(job, req), _store.save)
+
+
+def _give_up_funded(job_id: str, why: str) -> None:
+    job = JOBS.get(job_id)
+    if job is None:
+        return
+    job.state = "error"
+    job.error = f"The job could not finish ({why}); your time was returned."
+    _store.save(job)
+    _submission.close_billing(job, _ledger, _store.save)
+
+
+def _queue() -> "_workqueue.WorkQueue":
+    q = getattr(_queue, "_q", None)
+    if q is None:
+        q = _workqueue.WorkQueue(STATE_DIR / "queue.db", _run_funded, on_give_up=_give_up_funded,
+                                 max_global=int(os.environ.get("VOICEDUB_MAX_FUNDED_JOBS", "1") or 1),
+                                 max_per_account=int(os.environ.get("VOICEDUB_MAX_JOBS_PER_ACCOUNT", "1") or 1))
+        _queue._q = q
+        q.start()
+    return q
+
+
+def _recover_queue(jobs) -> None:
+    """After a restart: interrupted funded jobs go back in the queue (or give up
+    after the retry ceiling); queued ones stay queued."""
+    q = _queue()
+    q.recover()
+    for job_id in q.queued_ids():
+        j = jobs.get(job_id)
+        if j is not None:
+            j.state = "queued"
+            j.error = None
+            j.message = "Waiting for a free worker (resumed after a restart)"
+            _store.save(j)
+
+
+# ── Premium batches (W8: S04, M06) ──────────────────────────────────────────
+class BatchQuoteRequest(BaseModel):
+    draft_ids: List[str]
+    minutes: int = 0
+    languages: List[str] = ["hi"]
+
+
+class BatchSubmitRequest(BaseModel):
+    idempotency_key: str
+    rights_accepted: bool = False
+    rights_version: str = ""
+
+
+MAX_BATCH_ITEMS = 50
+
+
+def _quote_batch_children(owner, draft_ids, minutes, languages):
+    """Itemized child quotes funded only by Premium time; each child sees the
+    Premium left after the children before it. Raises SubmitError naming the item."""
+    led = _ledger()
+    try:
+        available = led.spendable(_account_key(owner))
+    finally:
+        led.close()
+    prem_left = int(available.get("premium", 0))
+    children = []
+    for n, did in enumerate(draft_ids, 1):
+        try:
+            q = _submissions().make_quote(draft_id=did, owner_id=owner, languages=languages, minutes=minutes,
+                                          style="dialogue", quality="standard", batch=True,
+                                          available={"premium": prem_left, "standard": 0})
+        except _submission.SubmitError as e:
+            raise _submission.SubmitError(f"Item {n}: {e}", e.status)
+        prem_left -= int(q["premium_seconds"])
+        d = _submissions().draft(did, owner)
+        children.append({"n": n, "draft_id": did, "filename": d["filename"], "quote_id": q["id"],
+                         "premium_seconds": int(q["premium_seconds"]), "job_id": None, "attempts": []})
+    return children
+
+
+def _start_batch_child(owner, acct, child, batch_id, rights_version) -> str:
+    """Reserve Premium for one child and queue its job. Raises SubmitError; on
+    error nothing stays reserved for this child."""
+    from billing import catalog
+    from billing.ledger import InsufficientBalance, PREMIUM
+    st = _submissions()
+    q = st.quote(child["quote_id"], owner)
+    if q.get("used_job_id"):
+        raise _submission.SubmitError(f"Item {child['n']}: quote already used", 409)
+    if int(time.time()) >= q["expires_at"] or q["price_version"] != catalog.PRICE_VERSION:
+        raise _submission.SubmitError("The batch price expired; price the batch again", 409)
+    d = st.draft(child["draft_id"], owner)
+    hosted = _features.profile() == "hosted"
+    req = JobCreateRequest(
+        url=d["path"], source_language="en", target_language=q["languages"][0], dub_duration=int(q.get("minutes") or 0),
+        use_edge_tts=_features.is_on("tts.edge"),
+        use_google_tts=(not _features.is_on("tts.edge")) and _features.is_on("tts.google"),
+        multi_speaker=False, visual_transforms=False if hosted else True)
+    msg = _features.job_refusal(req, "upload")
+    if msg:
+        raise _submission.SubmitError(msg, 400)
+    job_id = uuid.uuid4().hex[:12]
+    led = _ledger()
+    try:
+        split = led.reserve(acct, job_id, int(q["premium_seconds"]), order=(PREMIUM,), note=f"batch {batch_id}")
+    except InsufficientBalance:
+        raise _submission.SubmitError("Not enough Premium time for the whole batch; price it again", 409)
+    finally:
+        led.close()
+    try:
+        if not st.use_quote(child["quote_id"], job_id):
+            raise _submission.SubmitError(f"Item {child['n']}: quote already used", 409)
+        job_dir = OUTPUTS / job_id / "work"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        src = job_dir / ("source" + Path(d["path"]).suffix)
+        shutil.copy2(d["path"], src)
+        req.url = str(src)
+        job = Job(id=job_id, source_url=f"upload:{d['filename']}", target_language=req.target_language)
+        job.original_req = req
+        job.owner_id = owner
+        job.billing = {"account": acct, "reserve_key": job_id, "seconds": int(q["premium_seconds"]), "split": split,
+                       "quote_id": child["quote_id"], "price_version": q["price_version"],
+                       "draft_id": child["draft_id"], "batch_id": batch_id}
+        job.state = "queued"
+        job.message = "Waiting for a free worker"
+        _write_manifest(job, d, q, req, rights_version)
+        JOBS[job_id] = job
+        _store.save(job)
+    except BaseException:
+        led = _ledger()
+        try:
+            led.release(acct, job_id, note="batch child failed before start")
+        finally:
+            led.close()
+        raise
+    return job_id
+
+
+def _batch_view(b: dict) -> dict:
+    out = dict(b)
+    kids = []
+    for c in b.get("children", []):
+        c = dict(c)
+        j = JOBS.get(c["job_id"]) if c.get("job_id") else None
+        c["state"] = getattr(j, "state", None) if j else ("not started" if not c.get("job_id") else "unknown")
+        c["closed"] = (getattr(j, "billing", None) or {}).get("closed") if j else None
+        c["error"] = getattr(j, "error", None) if j else None
+        kids.append(c)
+    out["children"] = kids
+    out["summary"] = {s: sum(1 for c in kids if c["state"] == s) for s in ("queued", "running", "done", "error")}
+    return out
+
+
+@app.post("/api/batches")
+def create_batch(body: BatchQuoteRequest, request: Request):
+    from billing import catalog
+    owner = _require_owner(request)
+    ids = [d for d in body.draft_ids if d]
+    if not ids:
+        raise HTTPException(status_code=422, detail="Add at least one upload to the batch")
+    if len(ids) > MAX_BATCH_ITEMS or len(set(ids)) != len(ids):
+        raise HTTPException(status_code=422, detail=f"A batch holds up to {MAX_BATCH_ITEMS} different uploads")
+    try:
+        children = _quote_batch_children(owner, ids, body.minutes, body.languages)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    total = sum(c["premium_seconds"] for c in children)
+    b = {"status": "quoted", "minutes": body.minutes, "languages": body.languages, "children": children,
+         "premium_seconds": total, "display": {"premium": catalog.fmt_seconds(total)}}
+    bid = _submissions().create_batch(owner, b)
+    b["id"] = bid
+    return b
+
+
+@app.get("/api/batches")
+def list_batches(request: Request):
+    owner = _require_owner(request)
+    return [_batch_view(b) for b in _submissions().batches(owner)]
+
+
+@app.get("/api/batches/{batch_id}")
+def get_batch(batch_id: str, request: Request):
+    try:
+        return _batch_view(_submissions().batch(batch_id, _require_owner(request)))
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
+def _start_children(owner, batch_id, b, children, rights_version):
+    """All-or-nothing: every listed child is reserved and queued, or none is."""
+    acct = _account_key(owner)
+    started = []
+    try:
+        for c in children:
+            jid = _start_batch_child(owner, acct, c, batch_id, rights_version)
+            started.append((c, jid))
+    except BaseException:
+        led = _ledger()
+        try:
+            for _c, jid in started:
+                led.release(acct, jid, note="batch start rolled back")
+                JOBS.pop(jid, None)
+        finally:
+            led.close()
+        raise
+    for c, jid in started:
+        if c.get("job_id"):
+            c["attempts"].append(c["job_id"])
+        c["job_id"] = jid
+    _submissions().save_batch(batch_id, b)
+    for _c, jid in started:
+        _queue().enqueue(jid, acct)
+
+
+@app.post("/api/batches/{batch_id}/submit")
+def submit_batch(batch_id: str, body: BatchSubmitRequest, request: Request):
+    owner = _require_owner(request)
+    st = _submissions()
+    try:
+        existing = st.claim(owner, body.idempotency_key, batch_id)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    if existing:
+        return {"id": existing, "duplicate": True}
+    try:
+        b = st.batch(batch_id, owner)
+        if b["status"] != "quoted":
+            raise _submission.SubmitError("This batch was already started", 409)
+        for c in b["children"]:
+            st.record_rights(owner, c["draft_id"], body.rights_accepted, body.rights_version)
+        _start_children(owner, batch_id, b, b["children"], body.rights_version)
+        b["status"] = "submitted"
+        st.save_batch(batch_id, b)
+        st.complete_claim(owner, body.idempotency_key, batch_id)
+    except _submission.SubmitError as e:
+        st.drop_claim(owner, body.idempotency_key)
+        _submit_error(e)
+    except BaseException:
+        st.drop_claim(owner, body.idempotency_key)
+        raise
+    return {"id": batch_id, "duplicate": False}
+
+
+@app.post("/api/batches/{batch_id}/retry-failed")
+def retry_batch_failures(batch_id: str, body: BatchSubmitRequest, request: Request):
+    """Run again only the children that failed and had their time returned."""
+    owner = _require_owner(request)
+    st = _submissions()
+    try:
+        existing = st.claim(owner, body.idempotency_key, batch_id)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+    if existing:
+        return {"id": existing, "duplicate": True}
+    try:
+        b = st.batch(batch_id, owner)
+        if b["status"] != "submitted":
+            raise _submission.SubmitError("Start the batch first", 409)
+        failed = []
+        for c in b["children"]:
+            j = JOBS.get(c.get("job_id") or "")
+            if j is not None and j.state == "error" and (j.billing or {}).get("closed") == "released":
+                failed.append(c)
+        if not failed:
+            raise _submission.SubmitError("No failed items to retry", 409)
+        fresh = _quote_batch_children(owner, [c["draft_id"] for c in failed], b["minutes"], b["languages"])
+        for c, f in zip(failed, fresh):
+            c["quote_id"], c["premium_seconds"] = f["quote_id"], f["premium_seconds"]
+        for c in failed:
+            st.record_rights(owner, c["draft_id"], body.rights_accepted, body.rights_version)
+        _start_children(owner, batch_id, b, failed, body.rights_version)
+        st.complete_claim(owner, body.idempotency_key, batch_id)
+    except _submission.SubmitError as e:
+        st.drop_claim(owner, body.idempotency_key)
+        _submit_error(e)
+    except BaseException:
+        st.drop_claim(owner, body.idempotency_key)
+        raise
+    return {"id": batch_id, "retried": len(failed)}
+
+
+@app.get("/api/jobs/{job_id}/queue")
+def job_queue(job_id: str):
+    r = _queue().row(job_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="Not a queued job")
+    return {"state": r["state"], "attempts": r["attempts"], "position": _queue().position(job_id),
+            "note": r["note"]}
+
+
+@app.get("/api/jobs/{job_id}/manifest")
+def job_manifest(job_id: str):
+    p = _manifest_path(job_id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="No manifest")
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _refuse_switched_off(req, input_mode, cleanup: Optional[Path] = None) -> None:
@@ -5641,6 +5996,13 @@ def delete_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    if getattr(job, "billing", None) and job.state == "queued" and _queue().cancel(job_id):
+        job.state = "error"
+        job.error = "Cancelled before it started"
+        _store.save(job)
+        _submission.close_billing(job, _ledger, _store.save)
+        return {"status": "cancelled"}
+
     # A re-voice of a finished dialogue job (queued or running): stop only the
     # re-voice. The job keeps its folder, checkpoint, earlier result and saved
     # copy, and is back as it was at once; the worker then puts back the
@@ -6054,6 +6416,10 @@ def _load_jobs() -> None:
     module and reads the store before any request is served)."""
     _store.load_all(JOBS)
     _settle_loaded_jobs(JOBS, _store)
+    try:
+        _recover_queue(JOBS)
+    except Exception as e:
+        print(f"[QUEUE] recovery failed: {e}", flush=True)
     _reconcile_billing(JOBS)
 
 

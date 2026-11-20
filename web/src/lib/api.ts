@@ -1060,3 +1060,23 @@ export const getQuote = (body: { draft_id: string; languages: string[]; minutes:
     authFetch<QuoteInfo>('/api/quotes', { method: 'POST', body: JSON.stringify(body) });
 export const submitDraft = (draftId: string, body: { quote_id: string; idempotency_key: string; rights_accepted: boolean; rights_version: string }) =>
     authFetch<{ id: string; duplicate: boolean }>(`/api/drafts/${encodeURIComponent(draftId)}/submit`, { method: 'POST', body: JSON.stringify(body) });
+
+// ── Premium batches (W8) ──
+export interface BatchChild {
+    n: number; draft_id: string; filename: string; quote_id: string; premium_seconds: number;
+    job_id: string | null; attempts: string[]; state?: string | null; closed?: string | null; error?: string | null;
+}
+export interface BatchInfo {
+    id: string; status: 'quoted' | 'submitted'; minutes: number; languages: string[]; children: BatchChild[];
+    premium_seconds: number; display: { premium: string }; created_at?: number;
+    summary?: Record<string, number>;
+}
+export const createBatch = (body: { draft_ids: string[]; minutes: number }) =>
+    authFetch<BatchInfo>('/api/batches', { method: 'POST', body: JSON.stringify(body) });
+export const getBatch = (id: string) => authFetch<BatchInfo>(`/api/batches/${encodeURIComponent(id)}`);
+export const listBatches = () => authFetch<BatchInfo[]>('/api/batches');
+type BatchStart = { idempotency_key: string; rights_accepted: boolean; rights_version: string };
+export const submitBatch = (id: string, body: BatchStart) =>
+    authFetch<{ id: string; duplicate: boolean }>(`/api/batches/${encodeURIComponent(id)}/submit`, { method: 'POST', body: JSON.stringify(body) });
+export const retryBatchFailures = (id: string, body: BatchStart) =>
+    authFetch<{ id: string; retried: number }>(`/api/batches/${encodeURIComponent(id)}/retry-failed`, { method: 'POST', body: JSON.stringify(body) });

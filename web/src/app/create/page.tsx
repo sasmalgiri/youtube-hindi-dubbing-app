@@ -97,6 +97,7 @@ export default function CreatePage() {
                 <Link href="/" className="text-xs text-text-muted hover:text-text-primary">← Back</Link>
                 <h1 className="text-2xl font-semibold text-text-primary mt-1">New dub</h1>
                 <p className="text-sm text-text-muted mt-1">Upload your own video, see the exact price, then start. English → Hindi, one voice.</p>
+                <Link href="/create/batch" className="text-xs text-primary hover:underline">Several videos? Use a Premium batch →</Link>
             </div>
 
             {/* 1. upload */}

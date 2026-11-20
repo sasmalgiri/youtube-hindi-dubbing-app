@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS rights (
     text        TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS batches (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    body        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS submissions (
     owner_key   TEXT PRIMARY KEY,          -- owner_id || ':' || idempotency key
     job_id      TEXT,
@@ -264,6 +271,37 @@ class SubmissionStore:
 
     def drop_claim(self, owner_id: Optional[str], key: str) -> None:
         self._x("DELETE FROM submissions WHERE owner_key=? AND job_id IS NULL", (f"{owner_id or 'local'}:{key}",))
+
+    # batches (W8: S04, M06) — server records, so a batch survives logout and restarts
+    def create_batch(self, owner_id: Optional[str], body: Dict[str, Any]) -> str:
+        bid = "b_" + secrets.token_hex(8)
+        now = self._now()
+        self._x("INSERT INTO batches(id, owner_id, body, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (bid, owner_id, json.dumps(body), now, now))
+        return bid
+
+    def batch(self, batch_id: str, owner_id: Optional[str]) -> Dict[str, Any]:
+        r = self._one("SELECT owner_id, body, created_at FROM batches WHERE id=?", (batch_id,))
+        if r is None or r[0] != owner_id:
+            raise SubmitError("Batch not found", 404)
+        body = json.loads(r[1])
+        body["id"], body["created_at"] = batch_id, r[2]
+        return body
+
+    def save_batch(self, batch_id: str, body: Dict[str, Any]) -> None:
+        body = {k: v for k, v in body.items() if k not in ("id", "created_at")}
+        self._x("UPDATE batches SET body=?, updated_at=? WHERE id=?", (json.dumps(body), self._now(), batch_id))
+
+    def batches(self, owner_id: Optional[str]) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id, body, created_at FROM batches WHERE owner_id IS ? "
+                                      "ORDER BY created_at DESC", (owner_id,)).fetchall()
+        out = []
+        for bid, body, created in rows:
+            b = json.loads(body)
+            b["id"], b["created_at"] = bid, created
+            out.append(b)
+        return out
 
     def use_quote(self, quote_id: str, job_id: str) -> bool:
         cur = self._x("UPDATE quotes SET used_job_id=? WHERE id=? AND used_job_id IS NULL", (job_id, quote_id))
