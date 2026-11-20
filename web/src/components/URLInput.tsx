@@ -1,5 +1,6 @@
 'use client';
 
+import { useFeatures } from '@/hooks/useFeatures';
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { extractYouTubeId, isValidYouTubeUrl, getThumbnailUrl } from '@/lib/utils';
 import { addLink, type LinkPreset } from '@/lib/api';
@@ -25,6 +26,18 @@ export { type InputMode };
 
 export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtSubmit, onStorySubmit, onModeChange, disabled, url: controlledUrl, onUrlChange, getPreset, dubDuration = 0, onDubDurationChange }: URLInputProps) {
     const [mode, setMode] = useState<InputMode>('url');
+    // Module on/off matrix: switched-off input modes are hidden; if the current
+    // mode is off (hosted starts with links off), move to the first one that is on.
+    const { isOn: featureOn, matrix: featureMatrix } = useFeatures();
+    const ALL_MODES: InputMode[] = ['url', 'upload', 'batch', 'srt', 'story'];
+    const modeOn = (m: InputMode) => featureOn('input.' + m);
+    useEffect(() => {
+        if (featureMatrix && !modeOn(mode)) {
+            const next = ALL_MODES.find(modeOn);
+            if (next) { setMode(next); onModeChange?.(next); }
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [featureMatrix]);
     const [internalUrl, setInternalUrl] = useState('');
 
     const url = controlledUrl ?? internalUrl;
@@ -144,6 +157,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
             {/* Tab Switcher */}
             <div className="flex gap-1 p-1 rounded-xl bg-card/50 border border-border">
                 <button
+                    style={modeOn('url') ? undefined : { display: 'none' }}
                     onClick={() => { setMode('url'); onModeChange?.('url'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'url'
@@ -158,6 +172,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     YouTube URL
                 </button>
                 <button
+                    style={modeOn('upload') ? undefined : { display: 'none' }}
                     onClick={() => { setMode('upload'); onModeChange?.('upload'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'upload'
@@ -173,6 +188,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     Upload Video
                 </button>
                 <button
+                    style={modeOn('batch') ? undefined : { display: 'none' }}
                     onClick={() => { setMode('batch'); onModeChange?.('batch'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'batch'
@@ -188,6 +204,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     Batch URLs
                 </button>
                 <button
+                    style={modeOn('srt') ? undefined : { display: 'none' }}
                     onClick={() => { setMode('srt'); onModeChange?.('srt'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'srt'
@@ -204,6 +221,7 @@ export default function URLInput({ onSubmit, onFileSubmit, onBatchSubmit, onSrtS
                     SRT Dub
                 </button>
                 <button
+                    style={modeOn('story') ? undefined : { display: 'none' }}
                     onClick={() => { setMode('story'); onModeChange?.('story'); }}
                     className={`flex-1 py-2.5 px-4 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
                         mode === 'story'

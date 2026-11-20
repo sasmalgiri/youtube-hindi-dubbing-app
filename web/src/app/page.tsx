@@ -10,6 +10,7 @@ import PresetTabs from '@/components/PresetTabs';
 import DialogueModulesPanel, { DIALOGUE_RUN_OPTION_KEYS, pickDialogueRunOptions } from '@/components/DialogueModulesPanel';
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
+import { useFeatures } from '@/hooks/useFeatures';
 import { createJob, createJobUpload, createJobWithSrt, createJobStory, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
 
 // The "My Hindi SRT" dialogue preset (text_source = hindi_srt) voices a Hindi
@@ -24,6 +25,7 @@ function srtOnlyPresetError(s: DubbingSettings): string | null {
 }
 
 export default function HomePage() {
+    const { isOn } = useFeatures();
     const router = useRouter();
     // The app is locked to English -> Hindi: 'auto' made Whisper guess the
     // source language instead of being told it is English.
@@ -73,7 +75,7 @@ export default function HomePage() {
         use_whisperx: true,
         whisper_gpu_fallback: true,          // local Whisper on GPU if WhisperX not proper
         whisper_fallback_model: 'large-v3',  // large-v3 | medium
-        visual_transforms: true,             // Content-ID / duplicate evasion (classic mode)
+        visual_transforms: true,             // mirror / hue / zoom adjustments (classic mode)
         vx_hflip: false,                     // mirror (flips on-screen text) — opt-in
         vx_hue: 4.0,                         // hue shift degrees (imperceptible)
         vx_zoom: 1.04,                       // zoom + crop back
@@ -120,7 +122,7 @@ export default function HomePage() {
         sd_srt_content: '',                  // SRT Direct mode: full SRT content (paste or file upload)
         sd_max_stretch: 10.0,                // SRT Direct mode: max video stretch (1.0-10.0×)
         sd_audio_speed: 1.25,                // SRT Direct mode: post-TTS audio speedup (atempo)
-        sd_vx_hflip: true,                   // SRT Direct mode: horizontal mirror (Content-ID evasion)
+        sd_vx_hflip: true,                   // SRT Direct mode: horizontal mirror
         sd_vx_hue: 5.0,                      // SRT Direct mode: hue shift degrees
         sd_vx_zoom: 1.05,                    // SRT Direct mode: zoom + crop back
         transcript_srt_content: '',          // Upload English SRT to skip transcription entirely
@@ -369,7 +371,7 @@ export default function HomePage() {
                                 { mode: 'oneflow', label: 'OneFlow', color: 'bg-red-500' },
                                 { mode: 'srtdub', label: 'SRT Direct', color: 'bg-teal-500' },
                                 { mode: 'hindi_dialogue', label: 'Hindi Dialogue', color: 'bg-pink-500' },
-                            ].map(({ mode, label, color }) => (
+                            ].filter(({ mode }) => isOn('pipeline.' + mode)).map(({ mode, label, color }) => (
                                 <button
                                     key={mode}
                                     type="button"
@@ -409,7 +411,7 @@ export default function HomePage() {
                 )}
 
                 {/* Voice Clone Preset */}
-                <div className="flex items-center gap-3 px-1">
+                <div className="flex items-center gap-3 px-1" style={isOn('clone.coqui_xtts') ? undefined : { display: 'none' }}>
                     <button
                         type="button"
                         onClick={() => {

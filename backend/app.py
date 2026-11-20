@@ -171,6 +171,9 @@ HINGLISH_TRAINER_URL = os.environ.get("HINGLISH_TRAINER_URL", "http://localhost:
 
 def _send_training_data(source_srt_path: Path, translated_srt_path: Path, source_lang: str = "en"):
     """Send SRT pair to hinglish-ai-model trainer (fire-and-forget)."""
+    import features as _feat
+    if not _feat.trainer_allowed():      # S03/L04: never in hosted, and off when switched off locally
+        return
     def _send():
         try:
             import urllib.request
@@ -541,9 +544,17 @@ def _settle_loaded_jobs(jobs: Dict[str, "Job"], store) -> None:
 
 app = FastAPI(title="YouTube Hindi Dubbing API")
 
+import features as _features   # module on/off matrix (docs/release/TRACKER.md X01, A06)
+
+# CORS (S03): VOICEDUB_CORS_ORIGINS="https://a.example,https://b.example".
+# Local keeps "*" (desktop app + Colab tunnel); hosted never falls back to a
+# wildcard, even when the variable is set but empty.
+_cors_env = [o.strip() for o in (os.environ.get("VOICEDUB_CORS_ORIGINS") or "").split(",") if o.strip() and o.strip() != "*"]
+_cors_origins = _cors_env if (_cors_env or _features.profile() == "hosted") else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (needed for Colab ngrok tunnel)
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -552,6 +563,69 @@ app.add_middleware(
 # Serve output files for video playback
 OUTPUTS.mkdir(parents=True, exist_ok=True)
 app.mount("/static/jobs", StaticFiles(directory=str(OUTPUTS)), name="job-files")
+
+
+@app.middleware("http")
+async def _module_route_gate(request: Request, call_next):
+    """A switched-off module's routes answer 403 locally (with the switch
+    name) and 404 in hosted, before any handler runs."""
+    refusal = _features.route_refusal(request.method, request.url.path)
+    if refusal:
+        from fastapi.responses import JSONResponse
+        status, detail = refusal
+        return JSONResponse(status_code=status, content={"detail": detail})
+    return await call_next(request)
+
+
+def _features_admin(request: Request) -> None:
+    """Local: the desktop owner may switch modules. Hosted: only with the
+    admin token (no token configured = nobody can switch)."""
+    if _features.profile() == "local":
+        return
+    want = (os.environ.get("VOICEDUB_ADMIN_TOKEN") or "").strip()
+    got = (request.headers.get("x-admin-token") or "").strip()
+    import hmac
+    if not want or not hmac.compare_digest(want, got):
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+
+@app.get("/api/features")
+def get_features():
+    """The module matrix with each switch's effective state for this profile."""
+    return _features.describe()
+
+
+class FeatureSwitch(BaseModel):
+    on: bool
+
+
+@app.patch("/api/features/{module_id}")
+def patch_feature(module_id: str, body: FeatureSwitch, request: Request):
+    _features_admin(request)
+    try:
+        state = _features.set_state(module_id, body.on)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown module {module_id}")
+    except PermissionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    print(f"[FEATURES] {_features.profile()}: {module_id} -> {'on' if state else 'off'}", flush=True)
+    return {"id": module_id, "on": state}
+
+
+@app.post("/api/features/reset")
+def reset_features(request: Request):
+    _features_admin(request)
+    _features.reset()
+    return _features.describe()
+
+
+def _refuse_switched_off(req, input_mode, cleanup: Optional[Path] = None) -> None:
+    """HTTP 400 naming the switch when a job selects a module that is off."""
+    msg = _features.job_refusal(req, input_mode)
+    if msg:
+        if cleanup is not None:
+            shutil.rmtree(cleanup, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=msg)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -3174,6 +3248,7 @@ def create_job(req: JobCreateRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
+    _refuse_switched_off(req, "url")
 
     # If user opted in: when the URL changes from the previous submission,
     # delete the prior video's work_dir and saved files (frees multi-GB).
@@ -3363,6 +3438,7 @@ async def create_job_upload(
                 {"loc": list(err.get("loc", ())), "msg": err.get("msg", "")} for err in e.errors()])
         raise
 
+    _refuse_switched_off(req, "upload", cleanup=job_dir)
     job = Job(id=job_id, source_url=f"upload:{file.filename}", target_language=target_language)
     job.original_req = req
     JOBS[job_id] = job
@@ -3604,6 +3680,8 @@ async def create_job_story(
 ):
     """A written story becomes a Hindi short drama: script (LLM) -> clips (local
     Wan 2.1) -> silent video + SRT -> the SRT dub path (voices per character)."""
+    if not _features.is_on("input.story"):
+        raise HTTPException(status_code=403, detail="Story → video is switched off (Settings → Modules → input.story)")
     _cleanup_old_jobs()
     text = (story_text or "").strip()
     job_id = uuid.uuid4().hex[:12]
@@ -3907,6 +3985,7 @@ async def create_job_with_srt(
                 {"loc": list(err.get("loc", ())), "msg": err.get("msg", "")} for err in e.errors()])
         raise
 
+    _refuse_switched_off(req, ("srt",) if (video_file and video_file.filename) else ("srt", "url"), cleanup=job_dir)
     job = Job(id=job_id, source_url=display_source, target_language=target_language)
     job.original_req = req
     JOBS[job_id] = job

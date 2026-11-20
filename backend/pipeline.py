@@ -14657,7 +14657,7 @@ class Pipeline:
 
         want_alter = bool(getattr(self.cfg, "bg_alter", False))
         self._report("assemble", 0.88,
-                     "Mixing background (fingerprint-break: pitch+EQ) under voice..."
+                     "Mixing background (pitch+EQ adjusted) under voice..."
                      if want_alter else "Mixing background under voice...")
         try:
             _run_mix(alter=True)
@@ -14666,7 +14666,7 @@ class Pipeline:
                 # rubberband/EQ can be missing in some ffmpeg builds — retry with
                 # a plain unaltered mix so the job never dies on this step.
                 print(f"[Mix] Altered mix failed ({e}) — retrying without "
-                      f"fingerprint-break", flush=True)
+                      f"pitch+EQ adjusted", flush=True)
                 _run_mix(alter=False)
             else:
                 raise

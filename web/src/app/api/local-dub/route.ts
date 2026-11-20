@@ -10,6 +10,18 @@ const execFileAsync = promisify(execFile);
 const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export async function POST(req: NextRequest) {
+    // Module on/off matrix (S02): this route downloads on the server and buffers the
+    // whole file, so it exists only while surface.local_dub is on (never in hosted).
+    try {
+        const f = await fetch(`${BACKEND_URL}/api/features`, { cache: 'no-store' });
+        const m = f.ok ? await f.json() : null;
+        const mod = m?.modules?.find((x: { id: string }) => x.id === 'surface.local_dub');
+        if (!m || m.profile === 'hosted' || !mod?.on) {
+            return NextResponse.json({ detail: 'Not Found' }, { status: 404 });
+        }
+    } catch {
+        return NextResponse.json({ detail: 'Not Found' }, { status: 404 });
+    }
     let tempDir = '';
     let videoPath = '';
 

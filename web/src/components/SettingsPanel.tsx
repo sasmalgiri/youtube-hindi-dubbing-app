@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { getGlossary, addGlossaryEntry, deleteGlossaryEntry } from '@/lib/api';
+import { useFeatures } from '@/hooks/useFeatures';
 
 export interface DubbingSettings {
     voice: string;
@@ -39,7 +40,7 @@ export interface DubbingSettings {
     use_whisperx: boolean;
     whisper_gpu_fallback: boolean;     // local Whisper GPU fallback when WhisperX is "not proper"
     whisper_fallback_model: string;    // "large-v3" | "medium"
-    visual_transforms: boolean;        // Content-ID / duplicate evasion (classic mode)
+    visual_transforms: boolean;        // mirror / hue / zoom adjustments (classic mode)
     vx_hflip: boolean;                 // horizontal mirror (flips on-screen text — opt-in)
     vx_hue: number;                    // hue shift degrees
     vx_zoom: number;                   // zoom + crop back (1.0 = off)
@@ -229,6 +230,9 @@ function CollapsibleGroup({ title, subtitle, defaultOpen = false, master, onMast
 }
 
 export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi' }: SettingsPanelProps) {
+    // Module on/off matrix: a switched-off module's controls are hidden (Settings → Modules).
+    const { isOn } = useFeatures();
+    const gate = (id: string) => (isOn(id) ? undefined : { display: 'none' as const });
     const [open, setOpen] = useState(false);
 
     const update = (partial: Partial<DubbingSettings>) => {
@@ -517,13 +521,13 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </p>
                             </div>
 
-                            {/* Visual transforms — Content-ID evasion */}
+                            {/* Visual adjustments — mirror / hue / zoom */}
                             <div className="rounded-lg p-3 bg-teal-500/5 border border-teal-500/20 space-y-3">
                                 <div className="flex items-center justify-between">
                                     <div>
                                         <p className="text-xs font-medium text-teal-300">Visual transforms</p>
                                         <p className="text-[10px] text-text-muted">
-                                            Break YouTube Content ID visual fingerprint (does NOT create rights — you still need a license / fair-use basis).
+                                            Mirror, hue and zoom adjustments. They do not create rights: you still need a licence or other legal basis for the source.
                                         </p>
                                     </div>
                                 </div>
@@ -581,7 +585,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                         onChange={e => onChange({ ...settings, sd_vx_zoom: parseFloat(e.target.value) } as any)}
                                         className="w-full accent-teal-500"
                                     />
-                                    <p className="text-[10px] text-text-muted">0% = off. 5% = zooms in slightly then crops back; invisible loss but shifts fingerprint.</p>
+                                    <p className="text-[10px] text-text-muted">0% = off. 5% = zooms in slightly then crops back.</p>
                                 </div>
 
                                 <p className="text-[10px] text-amber-400 italic">
@@ -639,7 +643,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     overlapping; cues that are only punctuation stay silent.
                                 </p>
                             </div>
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-center justify-between" style={gate('option.multi_speaker')}>
                                 <div>
                                     <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
                                     <p className="text-xs text-text-muted">Detect each speaker in the original audio and give men male and women female voices (an already-translated SRT; a script with [SPEAKER_00] labels always uses them)</p>
@@ -732,6 +736,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                         ]
                                             // Groq is not wired to the new DP pipeline — hide it there.
                                             .filter((m) => !(isNew && m.value === 'groq-whisper'))
+                                            .filter((m) => isOn('asr.' + m.value))
                                             .map((m) => (
                                                 <button
                                                     key={m.value}
@@ -751,7 +756,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* Chain Dub — disabled when New pipeline */}
-                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`} style={gate('option.dub_chain')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Chain Dub (English → Hindi)</p>
                                         <p className="text-xs text-text-muted">Dub to English first using subs, then English to Hindi (best for non-English videos)</p>
@@ -899,7 +904,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     { value: 'groq', label: 'Groq', desc: 'gpt-oss-120b (free)' },
                                     { value: 'sambanova', label: 'SambaNova', desc: 'Llama 3.3 70B (free)' },
                                     { value: 'gemini', label: 'Gemini', desc: 'Google AI (free)' },
-                                ].map((m) => (
+                                ].filter((m) => isOn('mt.' + m.value)).map((m) => (
                                     <button
                                         key={m.value}
                                         onClick={() => update({ translation_engine: m.value })}
@@ -926,7 +931,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     { value: 'google', label: 'Google', desc: 'Free, FASTEST (parallel x20)' },
                                     { value: 'cerebras', label: 'Cerebras', desc: 'Llama 3.3 70B, fastest LLM' },
                                     { value: 'seamless', label: 'SeamlessM4T', desc: 'Meta end-to-end (GPU)' },
-                                ].map((m) => (
+                                ].filter((m) => isOn('mt.' + m.value)).map((m) => (
                                     <button
                                         key={m.value}
                                         onClick={() => update({ translation_engine: m.value })}
@@ -981,7 +986,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         )}
 
                         {/* Transcribe Only — disabled when New pipeline */}
-                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`} style={gate('option.transcribe_only')}>
                             <div>
                                 <p className="text-sm text-text-primary">Transcribe Only</p>
                                 <p className="text-xs text-text-muted">
@@ -998,7 +1003,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         </div>
 
                         {/* Multi-Speaker Voices — disabled when New pipeline */}
-                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                        <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`} style={gate('option.multi_speaker')}>
                             <div>
                                 <p className="text-sm text-text-primary">Multi-Speaker Voices</p>
                                 <p className="text-xs text-text-muted">Detect each speaker, give men male and women female Hindi voices (GPU ~20-40s per 10 min; first run downloads ~1.5 GB)</p>
@@ -1104,7 +1109,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </p>
                             <div className="space-y-3">
                                 {/* CosyVoice 2 */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('clone.cosyvoice')}>
                                     <div>
                                         <p className="text-sm text-text-primary">CosyVoice 2 ⭐ <span className="text-[10px] text-green-400">BEST FOR HINDI</span></p>
                                         <p className="text-xs text-text-muted">Free · GPU required · clones the original speaker&apos;s voice in Hindi · near-ElevenLabs quality · slow on CPU</p>
@@ -1120,7 +1125,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
                                 {/* Chatterbox */}
                                 {/* Indic Parler-TTS */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('tts.indic_parler')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Indic Parler-TTS <span className="text-[10px] text-blue-400">HINDI-NATIVE</span></p>
                                         <p className="text-xs text-text-muted">Free · GPU · purpose-built for Hindi &amp; Indic languages by AI4Bharat · good fallback if CosyVoice fails</p>
@@ -1133,7 +1138,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
                                 {/* Sarvam Bulbul v3 */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('tts.sarvam')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Sarvam Bulbul v3 <span className="text-[10px] text-purple-400">PREMIUM CLOUD</span></p>
                                         <p className="text-xs text-text-muted">Cloud API · arguably the best-sounding Hindi voice available · needs SARVAM_API_KEY in .env · paid after free quota</p>
@@ -1146,7 +1151,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                     </button>
                                 </div>
                                 {/* Chatterbox */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('clone.chatterbox')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Chatterbox AI <span className="text-[10px] text-blue-400">ENGLISH ONLY</span></p>
                                         <p className="text-xs text-text-muted">Free · GPU · most human-like English voice · use only for English-target dubs</p>
@@ -1166,7 +1171,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* ElevenLabs */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('tts.elevenlabs')}>
                                     <div>
                                         <p className="text-sm text-text-primary">ElevenLabs</p>
                                         <p className="text-xs text-text-muted">
@@ -1189,7 +1194,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* Coqui XTTS v2 */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('clone.coqui_xtts')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Coqui XTTS v2 <span className="text-[10px] text-green-400">VOICE CLONE</span></p>
                                         <p className="text-xs text-text-muted">Free · GPU · clones the original speaker&apos;s voice · best for same-language re-voicing (use the &quot;Voice Clone&quot; preset above)</p>
@@ -1209,7 +1214,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* Google Cloud TTS */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('tts.google')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Google Cloud TTS</p>
                                         <p className="text-xs text-text-muted">Free 1M chars/mo, WaveNet/Neural2 voices, needs GCP credentials</p>
@@ -1229,7 +1234,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* Edge-TTS */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('tts.edge')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Edge-TTS <span className="text-[10px] text-amber-400">FASTEST · NO SETUP</span></p>
                                         <p className="text-xs text-text-muted">Free · cloud · no GPU · supports 70+ languages · decent quality · use this when you want speed and zero installation</p>
@@ -1358,7 +1363,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                     </CollapsibleGroup>
 
                     {/* ── GROUP 4 — Background Music (master toggle) ── */}
-                    {!isSrtDub && (
+                    {!isSrtDub && isOn('option.mix_original') && (
                         <CollapsibleGroup
                             title="Background Music"
                             subtitle="Demucs bed under the voice, pitch/EQ-altered"
@@ -1369,8 +1374,8 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 <p className="text-sm text-text-primary">Keep Background Music</p>
                                 <p className="text-xs text-text-muted">
                                     Demucs isolates the original music/SFX and mixes it (auto-ducked) under the Hindi voice.
-                                    The bed is pitch/EQ-shifted to reduce Content-ID matching — this lowers, but does not
-                                    guarantee, avoiding a music copyright claim. Adds a GPU separation step.
+                                    The bed is pitch/EQ-adjusted. Use only music you have the right to use; this does not
+                                    clear a music copyright claim. Adds a GPU separation step.
                                 </p>
                             </div>
                         </CollapsibleGroup>
@@ -1633,7 +1638,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
 
                                     {/* ── Module 2: Global Stretch ── */}
                                     <div className={`rounded-lg border border-white/10 p-3 mb-3 ${tempoOn ? 'opacity-40 pointer-events-none' : ''}`}>
-                                        <div className="flex items-center justify-between">
+                                        <div className="flex items-center justify-between" style={gate('option.global_stretch')}>
                                             <div>
                                                 <p className="text-xs font-medium text-text-primary">Module 2 — Global Stretch{tempoOn && <span className="text-[10px] text-amber-400"> Managed by Tempo Match</span>}</p>
                                                 <p className="text-[10px] text-text-muted">One uniform video speed for the whole video. Simple: total TTS audio at speed X vs original video length.</p>
@@ -1845,16 +1850,17 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                             </div>
                         </CollapsibleGroup>
 
-                        {/* ── GROUP 5b — Visual Transforms (Content-ID evasion, master toggle) ── */}
+                        {/* ── GROUP 5b — Visual adjustments (master toggle) ── */}
+                        {isOn('visual.transforms') && (
                         <CollapsibleGroup
                             title="Visual Transforms"
-                            subtitle="Content-ID / duplicate evasion (classic mode)"
+                            subtitle="Mirror, hue and zoom adjustments (classic mode)"
                             master={settings.visual_transforms ?? true}
                             onMaster={(v) => update({ visual_transforms: v })}
                         >
                             <p className="text-[11px] text-text-muted">
-                                Applied once at the final mux (hue shift + slight zoom + metadata strip) to break the
-                                video fingerprint. Imperceptible.
+                                Applied once at the final mux (hue shift + slight zoom + metadata strip). These are ordinary
+                                editing adjustments: they do not create rights or clear copyright claims.
                                 <span className="text-yellow-400"> Only for content you have the right to dub.</span>
                             </p>
 
@@ -1896,6 +1902,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 <p className="text-[10px] text-text-muted">1.00 = off · 1.04 recommended (zoom in, crop back)</p>
                             </div>
                         </CollapsibleGroup>
+                        )}
 
                         {/* ── GROUP 6 — Verification & Review (master toggle) ── */}
                         <CollapsibleGroup
@@ -1907,7 +1914,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                         >
                             <div className="space-y-3">
                                 {/* Manual Review Queue */}
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between" style={gate('option.manual_review')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Manual Review Queue</p>
                                         <p className="text-xs text-text-muted">Save segments that failed QC after all retries to manual_review_queue.json for inspection</p>
@@ -2077,7 +2084,7 @@ export default function SettingsPanel({ settings, onChange, targetLanguage = 'hi
                                 </div>
 
                                 {/* Step-by-Step Review — disabled when New pipeline */}
-                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`}>
+                                <div className={`flex items-center justify-between ${(isNew || isOneFlow || isSrtMode) ? 'opacity-40 pointer-events-none' : ''}`} style={gate('option.step_by_step')}>
                                     <div>
                                         <p className="text-sm text-text-primary">Step-by-Step Review</p>
                                         <p className="text-xs text-text-muted">

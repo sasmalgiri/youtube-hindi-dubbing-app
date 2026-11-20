@@ -941,3 +941,55 @@ export async function deleteGlossaryEntry(word: string): Promise<Record<string, 
     const data = await res.json();
     return data.glossary || {};
 }
+
+
+// ── Module on/off matrix (backend/features.py) ─────────────────────────────
+
+export interface FeatureModule {
+    id: string;
+    group: string;
+    label: string;
+    desc: string;
+    on: boolean;
+    default: boolean;
+    overridden: boolean;
+    locked: boolean;
+    why: string;
+}
+
+export interface FeatureMatrix {
+    profile: 'local' | 'hosted';
+    groups: { id: string; label: string }[];
+    modules: FeatureModule[];
+}
+
+export async function getFeatures(): Promise<FeatureMatrix> {
+    const res = await fetch(`${API_BASE}/api/features`, { headers: { ...EXTRA_HEADERS }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Could not load modules (HTTP ${res.status})`);
+    return res.json();
+}
+
+export async function setFeature(id: string, on: boolean, adminToken?: string): Promise<{ id: string; on: boolean }> {
+    const res = await fetch(`${API_BASE}/api/features/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS, ...(adminToken ? { 'X-Admin-Token': adminToken } : {}) },
+        body: JSON.stringify({ on }),
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+}
+
+export async function resetFeatures(adminToken?: string): Promise<FeatureMatrix> {
+    const res = await fetch(`${API_BASE}/api/features/reset`, {
+        method: 'POST',
+        headers: { ...EXTRA_HEADERS, ...(adminToken ? { 'X-Admin-Token': adminToken } : {}) },
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+}

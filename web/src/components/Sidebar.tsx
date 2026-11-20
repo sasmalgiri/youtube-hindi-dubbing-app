@@ -58,6 +58,12 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                     </svg>
                     New Dubbing
                 </Link>
+                <Link
+                    href="/modules"
+                    className="mt-2 w-full flex items-center justify-center gap-2 text-xs text-text-muted hover:text-text-primary py-1.5 rounded-lg border border-white/10 hover:bg-white/5"
+                >
+                    Modules (on/off)
+                </Link>
             </div>
 
             {/* Recent Jobs */}
