@@ -184,8 +184,8 @@ _M: List[Module] = [
                    ("POST", "/api/presets"), ("DELETE", "/api/presets/{id}"),
                    ("POST", "/api/glossary"), ("DELETE", "/api/glossary/{id}")),
            why="S01: per-account lists first"),
-    Module("surface.job_list_all", "surface", "All-jobs list", "Lists every job on this machine.",
-           routes=(("GET", "/api/jobs"),), why="S01: per-account history first"),
+    Module("surface.job_list_all", "surface", "Job list", "Recent jobs (hosted: only the signed-in account's).",
+           hosted=True, routes=(("GET", "/api/jobs"),), why="W1: filtered to the signed-in account"),
 
     # Integrations
     Module("integration.trainer", "integration", "Hinglish trainer forwarding", "Sends each job's source and translated SRT to the local trainer.",

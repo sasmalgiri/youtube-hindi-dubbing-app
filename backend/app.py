@@ -225,6 +225,7 @@ JobState = Literal["queued", "running", "done", "error", "waiting_for_srt", "rev
 @dataclass
 class Job:
     id: str
+    owner_id: Optional[str] = None      # W1: account that owns this job (None = unassigned legacy/local)
     state: JobState = "queued"
     current_step: str = ""
     step_progress: float = 0.0
@@ -514,6 +515,23 @@ SAVED_DIR.mkdir(parents=True, exist_ok=True)
 # stored request runs its validators, which use helpers defined further down.
 _store = JobStore(STATE_DIR / "jobs.db")
 
+# ── Accounts (W1) ────────────────────────────────────────────────────────────
+import accounts as _accounts_mod
+
+
+def _auth_mailer():
+    """SMTP when configured. Local profile without SMTP: the code is printed in
+    the backend log (desktop testing). Hosted without SMTP: email sign-in off."""
+    if _accounts_mod.smtp_configured():
+        return _accounts_mod.send_code_email
+    import features as _f
+    if _f.profile() == "local":
+        return lambda to, code: print(f"[AUTH] local sign-in code for {to}: {code}", flush=True)
+    return None
+
+
+_accounts = _accounts_mod.AccountStore(STATE_DIR / "accounts.db", mailer=_auth_mailer())
+
 
 def _settle_loaded_jobs(jobs: Dict[str, "Job"], store) -> None:
     """Fix up jobs loaded from the store."""
@@ -617,6 +635,183 @@ def reset_features(request: Request):
     _features_admin(request)
     _features.reset()
     return _features.describe()
+
+
+def _session_of(request: Request):
+    """The signed-in session for this request, or None."""
+    return _accounts.session(request.cookies.get(_accounts_mod.SESSION_COOKIE))
+
+
+def _owner_of(request: Request) -> Optional[str]:
+    sess = _session_of(request)
+    return sess.user.id if sess else None
+
+
+_JOB_PATH = re.compile(r"^/(?:api/jobs|static/jobs)/([A-Za-z0-9_-]+)(?:/|$)")
+_JOB_CREATE_PATHS = {"upload", "story", "with-srt"}
+
+
+def _job_visible(job, user_id: Optional[str]) -> bool:
+    """Hosted: owner only. Local: unassigned jobs belong to this PC's owner;
+    an assigned job is hidden from a different signed-in account."""
+    owner = getattr(job, "owner_id", None)
+    if _features.profile() == "hosted":
+        return user_id is not None and owner == user_id
+    return owner is None or user_id is None or owner == user_id
+
+
+@app.middleware("http")
+async def _ownership_gate(request: Request, call_next):
+    """W1 / T04: every per-job route and file is checked here, before any
+    handler runs. A job you cannot see answers 404 (never 403), so job ids
+    cannot be probed."""
+    from fastapi.responses import JSONResponse
+    path = request.url.path
+    hosted = _features.profile() == "hosted"
+    if hosted and (path == "/api/jobs" or path.startswith("/api/jobs/") or path.startswith("/static/jobs/")):
+        if _owner_of(request) is None:
+            return JSONResponse(status_code=401, content={"detail": "Sign in first"})
+    m = _JOB_PATH.match(path)
+    if m and m.group(1) not in _JOB_CREATE_PATHS:
+        job = JOBS.get(m.group(1))
+        if job is not None and not _job_visible(job, _owner_of(request)):
+            return JSONResponse(status_code=404, content={"detail": "Job not found"})
+    return await call_next(request)
+
+
+def _set_session_cookie(response, token: str) -> None:
+    response.set_cookie(_accounts_mod.SESSION_COOKIE, token, max_age=_accounts_mod.SESSION_TTL, httponly=True,
+                        samesite="lax", secure=_features.profile() == "hosted", path="/")
+
+
+def _auth_error(e: "_accounts_mod.AuthError"):
+    raise HTTPException(status_code=e.status, detail=str(e))
+
+
+class EmailStart(BaseModel):
+    email: str
+
+
+class EmailVerify(BaseModel):
+    email: str
+    code: str
+
+
+class GoogleCredential(BaseModel):
+    credential: str
+
+
+@app.get("/api/auth/config")
+def auth_config():
+    """What the sign-in page can offer on this server."""
+    return {
+        "profile": _features.profile(),
+        "required": _features.profile() == "hosted",
+        "google_client_id": (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None,
+        "email": _accounts._mailer is not None,
+        "email_is_local_log": _accounts._mailer is not None and not _accounts_mod.smtp_configured(),
+    }
+
+
+@app.post("/api/auth/email/start")
+def auth_email_start(body: EmailStart):
+    try:
+        _accounts.start_email(body.email)
+    except _accounts_mod.AuthError as e:
+        _auth_error(e)
+    return {"sent": True}
+
+
+@app.post("/api/auth/email/verify")
+def auth_email_verify(body: EmailVerify, request: Request):
+    from fastapi.responses import JSONResponse
+    try:
+        token = _accounts.verify_email(body.email, body.code, request.headers.get("user-agent", ""))
+    except _accounts_mod.AuthError as e:
+        _auth_error(e)
+    sess = _accounts.session(token)
+    resp = JSONResponse({"user": {"id": sess.user.id, "email": sess.user.email, "name": sess.user.name}})
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.post("/api/auth/google")
+def auth_google(body: GoogleCredential, request: Request):
+    from fastapi.responses import JSONResponse
+    try:
+        token = _accounts.verify_google(body.credential, (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip(),
+                                        request.headers.get("user-agent", ""))
+    except _accounts_mod.AuthError as e:
+        _auth_error(e)
+    sess = _accounts.session(token)
+    resp = JSONResponse({"user": {"id": sess.user.id, "email": sess.user.email, "name": sess.user.name}})
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    sess = _session_of(request)
+    if sess is None:
+        return {"user": None}
+    return {"user": {"id": sess.user.id, "email": sess.user.email, "name": sess.user.name},
+            "session": {"id": sess.id, "method": sess.method}}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    from fastapi.responses import JSONResponse
+    _accounts.revoke_token(request.cookies.get(_accounts_mod.SESSION_COOKIE))
+    resp = JSONResponse({"signed_out": True})
+    resp.delete_cookie(_accounts_mod.SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/api/auth/sessions")
+def auth_sessions(request: Request):
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    return {"current": sess.id, "sessions": _accounts.sessions(sess.user.id)}
+
+
+@app.post("/api/auth/sessions/revoke-all")
+def auth_revoke_all(request: Request):
+    """Sign out everywhere (P09 session revocation), this device included."""
+    from fastapi.responses import JSONResponse
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    n = _accounts.revoke(sess.user.id)
+    resp = JSONResponse({"revoked": n})
+    resp.delete_cookie(_accounts_mod.SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.delete("/api/auth/sessions/{session_id}")
+def auth_revoke_one(session_id: str, request: Request):
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    if _accounts.revoke(sess.user.id, session_id) != 1:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"revoked": 1}
+
+
+@app.get("/api/account/balance")
+def account_balance(request: Request):
+    """Prepaid time per credit type (W4). Seconds are integers; money is not mixed in."""
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    from billing.ledger import Ledger
+    led = Ledger(STATE_DIR / "ledger.db")
+    try:
+        b = led.balances(sess.user.id)
+    finally:
+        led.close()
+    return {t: {"spendable_seconds": v.spendable, "reserved_seconds": v.reserved, "consumed_seconds": v.consumed,
+                "debt_seconds": v.debt} for t, v in b.items()}
 
 
 def _refuse_switched_off(req, input_mode, cleanup: Optional[Path] = None) -> None:
@@ -2864,6 +3059,7 @@ def _queue_chain_next(parent_job: Job):
         target_language=next_lang,
         chain_languages=remaining,
         chain_parent_id=parent_job.id,
+        owner_id=getattr(parent_job, "owner_id", None),
     )
     job.original_req = req
     job.video_title = parent_job.video_title  # Carry title forward
@@ -3051,9 +3247,11 @@ def cookies_status():
 
 
 @app.get("/api/jobs")
-def list_jobs():
-    """List all jobs, newest first."""
-    jobs = sorted(list(JOBS.values()), key=lambda j: getattr(j, 'created_at', 0), reverse=True)
+def list_jobs(request: Request):
+    """Jobs the caller may see, newest first (hosted: only the signed-in account's)."""
+    uid = _owner_of(request)
+    jobs = sorted([j for j in JOBS.values() if _job_visible(j, uid)],
+                  key=lambda j: getattr(j, 'created_at', 0), reverse=True)
     result = []
     for j in jobs:
         try:
@@ -3242,7 +3440,7 @@ def _cleanup_old_jobs():
 
 
 @app.post("/api/jobs")
-def create_job(req: JobCreateRequest):
+def create_job(req: JobCreateRequest, request: Request):
     """Create a new dubbing job from a YouTube URL."""
     _cleanup_old_jobs()
     url = req.url.strip()
@@ -3270,6 +3468,7 @@ def create_job(req: JobCreateRequest):
         chain_languages=remaining,
     )
     job.original_req = req
+    job.owner_id = _owner_of(request)
     JOBS[job_id] = job
     _store.save(job)
 
@@ -3282,6 +3481,7 @@ def create_job(req: JobCreateRequest):
 
 @app.post("/api/jobs/upload")
 async def create_job_upload(
+    request: Request,
     file: UploadFile = File(...),
     source_language: str = Form("en"),
     target_language: str = Form("hi"),
@@ -3441,6 +3641,7 @@ async def create_job_upload(
     _refuse_switched_off(req, "upload", cleanup=job_dir)
     job = Job(id=job_id, source_url=f"upload:{file.filename}", target_language=target_language)
     job.original_req = req
+    job.owner_id = _owner_of(request)
     JOBS[job_id] = job
     _store.save(job)
 
@@ -3671,6 +3872,7 @@ STORY_STEP_WEIGHTS = {"download": 0.05, "extract": 0.40, "transcribe": 0.0,
 
 @app.post("/api/jobs/story")
 async def create_job_story(
+    request: Request,
     story_file: Optional[UploadFile] = File(None),
     story_text: str = Form(""),
     title: str = Form(""),
@@ -3706,6 +3908,7 @@ async def create_job_story(
         raise HTTPException(status_code=400, detail="Paste or upload a story (at least a few sentences)")
     (work_dir / "story.txt").write_text(text, encoding="utf-8")
     job = Job(id=job_id, source_url=f"story:{(title or text[:40]).strip()}", target_language="hi")
+    job.owner_id = _owner_of(request)
     job.video_title = (title or "").strip() or "Story"
     JOBS[job_id] = job
     _store.save(job)
@@ -3805,6 +4008,7 @@ def _run_story_job(job: Job, text: str, title: str, voice: str, steps: int, max_
 
 @app.post("/api/jobs/with-srt")
 async def create_job_with_srt(
+    request: Request,
     srt_file: UploadFile = File(...),
     url: str = Form(""),
     video_file: Optional[UploadFile] = File(None),
@@ -3988,6 +4192,7 @@ async def create_job_with_srt(
     _refuse_switched_off(req, ("srt",) if (video_file and video_file.filename) else ("srt", "url"), cleanup=job_dir)
     job = Job(id=job_id, source_url=display_source, target_language=target_language)
     job.original_req = req
+    job.owner_id = _owner_of(request)
     JOBS[job_id] = job
     _store.save(job)
 

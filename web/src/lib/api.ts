@@ -993,3 +993,40 @@ export async function resetFeatures(adminToken?: string): Promise<FeatureMatrix>
     }
     return res.json();
 }
+
+// ── Accounts (W1) ──────────────────────────────────────────────────────────
+
+export interface AuthUser { id: string; email: string; name: string }
+export interface AuthConfig {
+    profile: 'local' | 'hosted';
+    required: boolean;
+    google_client_id: string | null;
+    email: boolean;
+    email_is_local_log: boolean;
+}
+export interface SessionInfo { id: string; created_at: number; last_seen: number; expires_at: number; user_agent: string; method: string }
+export interface CreditBalance { spendable_seconds: number; reserved_seconds: number; consumed_seconds: number; debt_seconds: number }
+
+async function authFetch<T>(path: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(`${API_BASE}${path}`, {
+        credentials: 'include',
+        ...init,
+        headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...EXTRA_HEADERS, ...(init?.headers || {}) },
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(typeof err.detail === 'string' ? err.detail : `HTTP ${res.status}`);
+    }
+    return res.json();
+}
+
+export const getAuthConfig = () => authFetch<AuthConfig>('/api/auth/config');
+export const getMe = () => authFetch<{ user: AuthUser | null }>('/api/auth/me');
+export const emailStart = (email: string) => authFetch<{ sent: boolean }>('/api/auth/email/start', { method: 'POST', body: JSON.stringify({ email }) });
+export const emailVerify = (email: string, code: string) => authFetch<{ user: AuthUser }>('/api/auth/email/verify', { method: 'POST', body: JSON.stringify({ email, code }) });
+export const googleSignIn = (credential: string) => authFetch<{ user: AuthUser }>('/api/auth/google', { method: 'POST', body: JSON.stringify({ credential }) });
+export const signOut = () => authFetch<{ signed_out: boolean }>('/api/auth/logout', { method: 'POST' });
+export const getSessions = () => authFetch<{ current: string; sessions: SessionInfo[] }>('/api/auth/sessions');
+export const revokeSession = (id: string) => authFetch<{ revoked: number }>(`/api/auth/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export const signOutEverywhere = () => authFetch<{ revoked: number }>('/api/auth/sessions/revoke-all', { method: 'POST' });
+export const getBalance = () => authFetch<Record<'standard' | 'premium', CreditBalance>>('/api/account/balance');

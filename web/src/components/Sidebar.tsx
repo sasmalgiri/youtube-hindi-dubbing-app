@@ -1,5 +1,6 @@
 'use client';
 
+import { useAuth } from '@/hooks/useAuth';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { getJobs, type JobStatus } from '@/lib/api';
@@ -64,6 +65,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                 >
                     Modules (on/off)
                 </Link>
+                <AccountLink />
             </div>
 
             {/* Recent Jobs */}
@@ -112,5 +114,20 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                 </p>
             </div>
         </aside>
+    );
+}
+
+
+function AccountLink() {
+    const { user, loaded } = useAuth();
+    if (!loaded) return null;
+    return (
+        <Link
+            href={user ? '/account' : '/signin'}
+            className="mt-2 w-full flex items-center justify-center gap-2 text-xs text-text-muted hover:text-text-primary py-1.5 rounded-lg border border-white/10 hover:bg-white/5 truncate"
+            title={user ? user.email : 'Sign in'}
+        >
+            {user ? user.email : 'Sign in'}
+        </Link>
     );
 }

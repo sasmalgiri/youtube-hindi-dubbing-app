@@ -113,6 +113,11 @@ class JobStore:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")  # allow concurrent reads
         self._conn.execute(_CREATE_TABLE)
+        # W1: owner column (migration for databases made before accounts).
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "owner_id" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN owner_id TEXT")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner_id)")
         self._conn.commit()
 
     def load_all(self, jobs_dict: Dict[str, Any]) -> int:
@@ -174,13 +179,14 @@ class JobStore:
             now = time.time()
             with self._lock:
                 self._conn.execute(
-                    """INSERT INTO jobs (id, state, payload, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?)
+                    """INSERT INTO jobs (id, state, payload, created_at, updated_at, owner_id)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                            state = excluded.state,
                            payload = excluded.payload,
-                           updated_at = excluded.updated_at""",
-                    (job.id, job.state, payload, job.created_at, now),
+                           updated_at = excluded.updated_at,
+                           owner_id = excluded.owner_id""",
+                    (job.id, job.state, payload, job.created_at, now, getattr(job, "owner_id", None)),
                 )
                 self._conn.commit()
         except Exception as e:

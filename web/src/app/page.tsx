@@ -11,6 +11,7 @@ import DialogueModulesPanel, { DIALOGUE_RUN_OPTION_KEYS, pickDialogueRunOptions 
 import JobCard from '@/components/JobCard';
 import SavedLinks from '@/components/SavedLinks';
 import { useFeatures } from '@/hooks/useFeatures';
+import { useAuth } from '@/hooks/useAuth';
 import { createJob, createJobUpload, createJobWithSrt, createJobStory, localDownloadAndDub, isRemoteBackend, getJobs, addLink, type JobStatus } from '@/lib/api';
 
 // The "My Hindi SRT" dialogue preset (text_source = hindi_srt) voices a Hindi
@@ -26,7 +27,12 @@ function srtOnlyPresetError(s: DubbingSettings): string | null {
 
 export default function HomePage() {
     const { isOn } = useFeatures();
+    // Hosted: signing in is required (W1). Desktop: optional.
+    const auth = useAuth();
     const router = useRouter();
+    useEffect(() => {
+        if (auth.loaded && auth.config?.required && !auth.user) router.push('/signin');
+    }, [auth.loaded, auth.config?.required, auth.user, router]);
     // The app is locked to English -> Hindi: 'auto' made Whisper guess the
     // source language instead of being told it is English.
     const [sourceLanguage, setSourceLanguage] = useState('en');
