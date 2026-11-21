@@ -48,6 +48,15 @@ const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const SELECT = 'rounded bg-white/5 border border-border px-1 py-0.5 text-[11px] text-text-primary';
 const SMALL_BTN = 'text-[11px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 text-text-secondary transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
 
+const DOUBT_LABELS: Record<string, string> = {
+    unknown: 'no speaker found for these words',
+    borrowed: 'short fragment given the next/previous speaker',
+    overlap: 'another person speaks at the same time',
+    sandwich: 'short line between two lines of another speaker',
+    very_short: 'too short to tell voices apart',
+};
+const hasDoubt = (t: ReviewTurn) => (t.speaker_doubt || []).length > 0;
+
 function categoryPill(cat: string): { cls: string; short: string; label: string } {
     if (cat === 'female_like') return { cls: 'bg-pink-500/20 text-pink-300', short: 'F', label: 'female-like' };
     if (cat === 'male_like') return { cls: 'bg-blue-500/20 text-blue-300', short: 'M', label: 'male-like' };
@@ -94,6 +103,12 @@ const LineRow = memo(function LineRow({
                     onChange={(e) => onSpeaker(t, e.target.value)}>
                     {speakerChoices.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
+                {hasDoubt(t) && (
+                    <span className="px-1.5 rounded bg-orange-500/15 text-orange-300" data-testid="speaker-doubt"
+                        title={`Check who says this: ${(t.speaker_doubt || []).map((d) => DOUBT_LABELS[d] || d).join('; ')}`}>
+                        check speaker
+                    </span>
+                )}
                 {(t.flags || []).map((f) => (
                     <span key={f} className={`px-1.5 rounded ${SERIOUS_FLAGS.has(f) ? 'bg-red-500/15 text-red-400' : 'bg-zinc-500/15 text-zinc-400'}`}>
                         {flagLabel(f)}
@@ -360,11 +375,13 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
     const edits = useMemo(() => (packet ? buildEdits(packet, draft) : {}), [packet, draft]);
     const summary = useMemo(() => summarizeEdits(edits), [edits]);
     const flaggedCount = useMemo(() => turns.filter(isFlagged).length, [turns]);
+    const doubtCount = useMemo(() => turns.filter(hasDoubt).length, [turns]);
     const editedCount = useMemo(() => turns.filter((t) => isTurnEdited(t, draft)).length, [turns, draft]);
     const search = useMemo(() => previewReplace(turns, draft, find, caseSensitive), [turns, draft, find, caseSensitive]);
 
     const rows = useMemo(() => turns.filter((t) => {
         if (filter === 'flagged') return isFlagged(t);
+        if (filter === 'doubt') return hasDoubt(t);
         if (filter === 'edited') return isTurnEdited(t, draft);
         if (filter === 'matches') return !draft.deleted[t.turn_id] && countMatches(currentHindi(t, draft), find, caseSensitive) > 0;
         if (filter.startsWith('speaker:')) return (draft.speaker[t.turn_id] ?? t.speaker_id) === filter.slice(8);
@@ -511,8 +528,8 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
                                     <div className="flex flex-wrap items-center gap-2">
                                         <span className={`px-1.5 py-0.5 rounded font-medium ${cat.cls}`}>{cat.short}</span>
                                         <span className="font-medium text-text-primary">{s.speaker_id}</span>
-                                        <span className="text-text-muted">
-                                            {cat.label}{s.category_confidence != null ? ` ${Math.round(s.category_confidence * 100)}%` : ''}
+                                        <span className="text-text-muted" title="A guess from how the voice sounds, used only to pick a matching voice. It is not the person's gender, age or identity.">
+                                            voice guess: {cat.label}{s.category_confidence != null ? ` ${Math.round(s.category_confidence * 100)}%` : ''}
                                             {' · '}{s.turns} line{s.turns === 1 ? '' : 's'} · {Math.round(s.total_speech_s || 0)}s
                                         </span>
                                         {s.override && <span className="px-1.5 rounded bg-violet-500/15 text-violet-300">your voice</span>}
@@ -606,6 +623,7 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
                         <select value={filter} onChange={(e) => setFilter(e.target.value)} className={SELECT}>
                             <option value="all">All lines ({turns.length})</option>
                             <option value="flagged">Flagged ({flaggedCount})</option>
+                            <option value="doubt">Speaker in doubt ({doubtCount})</option>
                             <option value="edited">Edited ({editedCount})</option>
                             {find && <option value="matches">Matching “{find}” ({search.lines})</option>}
                             {speakerIds.map((id) => (

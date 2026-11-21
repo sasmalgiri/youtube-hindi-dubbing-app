@@ -510,6 +510,7 @@ export interface ReviewTurn {
     required: boolean;
     clip: string | null;         // file name in the job's clips folder (after_run only)
     overflow_s: number | null;   // how far the voiced line runs past its slot
+    speaker_doubt?: string[];    // why the speaker of this line may be wrong (P05)
 }
 export interface ReviewSpeaker {
     speaker_id: string;
@@ -537,6 +538,7 @@ export interface ReviewPacket {
     speakers: ReviewSpeaker[];
     voice_options: VoiceOptions;
     media_duration: number;
+    speaker_doubt_count?: number;
 }
 export interface VoiceOverride { provider: string; voice: string; pitch: string | null; }
 export interface TurnEdit { hi?: string; speaker_id?: string; delete?: boolean; }

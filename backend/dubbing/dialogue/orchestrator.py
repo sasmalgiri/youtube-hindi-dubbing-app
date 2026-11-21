@@ -1803,9 +1803,10 @@ class DialogueOrchestrator:
                              "provider": prov, "voice": b.get("voice"), "pitch": b.get("pitch"),
                              "variant": b.get("variant"), "reference_clip": refs.get(sid),
                              "override": bool(b.get("override"))})
-        return {"job_stage": stage, "turns": turns, "speakers": speakers,
-                "voice_options": {p: self.registry.voice_options(p) for p in providers},
-                "media_duration": round(float(getattr(self, "media_dur", 0.0) or 0.0), 3)}
+        from .speaker_review import annotate
+        return annotate({"job_stage": stage, "turns": turns, "speakers": speakers,
+                         "voice_options": {p: self.registry.voice_options(p) for p in providers},
+                         "media_duration": round(float(getattr(self, "media_dur", 0.0) or 0.0), 3)})
 
     # ── voice matching (optional) ──────────────────────────────────────
     def _prepare_voice_match(self):

@@ -5620,8 +5620,9 @@ def get_dialogue_review(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    from dubbing.dialogue.speaker_review import annotate as _annotate_doubts
     if job.state == "review_translation" and job.dialogue_review is not None:
-        return job.dialogue_review
+        return _annotate_doubts(job.dialogue_review)
     candidates = [OUTPUTS / job.id / "dialogue_out" / "review.json"]
     if job.saved_folder:
         candidates.append(Path(job.saved_folder) / "review.json")
@@ -5629,7 +5630,7 @@ def get_dialogue_review(job_id: str):
     for p in candidates:
         try:
             if p.is_file():
-                return json.loads(p.read_text(encoding="utf-8"))
+                return _annotate_doubts(json.loads(p.read_text(encoding="utf-8")))   # older packets too
         except (OSError, ValueError) as e:
             print(f"[hindi_dialogue] unreadable review packet {p}: {e}", flush=True)
     raise HTTPException(status_code=404, detail="No review for this job")

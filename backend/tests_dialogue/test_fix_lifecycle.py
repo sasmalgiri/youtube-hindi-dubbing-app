@@ -14,6 +14,7 @@ Same fakes as the neighbouring tests: test_api_review (fake run_dialogue),
 test_e2e_review_revoice (API + the real orchestrator and FFmpeg),
 test_review_resume (orchestrator on synthetic media), test_mux_outputs.
 """
+from dubbing.dialogue.speaker_review import annotate as _annotate_doubts
 import json
 import os
 import subprocess
@@ -474,7 +475,7 @@ def test_review_packet_of_a_job_stopped_before_voicing(api):
     (work / "checkpoint" / "state.json").write_text("{}", encoding="utf-8")
     (work / "review.json").write_text(json.dumps(_packet("before_voice")), encoding="utf-8")
     r = api.c.get(f"/api/jobs/{job.id}/dialogue/review")
-    assert r.status_code == 200 and r.json() == _packet("before_voice")
+    assert r.status_code == 200 and r.json() == _annotate_doubts(_packet("before_voice"))
     assert api.c.get(f"/api/jobs/{job.id}").json()["dialogue_revoice_ready"] is True
     # an after-run packet, once there is one, is served first
     out = app_mod.OUTPUTS / job.id / "dialogue_out"
