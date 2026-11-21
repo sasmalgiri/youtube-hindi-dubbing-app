@@ -1,5 +1,6 @@
 'use client';
 
+import { useFeatures } from '@/hooks/useFeatures';
 import { useAuth } from '@/hooks/useAuth';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -12,6 +13,7 @@ interface SidebarProps {
 
 export default function Sidebar({ onNewDubbing }: SidebarProps) {
     const [jobs, setJobs] = useState<JobStatus[]>([]);
+    const { isOn } = useFeatures();
 
     useEffect(() => {
         const load = () => {
@@ -77,6 +79,14 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                 >
                     History
                 </Link>
+                {isOn('input.narration') && (
+                    <Link
+                        href="/create/narration"
+                        className="mt-2 w-full flex items-center justify-center gap-2 text-xs text-text-muted hover:text-text-primary py-1.5 rounded-lg border border-white/10 hover:bg-white/5"
+                    >
+                        Narration
+                    </Link>
+                )}
                 <AccountLink />
             </div>
 

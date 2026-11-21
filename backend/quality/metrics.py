@@ -39,6 +39,8 @@ def numbers_kept(hi: str, numbers: List[str]) -> List[str]:
 
 
 def has_negation(hi: str) -> bool:
+    if "नहीं" in hi or "नही" in hi:   # unambiguous even when glued to the next word ("नहींखोलो")
+        return True
     # Devanagari letters and marks, without the danda (।) and double danda (॥)
     return any(w in NEG_HI for w in re.findall("[ऀ-ॣ०-ॿ]+", hi))
 

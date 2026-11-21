@@ -372,6 +372,44 @@ export async function createJobWithSrt(
     return res.json();
 }
 
+// ── Narration style (P04) ───────────────────────────────────────────────────
+export interface NarrationScene {
+    id: string; start: number; end: number; cue_ids: string[]; english: string;
+    budget_chars: number; hi: string; problems: string[];
+}
+export interface NarrationCue { id: string; start: number; end: number; text: string; }
+export async function draftNarration(srt: string, engine = 'groq'): Promise<{ cues: NarrationCue[]; scenes: NarrationScene[]; engine: string }> {
+    const res = await fetch(`${API_BASE}/api/narration/draft`, {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ srt, engine }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    return res.json();
+}
+export async function approveNarration(passages: (NarrationScene & { selected: boolean })[]): Promise<{ srt: string; scenes: number; warnings: string[] }> {
+    const res = await fetch(`${API_BASE}/api/narration/approve`, {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
+        body: JSON.stringify({ passages }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    return res.json();
+}
+/** Voice the approved narration word for word (SRT Direct). */
+export async function dubNarration(srt: string, video: { url?: string; file?: File }): Promise<{ id: string }> {
+    const form = new FormData();
+    form.append('srt_file', new File([srt], 'narration_hi.srt', { type: 'text/plain' }));
+    form.append('sd_srt_content', srt);
+    form.append('pipeline_mode', 'srtdub');
+    form.append('srt_needs_translation', 'false');
+    form.append('source_language', 'en');
+    form.append('target_language', 'hi');
+    if (video.file) form.append('video_file', video.file);
+    if (video.url) form.append('url', video.url);
+    const res = await fetch(`${API_BASE}/api/jobs/with-srt`, { method: 'POST', credentials: 'include', headers: { ...EXTRA_HEADERS }, body: form });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Could not start the dub');
+    return res.json();
+}
+
 export async function getJob(id: string): Promise<JobStatus> {
     const res = await fetch(`${API_BASE}/api/jobs/${id}`, {
         headers: { ...EXTRA_HEADERS },

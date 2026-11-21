@@ -910,6 +910,68 @@ def account_balance(request: Request):
                 "debt_seconds": v.debt} for t, v in b.items()}
 
 
+# ── Narration style (P04) ──────────────────────────────────────────────────
+class NarrationDraftBody(BaseModel):
+    srt: str                                  # English SRT of the source (transcript or supplied)
+    engine: str = "groq"
+    scene_gap_s: float = 2.5
+    max_scene_s: float = 40.0
+
+
+class NarrationPassage(BaseModel):
+    id: str
+    start: float
+    end: float
+    hi: str
+    cue_ids: List[str] = []
+    selected: bool = True
+
+
+class NarrationApproveBody(BaseModel):
+    passages: List[NarrationPassage]
+
+
+def _narration_client(engine: str):
+    from dubbing.dialogue.translation import OpenAICompatClient
+    if engine not in OpenAICompatClient.ENDPOINTS:
+        raise HTTPException(status_code=400, detail=f"Unknown engine {engine}")
+    c = OpenAICompatClient(engine)
+    if not c.available:
+        raise HTTPException(status_code=503, detail=f"{engine} is not configured on this server")
+    return c
+
+
+@app.post("/api/narration/draft")
+def narration_draft(body: NarrationDraftBody):
+    """Scenes from the English SRT and a Hindi narration passage for each (editable preview)."""
+    from dubbing import narration as N
+    if len(body.srt) > 400_000:
+        raise HTTPException(status_code=413, detail="The SRT is too large")
+    cues = N.parse_srt_text(body.srt)
+    if not cues:
+        raise HTTPException(status_code=400, detail="The SRT has no readable cues")
+    scenes = N.scenes_from_cues(cues, gap_s=max(0.5, min(10.0, body.scene_gap_s)),
+                                max_s=max(10.0, min(120.0, body.max_scene_s)))
+    client = _narration_client(body.engine)
+    try:
+        passages = N.draft(scenes, client)
+    except N.NarrationError as e:
+        raise HTTPException(status_code=502, detail=f"Narration draft failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Narration draft failed ({type(e).__name__}: {str(e)[:160]})")
+    return {"cues": cues, "scenes": passages, "engine": body.engine}
+
+
+@app.post("/api/narration/approve")
+def narration_approve(body: NarrationApproveBody):
+    """The reviewer's passages (chosen scenes only) as the exact Hindi SRT to voice."""
+    from dubbing import narration as N
+    try:
+        return N.approve([p.model_dump() if hasattr(p, "model_dump") else p.dict() for p in body.passages])
+    except N.NarrationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ── Account deletion (L04, P09) ─────────────────────────────────────────────
 KEPT_ON_DELETION = [
     "Payment orders, receipts and the prepaid-time ledger (financial records the law requires us to keep)",

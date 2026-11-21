@@ -12,7 +12,7 @@
 {"id": "gls-02", "cat": "glossary", "en": "NASA launched the telescope in December.", "ref": "नासा ने दिसंबर में दूरबीन लॉन्च की।", "glossary": {"NASA": ["नासा", "NASA"]}}
 {"id": "gls-03", "cat": "glossary", "en": "Marie Curie won two Nobel Prizes.", "ref": "मैरी क्यूरी ने दो नोबेल पुरस्कार जीते।", "glossary": {"Marie Curie": ["मैरी क्यूरी"], "Nobel": ["नोबेल"]}}
 {"id": "gls-04", "cat": "glossary", "en": "The Roman Empire lasted for centuries.", "ref": "रोमन साम्राज्य सदियों तक चला।", "glossary": {"Roman": ["रोमन"]}}
-{"id": "gls-05", "cat": "glossary", "en": "Tokyo is the capital of Japan.", "ref": "टोक्यो जापान की राजधानी है।", "glossary": {"Tokyo": ["टोक्यो"], "Japan": ["जापान"]}}
+{"id": "gls-05", "cat": "glossary", "en": "Tokyo is the capital of Japan.", "ref": "टोक्यो जापान की राजधानी है।", "glossary": {"Tokyo": ["टोक्यो", "टोकियो"], "Japan": ["जापान", "जपान"]}}
 {"id": "q-01", "cat": "question", "en": "Where were you last night?", "ref": "कल रात तुम कहाँ थे?", "question": true}
 {"id": "q-02", "cat": "question", "en": "Why did the empire collapse so quickly?", "ref": "साम्राज्य इतनी जल्दी क्यों ढह गया?", "question": true}
 {"id": "q-03", "cat": "question", "en": "Can you hear that sound?", "ref": "क्या तुम्हें वह आवाज़ सुनाई दे रही है?", "question": true}
