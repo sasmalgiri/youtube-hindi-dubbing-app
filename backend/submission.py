@@ -391,7 +391,13 @@ def close_billing(job, ledger_factory: Callable[[], Any], save: Callable[[Any], 
         delivered = job.state == "done" and bool(getattr(job, "result_path", None)) and \
             Path(str(job.result_path)).exists()
         if delivered:
-            problem = verify_result(Path(str(job.result_path)))
+            import delivery_check
+            srt = getattr(job, "subtitles_path", None)
+            rep = delivery_check.check(Path(str(job.result_path)), srt=Path(srt) if srt else None,
+                                       paid_seconds=b.get("seconds"),
+                                       target_lang=getattr(job, "target_language", "hi") or "hi")
+            b["delivery"] = rep               # Q05: problems, warnings, metrics, sha256
+            problem = "; ".join(rep["problems"]) or None
             if problem:                       # P07: never "Complete" (or charged) on a bad output
                 delivered = False
                 job.state = "error"

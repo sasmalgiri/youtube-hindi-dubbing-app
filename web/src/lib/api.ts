@@ -209,6 +209,7 @@ export interface JobStatus {
     overall_progress: number;
     step_times?: Record<string, number>;
     skipped_steps?: Record<string, string>;
+    delivery_check?: { ok: boolean; problems: string[]; warnings: string[]; metrics: Record<string, unknown> } | null;
     message: string;
     error?: string | null;
     source_url: string;

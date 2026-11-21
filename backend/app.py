@@ -5152,6 +5152,7 @@ def get_job(job_id: str):
         "overall_progress": round(job.overall_progress, 3),
         "step_times": job.step_times,
         "skipped_steps": _skipped_steps(job),
+        "delivery_check": (getattr(job, "billing", None) or {}).get("delivery"),
         "message": job.message,
         "error": job.error,
         "source_url": job.source_url,

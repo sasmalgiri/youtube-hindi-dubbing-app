@@ -193,6 +193,16 @@ export default function JobPage() {
                     skippedSteps={status?.skipped_steps}
                 />
 
+                {status?.delivery_check && (status.delivery_check.warnings.length > 0 || status.delivery_check.problems.length > 0) && (
+                    <div className="glass-card p-4 text-sm" data-testid="delivery-check">
+                        <p className="font-medium text-text-primary mb-1">Delivery check</p>
+                        <ul className="list-disc ml-5 space-y-0.5">
+                            {status.delivery_check.problems.map((p) => <li key={p} className="text-red-300">{p}</li>)}
+                            {status.delivery_check.warnings.map((w) => <li key={w} className="text-amber-300">{w}</li>)}
+                        </ul>
+                    </div>
+                )}
+
                 {/* Resource pills */}
                 {status?.config && Object.keys(status.config).length > 0 && (
                     <div className="space-y-3">
