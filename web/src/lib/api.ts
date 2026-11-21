@@ -208,6 +208,7 @@ export interface JobStatus {
     step_progress: number;
     overall_progress: number;
     step_times?: Record<string, number>;
+    skipped_steps?: Record<string, string>;
     message: string;
     error?: string | null;
     source_url: string;
@@ -726,6 +727,7 @@ export interface SavedLink {
     added_at: number;
     preset?: LinkPreset;
     completed?: boolean;
+    delivered?: number;
 }
 
 export async function getLinks(): Promise<SavedLink[]> {
@@ -774,6 +776,8 @@ export interface Preset {
     description?: string;
     settings?: Record<string, unknown>;
     builtin?: boolean;
+    /** Set when the preset uses a module that is switched off. */
+    blocked?: string | null;
 }
 
 export async function getPresets(): Promise<Preset[]> {
@@ -1097,4 +1101,11 @@ export const startCheckout = (pack_id: string) => authFetch<CheckoutOrder>('/api
 export const verifyCheckout = (body: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) =>
     authFetch<OrderInfo>('/api/checkout/verify', { method: 'POST', body: JSON.stringify(body) });
 export const getOrders = () => authFetch<OrderInfo[]>('/api/account/orders');
+export interface DeletionPlan {
+    jobs: number; active_jobs: string[]; queued_funded: string[]; drafts: number; batches: number;
+    unused_seconds: Record<string, number>; kept: string[];
+}
+export const getDeletionPlan = () => authFetch<DeletionPlan>('/api/account/deletion');
+export const deleteAccount = (confirm_email: string) =>
+    authFetch<{ deleted: boolean; jobs_removed: number }>('/api/account/delete', { method: 'POST', body: JSON.stringify({ confirm_email }) });
 export const receiptUrl = (orderId: string) => `${API_BASE}/api/account/receipts/${encodeURIComponent(orderId)}`;

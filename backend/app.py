@@ -910,6 +910,111 @@ def account_balance(request: Request):
                 "debt_seconds": v.debt} for t, v in b.items()}
 
 
+# ── Account deletion (L04, P09) ─────────────────────────────────────────────
+KEPT_ON_DELETION = [
+    "Payment orders, receipts and the prepaid-time ledger (financial records the law requires us to keep)",
+    "Your rights confirmations for uploads (what you declared, with the date)",
+    "An entry in the deletion log with counts only (no email, no content)",
+]
+
+
+def _deletion_plan(uid: str) -> Dict[str, Any]:
+    mine = [j for j in list(JOBS.values()) if getattr(j, "owner_id", None) == uid]
+    active = [j.id for j in mine if j.state in ("running", "review_transcription", "review_translation")
+              or (j.state == "queued" and not getattr(j, "billing", None))]
+    led = _ledger()
+    try:
+        bal = {t: v.spendable for t, v in led.balances(uid).items()}
+    finally:
+        led.close()
+    return {"jobs": len(mine), "active_jobs": active,
+            "queued_funded": [j.id for j in mine if j.state == "queued" and getattr(j, "billing", None)],
+            **_submissions().owner_counts(uid),
+            "unused_seconds": bal, "kept": KEPT_ON_DELETION}
+
+
+def _erase_job_files(job) -> None:
+    for attr in ("saved_video", "subtitles_path"):
+        f = getattr(job, attr, None)
+        if f:
+            try:
+                Path(f).unlink(missing_ok=True)
+            except OSError:
+                pass
+    folder = getattr(job, "saved_folder", None)
+    try:
+        if folder and Path(folder).resolve() != SAVED_DIR.resolve() and Path(folder).is_dir() and not any(Path(folder).iterdir()):
+            Path(folder).rmdir()
+    except OSError:
+        pass
+    shutil.rmtree(OUTPUTS / job.id, ignore_errors=True)
+
+
+@app.get("/api/account/deletion")
+def account_deletion_preview(request: Request):
+    """What deleting the account removes and keeps, shown before the user confirms."""
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    return _deletion_plan(sess.user.id)
+
+
+class AccountDeleteBody(BaseModel):
+    confirm_email: str
+
+
+@app.post("/api/account/delete")
+def account_delete(body: AccountDeleteBody, request: Request):
+    from fastapi.responses import JSONResponse
+    sess = _session_of(request)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Sign in first")
+    user = sess.user
+    try:
+        typed = _accounts_mod.normalise_email(body.confirm_email or "")
+    except _accounts_mod.AuthError:
+        typed = ""
+    if typed != user.email:
+        raise HTTPException(status_code=400, detail="Type your account email exactly to confirm")
+    plan = _deletion_plan(user.id)
+    if plan["active_jobs"]:
+        raise HTTPException(status_code=409, detail=f"{len(plan['active_jobs'])} dub(s) are still running. "
+                                                    "Cancel them or wait until they finish, then delete the account.")
+    for jid in plan["queued_funded"]:           # not started: cancel and give the time back first
+        j = JOBS.get(jid)
+        if j and _queue().cancel(jid):
+            j.state, j.error = "error", "Cancelled: account deleted"
+            _store.save(j)
+            _submission.close_billing(j, _ledger, _store.save)
+    removed, bucket_failed = 0, []
+    for j in [j for j in list(JOBS.values()) if getattr(j, "owner_id", None) == user.id]:
+        if j.state in ("running", "queued"):
+            continue
+        _erase_job_files(j)
+        if (getattr(j, "billing", None) or {}).get("stored"):
+            import storage as _storage
+            try:
+                _storage.delete_prefix(_storage.job_prefix(user.id, j.id))
+            except Exception as e:
+                print(f"[DELETE] bucket cleanup failed for {j.id}: {e}", flush=True)
+                bucket_failed.append(j.id)            # logged below so the operator can finish it
+        JOBS.pop(j.id, None)
+        _store.delete(j.id)
+        removed += 1
+    purged = _submissions().purge_owner(user.id)
+    _accounts.erase_user(user.id)
+    rec = {"user_id": user.id, "at": int(time.time()), "jobs": removed, **purged,
+           "unused_seconds": plan["unused_seconds"], "bucket_cleanup_pending": bucket_failed}
+    try:
+        with open(STATE_DIR / "deletions.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"[DELETE] could not write deletion log: {e}", flush=True)
+    resp = JSONResponse({"deleted": True, "jobs_removed": removed, **purged, "kept": KEPT_ON_DELETION})
+    resp.delete_cookie(_accounts_mod.SESSION_COOKIE, path="/")
+    return resp
+
+
 # ── Creator submission + funded jobs (W2, W4, W6 core) ──────────────────────
 import submission as _submission
 
@@ -5004,6 +5109,35 @@ def _job_config_inner(job: Job) -> Dict[str, Any]:
     }
 
 
+PIPELINE_STEPS = ("download", "extract", "transcribe", "translate", "synthesize", "assemble")
+
+
+def _skipped_steps(job) -> Dict[str, str]:
+    """P07: steps a finished job never ran, each with the reason. Only for a
+    done job: while running, a missing step may simply not have started."""
+    if job.state != "done":
+        return {}
+    req = job.original_req
+    ran = set((job.step_times or {}).keys())
+    src = str(job.source_url or "")
+    sd_srt = bool(getattr(req, "sd_srt_content", "") or "")
+    en_srt = bool(getattr(req, "transcript_srt_content", "") or "")
+    needs_tr = bool(getattr(req, "srt_needs_translation", False))
+    out: Dict[str, str] = {}
+    for st in PIPELINE_STEPS:
+        if st in ran:
+            continue
+        if st == "download" and not src.startswith(("http://", "https://")):
+            out[st] = "Uploaded file: nothing to download"
+        elif st == "transcribe" and (sd_srt or en_srt):
+            out[st] = "Subtitles were supplied, so speech was not transcribed"
+        elif st == "translate" and sd_srt and not needs_tr:
+            out[st] = "Hindi subtitles were supplied, so no translation was needed"
+        else:
+            out[st] = "Not needed for this job"
+    return out
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     job = JOBS.get(job_id)
@@ -5017,6 +5151,7 @@ def get_job(job_id: str):
         "step_progress": round(job.step_progress, 3),
         "overall_progress": round(job.overall_progress, 3),
         "step_times": job.step_times,
+        "skipped_steps": _skipped_steps(job),
         "message": job.message,
         "error": job.error,
         "source_url": job.source_url,
@@ -5354,6 +5489,18 @@ def download_by_link(token: str):
         raise HTTPException(status_code=404, detail="Link not found")
     if time.time() > exp:
         raise HTTPException(status_code=410, detail="This link expired; open the job again for a new one")
+    job = JOBS.get(job_id)
+    import storage as _storage
+    if job is not None and _storage.configured():
+        b = getattr(job, "billing", None) or {}
+        if b.get("closed") == "settled" and kind not in (b.get("stored") or {}):
+            _submission._store_delivery(job, b)          # retry an earlier upload failure
+            _store.save(job)
+        key = (b.get("stored") or {}).get(kind)
+        if key:
+            from fastapi.responses import RedirectResponse
+            name = f"dubbed_{job_id}{Path(key).suffix}" if kind == "video" else f"subtitles_{job_id}.srt"
+            return RedirectResponse(_storage.presigned(key, name), status_code=302)
     return get_result(job_id) if kind == "video" else get_srt(job_id)
 
 
@@ -6325,11 +6472,18 @@ def _bg_fetch_title(link_id: str, url: str):
 
 
 @app.get("/api/links")
-def get_links():
+def get_links(request: Request):
     links = _load_links()
     completed = set(_load_completed_urls())
+    # P08: a link's count is its delivered versions (finished jobs the caller can see)
+    uid = _owner_of(request)
+    delivered: Dict[str, int] = {}
+    for j in list(JOBS.values()):
+        if j.state == "done" and _job_visible(j, uid) and j.source_url:
+            delivered[j.source_url] = delivered.get(j.source_url, 0) + 1
     for link in links:
-        link["completed"] = link["url"] in completed
+        link["delivered"] = delivered.get(link["url"], 0)
+        link["completed"] = link["url"] in completed or link["delivered"] > 0
     return links
 
 
@@ -6406,14 +6560,25 @@ from dubbing.builtin_presets import (
 
 @app.get("/api/presets")
 def get_presets():
-    """List all saved presets (name + slug)."""
-    return {"presets": _list_presets(WORK_ROOT)}
+    """List all saved presets (name + slug, plus `blocked` when it uses a switched-off module)."""
+    out = []
+    for p in _list_presets(WORK_ROOT):
+        try:
+            data = _load_preset(WORK_ROOT, p["slug"]) or {}
+        except (ValueError, OSError):
+            data = {}
+        out.append({**p, "blocked": _features.job_refusal(data.get("settings") or {})})
+    return {"presets": out}
 
 
 @app.get("/api/presets/builtin")
 def get_builtin_presets_list():
-    """List built-in read-only quality presets."""
-    return {"presets": _list_builtin_presets()}
+    """List built-in read-only quality presets (with `blocked` like /api/presets)."""
+    out = []
+    for p in _list_builtin_presets():
+        data = _get_builtin_preset(p["slug"]) or {}
+        out.append({**p, "blocked": _features.job_refusal(data.get("settings") or {})})
+    return {"presets": out}
 
 
 @app.get("/api/presets/builtin/{slug}")

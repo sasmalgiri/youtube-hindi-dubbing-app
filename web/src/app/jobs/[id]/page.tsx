@@ -190,6 +190,7 @@ export default function JobPage() {
                     isError={isError}
                     eta={eta}
                     stepTimes={status?.step_times}
+                    skippedSteps={status?.skipped_steps}
                 />
 
                 {/* Resource pills */}

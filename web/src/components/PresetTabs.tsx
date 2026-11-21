@@ -131,8 +131,10 @@ export default function PresetTabs({ currentSettings, onApply, onLanguageChange,
                                     key={p.slug}
                                     type="button"
                                     onClick={() => handleSelectPreset(p.slug, true)}
-                                    title={p.description || p.name}
-                                    className={`px-4 py-2 rounded-xl text-xs font-medium transition-all border ${
+                                    disabled={!!p.blocked}
+                                    data-blocked={p.blocked ? 'true' : undefined}
+                                    title={p.blocked || p.description || p.name}
+                                    className={`px-4 py-2 rounded-xl text-xs font-medium transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
                                         activeSlug === p.slug
                                             ? 'bg-violet-500/20 border-violet-500 text-violet-200'
                                             : 'bg-violet-500/5 border-violet-500/20 text-violet-300 hover:bg-violet-500/10 hover:border-violet-500/40'
@@ -157,7 +159,10 @@ export default function PresetTabs({ currentSettings, onApply, onLanguageChange,
                             <button
                                 type="button"
                                 onClick={() => handleSelectPreset(p.slug)}
-                                className={`px-4 py-2 rounded-xl text-xs font-medium transition-all border ${
+                                disabled={!!p.blocked}
+                                data-blocked={p.blocked ? 'true' : undefined}
+                                title={p.blocked || undefined}
+                                className={`px-4 py-2 rounded-xl text-xs font-medium transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
                                     activeSlug === p.slug
                                         ? 'bg-primary/20 border-primary text-primary-light'
                                         : 'bg-white/5 border-white/10 text-text-muted hover:bg-white/10 hover:border-white/20'

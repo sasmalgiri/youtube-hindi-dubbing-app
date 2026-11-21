@@ -20,6 +20,7 @@ interface ProgressPipelineProps {
     isError: boolean;
     eta?: string;
     stepTimes?: Record<string, number>;
+    skippedSteps?: Record<string, string>;
 }
 
 function formatStepTime(seconds: number): string {
@@ -51,7 +52,7 @@ function StepIcon({ icon, size = 16 }: { icon: string; size?: number }) {
     }
 }
 
-export default function ProgressPipeline({ currentStep, stepProgress, overallProgress, message, isComplete, isError, eta, stepTimes }: ProgressPipelineProps) {
+export default function ProgressPipeline({ currentStep, stepProgress, overallProgress, message, isComplete, isError, eta, stepTimes, skippedSteps }: ProgressPipelineProps) {
     const currentIndex = STEPS.findIndex(s => s.key === currentStep);
     const currentStepLabel = STEPS[currentIndex]?.label || currentStep;
 
@@ -106,13 +107,14 @@ export default function ProgressPipeline({ currentStep, stepProgress, overallPro
             {/* Steps */}
             <div className="flex items-center justify-between">
                 {STEPS.map((step, i) => {
-                    const isDone = isComplete || i < currentIndex;
+                    const skipReason = skippedSteps?.[step.key];
+                    const isDone = !skipReason && (isComplete || i < currentIndex);
                     const isActive = !isComplete && !isError && i === currentIndex;
                     const isPending = !isComplete && i > currentIndex;
                     const hasError = isError && i === currentIndex;
 
                     return (
-                        <div key={step.key} className="flex items-center flex-1">
+                        <div key={step.key} className="flex items-center flex-1" title={skipReason ? `Skipped: ${skipReason}` : undefined} data-skipped={skipReason ? 'true' : undefined}>
                             {/* Step circle */}
                             <div className="flex flex-col items-center">
                                 <div
@@ -154,7 +156,7 @@ export default function ProgressPipeline({ currentStep, stepProgress, overallPro
                                     isPending && 'text-text-muted/40',
                                     hasError && 'text-error/80',
                                 )}>
-                                    {isDone ? '100%' : isActive ? `${Math.round(stepProgress * 100)}%` : '0%'}
+                                    {skipReason ? 'Skipped' : isDone ? '100%' : isActive ? `${Math.round(stepProgress * 100)}%` : '0%'}
                                 </span>
 
                                 {/* Step time */}
@@ -189,6 +191,14 @@ export default function ProgressPipeline({ currentStep, stepProgress, overallPro
                     );
                 })}
             </div>
+
+            {skippedSteps && Object.keys(skippedSteps).length > 0 && (
+                <ul className="mt-4 space-y-1 text-xs text-text-muted" data-testid="skipped-steps">
+                    {STEPS.filter((s) => skippedSteps[s.key]).map((s) => (
+                        <li key={s.key}><span className="font-medium text-text-secondary">{s.label} skipped:</span> {skippedSteps[s.key]}</li>
+                    ))}
+                </ul>
+            )}
 
             {/* Current message */}
             {message && (

@@ -159,6 +159,26 @@ class SubmissionStore:
     def close(self) -> None:
         self._conn.close()
 
+    def owner_counts(self, owner_id: Optional[str]) -> Dict[str, int]:
+        return {"drafts": self._one("SELECT COUNT(*) FROM drafts WHERE owner_id IS ?", (owner_id,))[0],
+                "batches": self._one("SELECT COUNT(*) FROM batches WHERE owner_id IS ?", (owner_id,))[0]}
+
+    def purge_owner(self, owner_id: str) -> Dict[str, int]:
+        """L04: remove an account's uploads, quotes and batches. Rights
+        confirmations are kept (evidence of what the account declared)."""
+        rows = self._x("SELECT path FROM drafts WHERE owner_id=?", (owner_id,)).fetchall()
+        for (path,) in rows:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        n = self.owner_counts(owner_id)
+        self._x("DELETE FROM drafts WHERE owner_id=?", (owner_id,))
+        self._x("DELETE FROM quotes WHERE owner_id=?", (owner_id,))
+        self._x("DELETE FROM batches WHERE owner_id=?", (owner_id,))
+        self._x("DELETE FROM submissions WHERE owner_key LIKE ?", (f"{owner_id}:%",))
+        return n
+
     # drafts
     async def save_upload(self, upload, owner_id: Optional[str]) -> Dict[str, Any]:
         """Stream to disk with a byte limit and an incremental checksum, then probe."""
@@ -317,6 +337,22 @@ def run_billed(job, ledger_factory: Callable[[], Any], run: Callable[[], None], 
         close_billing(job, ledger_factory, save)
 
 
+def _store_delivery(job, b: Dict) -> None:
+    """Copy the checked output to private storage when configured. A storage
+    failure never undoes delivery: the file is still on this PC's disk and the
+    error is recorded for the operator (retried by the next download)."""
+    import storage
+    if not storage.configured():
+        return
+    srt = getattr(job, "subtitles_path", None)
+    try:
+        b["stored"] = storage.put_job_files(getattr(job, "owner_id", None), job.id,
+                                            {"video": Path(str(job.result_path)), "srt": Path(srt) if srt else None})
+        b.pop("store_error", None)
+    except Exception as e:
+        b["store_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+
+
 def verify_result(path: Path, min_seconds: float = 1.0, silence_db: float = -60.0) -> Optional[str]:
     """Check a delivered file before it counts as Complete: it decodes, has an
     audio stream, is long enough and is not silent. Returns a reason or None."""
@@ -364,6 +400,7 @@ def close_billing(job, ledger_factory: Callable[[], Any], save: Callable[[Any], 
         if delivered:
             led.settle(b["account"], b["reserve_key"])
             b["closed"] = "settled"
+            _store_delivery(job, b)
         else:
             led.release(b["account"], b["reserve_key"], note=f"job {job.id} ended as {job.state}")
             b["closed"] = "released"

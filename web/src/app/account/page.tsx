@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getBalance, getCatalog, getOrders, getSessions, receiptUrl, revokeSession, signOut, signOutEverywhere, startCheckout, verifyCheckout, type CatalogInfo, type CreditBalance, type OrderInfo, type SessionInfo } from '@/lib/api';
+import { deleteAccount, getDeletionPlan, type DeletionPlan, getBalance, getCatalog, getOrders, getSessions, receiptUrl, revokeSession, signOut, signOutEverywhere, startCheckout, verifyCheckout, type CatalogInfo, type CreditBalance, type OrderInfo, type SessionInfo } from '@/lib/api';
 import { refreshAuth, useAuth } from '@/hooks/useAuth';
 
 type RzpResponse = { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string };
@@ -38,6 +38,10 @@ export default function AccountPage() {
     const [orders, setOrders] = useState<OrderInfo[]>([]);
     const [buying, setBuying] = useState<string | null>(null);
     const [notice, setNotice] = useState<string | null>(null);
+    const [plan, setPlan] = useState<DeletionPlan | null>(null);
+    const [confirmEmail, setConfirmEmail] = useState('');
+    const [delError, setDelError] = useState<string | null>(null);
+    const [deleting, setDeleting] = useState(false);
 
     const load = useCallback(async () => {
         try {
@@ -84,6 +88,21 @@ export default function AccountPage() {
             setError(e instanceof Error ? e.message : 'Could not start checkout');
             setBuying(null);
         }
+    };
+
+    const showPlan = async () => {
+        setDelError(null);
+        try { setPlan(await getDeletionPlan()); } catch (e) { setDelError(e instanceof Error ? e.message : 'Could not load'); }
+    };
+    const doDelete = async () => {
+        setDeleting(true); setDelError(null);
+        try {
+            await deleteAccount(confirmEmail);
+            await refreshAuth();
+            router.push('/signin');
+        } catch (e) {
+            setDelError(e instanceof Error ? e.message : 'Could not delete the account');
+        } finally { setDeleting(false); }
     };
 
     const out = async (everywhere: boolean) => {
@@ -178,6 +197,37 @@ export default function AccountPage() {
                     <button type="button" onClick={() => out(false)} className="text-xs px-3 py-1.5 rounded-lg border border-white/10 text-text-muted hover:bg-white/5">Sign out</button>
                     <button type="button" onClick={() => out(true)} className="text-xs px-3 py-1.5 rounded-lg border border-red-500/30 text-red-300 hover:bg-red-500/10">Sign out everywhere</button>
                 </div>
+            </section>
+
+            <section className="glass-card p-4 border border-red-500/20" data-testid="delete-account">
+                <h2 className="text-sm font-semibold text-red-300 mb-2">Delete account</h2>
+                {!plan ? (
+                    <button type="button" onClick={showPlan} className="text-xs px-3 py-1.5 rounded-lg border border-red-500/30 text-red-300 hover:bg-red-500/10">See what will be deleted</button>
+                ) : (
+                    <div className="space-y-3 text-sm">
+                        <p className="text-text-secondary">This removes your {plan.jobs} dub(s) and their files, {plan.drafts} upload(s), {plan.batches} batch(es), your email and your sign-ins. It cannot be undone.</p>
+                        {Object.entries(plan.unused_seconds).some(([, s]) => s > 0) && (
+                            <p className="text-amber-300">Unused prepaid time is lost: {Object.entries(plan.unused_seconds).filter(([, s]) => s > 0).map(([t, s]) => `${fmtTime(s)} ${t}`).join(', ')}.</p>
+                        )}
+                        {plan.active_jobs.length > 0 && (
+                            <p className="text-red-300">{plan.active_jobs.length} dub(s) are still running. Cancel them or wait until they finish.</p>
+                        )}
+                        <div>
+                            <p className="text-xs text-text-muted mb-1">Kept:</p>
+                            <ul className="list-disc ml-5 text-xs text-text-muted">{plan.kept.map((k) => <li key={k}>{k}</li>)}</ul>
+                        </div>
+                        <label className="block text-xs text-text-muted">Type your email to confirm
+                            <input value={confirmEmail} onChange={(e) => setConfirmEmail(e.target.value)} aria-label="Confirm email"
+                                className="mt-1 w-full px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-text-primary" />
+                        </label>
+                        <button type="button" onClick={doDelete}
+                            disabled={deleting || plan.active_jobs.length > 0 || confirmEmail.trim().toLowerCase() !== (user?.email || '').toLowerCase()}
+                            className="text-xs px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/40 text-red-200 disabled:opacity-40">
+                            {deleting ? 'Deleting…' : 'Delete my account'}
+                        </button>
+                    </div>
+                )}
+                {delError && <p role="alert" className="text-xs text-red-300 mt-2">{delError}</p>}
             </section>
         </main>
     );

@@ -239,7 +239,7 @@ export default function SavedLinks({ onSelect, onJobStarted, getCurrentSettings 
                                                         <p className="text-sm text-text-primary truncate">{link.title}</p>
                                                     )}
                                                     {link.completed && (
-                                                        <span className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full flex-shrink-0">Done</span>
+                                                        <span className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded-full flex-shrink-0" data-testid="delivered-count">{link.delivered ? `${link.delivered} delivered` : 'Done'}</span>
                                                     )}
                                                 </div>
                                                 <p className="text-xs text-text-muted truncate">{link.url}</p>

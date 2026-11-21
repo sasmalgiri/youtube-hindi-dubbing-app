@@ -319,6 +319,18 @@ class AccountStore:
         self._conn.execute("UPDATE users SET deleted_at=? WHERE id=? AND deleted_at IS NULL", (self._now(), user_id))
         self.revoke(user_id)
 
+    def erase_user(self, user_id: str) -> None:
+        """L04: close access and remove personal data. The id stays (it keys
+        the ledger and receipts, which are kept as financial records); the
+        email, name and Google link are replaced, so the same email can sign
+        up again as a new account."""
+        u = self._conn.execute("SELECT email FROM users WHERE id=?", (user_id,)).fetchone()
+        self.revoke(user_id)
+        self._conn.execute("UPDATE users SET deleted_at=COALESCE(deleted_at, ?), email=?, name='', google_sub=NULL "
+                           "WHERE id=?", (self._now(), f"deleted-{user_id}@invalid", user_id))
+        if u:
+            self._conn.execute("DELETE FROM email_codes WHERE email=?", (u[0],))
+
 
 def _google_verify(credential: str, client_id: str) -> Dict:
     from google.auth.transport import requests as g_requests
