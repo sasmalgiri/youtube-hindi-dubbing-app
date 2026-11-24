@@ -88,6 +88,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                     </Link>
                 )}
                 <AccountLink />
+                <Link href="/legal" className="mt-2 block text-center text-[11px] text-text-muted hover:text-text-primary">Terms · Refunds · Privacy</Link>
             </div>
 
             {/* Recent Jobs */}

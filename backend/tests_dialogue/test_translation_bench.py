@@ -66,3 +66,29 @@ def test_other_languages_are_scored_by_their_own_rules():
     assert ja["checks"]["negation"] and ja["checks"]["target_script"]
     bad = M.score_item(corpus["nar-03"], "但是国王犯了一个可怕的错误。", "bn")
     assert bad["checks"]["target_script"] is False
+
+
+def test_simulated_review_aggregates_two_judges_and_never_signs_off(tmp_path):
+    import json as _j
+    from quality import llm_review as LR
+    import languages
+
+    class Judge:
+        def __init__(self, name, scores):
+            self.model_id, self.scores = name, scores
+
+        def complete(self, system, user):
+            assert "data" in system and "Spanish" in system
+            return _j.dumps({"reviews": [{"id": i, "accuracy": a, "natural": n, "problems": p} for i, (a, n, p) in self.scores.items()]})
+
+    items = [{"id": "a", "en": "Hello.", "hi": "Hola."}, {"id": "b", "en": "It costs 45.", "hi": "Cuesta 54."}]
+    r = LR.review(items, "es", [Judge("j1", {"a": (5, 5, []), "b": (1, 4, ["wrong number"])}),
+                                Judge("j2", {"a": (5, 4, []), "b": (4, 4, [])})])
+    assert r["reviewed"] == 2 and r["accuracy"] == 3.75 and [l["id"] for l in r["weak"]] == ["b"]
+    assert [l["id"] for l in r["disagreements"]] == ["b"] and "wrong number" in r["weak"][0]["problems"]
+    assert "not native reviewers" in LR.markdown(r)
+    before = languages.sellable("es")
+    rep = tmp_path / "rep.json"
+    rep.write_text(_j.dumps({"target": "es", "runs": [{"items": [{"id": "num-03", "hi": "Cuesta 45 dólares, no 54."}]}]}))
+    assert LR.main([str(rep)], clients=[Judge("j1", {"num-03": (5, 5, [])})]) == 0
+    assert languages.sellable("es") == before is False
