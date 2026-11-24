@@ -60,7 +60,8 @@ def test_catalog_lists_packs_and_checkout_state(pay):
     c, _ = pay["client"]("a@example.com")
     cat = c.get("/api/catalog").json()
     assert {p["id"] for p in cat["packs"]} == {"std_4h", "prem_4h", "std_1h"}
-    assert cat["checkout"] == {"configured": True, "test_mode": True}
+    assert cat["checkout"] == {"configured": True, "test_mode": True, "simulated": False,
+                               "script_url": "https://checkout.razorpay.com/v1/checkout.js"}
 
 
 def test_not_configured_refuses_cleanly(pay, monkeypatch):
