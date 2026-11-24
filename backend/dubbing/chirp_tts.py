@@ -60,9 +60,18 @@ def request_body(text: str, voice: str, sample_rate: int, speaking_rate: Optiona
     return {"input": {"text": text}, "voice": {"languageCode": lang, "name": voice}, "audioConfig": audio}
 
 
+RETRY_STATUS = (429, 500, 502, 503, 504)
+MAX_ATTEMPTS = 3
+MAX_WAIT_S = 10.0
+
+
 def synthesize(text: str, voice: str, sample_rate: int = 24000, *, key: Optional[str] = None,
-               post: Optional[Callable] = None, timeout: int = 60) -> bytes:
-    """Returns WAV bytes (LINEAR16 with header). Raises ChirpError with a short reason."""
+               post: Optional[Callable] = None, timeout: int = 60,
+               sleep: Optional[Callable[[float], None]] = None) -> bytes:
+    """Returns WAV bytes (LINEAR16 with header). Raises ChirpError with a short reason.
+    Rate limits and server errors are retried briefly (Retry-After honoured up to
+    MAX_WAIT_S); a longer wait means the quota is spent and the caller falls back."""
+    import time as _time
     key = key if key is not None else api_key()
     if not key:
         raise ChirpError("GOOGLE_TTS_API_KEY not set")
@@ -71,7 +80,25 @@ def synthesize(text: str, voice: str, sample_rate: int = 24000, *, key: Optional
     if post is None:
         import requests
         post = requests.post
-    r = post(URL, params={"key": key}, json=request_body(text, voice, sample_rate), timeout=timeout)
+    sleep = sleep or _time.sleep
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            r = post(URL, params={"key": key}, json=request_body(text, voice, sample_rate), timeout=timeout)
+        except Exception as e:                      # network error: retry like a 5xx
+            if attempt == MAX_ATTEMPTS - 1:
+                raise ChirpError(f"Google TTS unreachable ({type(e).__name__})")
+            sleep(min(MAX_WAIT_S, 1.0 * 2 ** attempt))
+            continue
+        if r.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS - 1:
+            try:
+                wait = float((getattr(r, "headers", None) or {}).get("Retry-After", 0)) or 1.0 * 2 ** attempt
+            except (TypeError, ValueError):
+                wait = 1.0 * 2 ** attempt
+            if wait > MAX_WAIT_S:
+                break
+            sleep(wait)
+            continue
+        break
     if r.status_code != 200:
         # never echo the key; the body names the problem (quota, disabled API, bad voice)
         raise ChirpError(f"Google TTS HTTP {r.status_code}: {r.text[:160]}")

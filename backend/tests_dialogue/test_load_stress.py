@@ -54,8 +54,47 @@ class ChaosRunner:
             job.result_path, job.state = out, "done"
 
 
+class Serving:
+    """A real restart stops serving requests before it reloads; requests wait."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.open, self.inflight = True, 0
+
+    def enter(self):
+        with self.cv:
+            self.cv.wait_for(lambda: self.open)
+            self.inflight += 1
+
+    def leave(self):
+        with self.cv:
+            self.inflight -= 1
+            self.cv.notify_all()
+
+    def close(self):
+        with self.cv:
+            self.open = False
+            self.cv.wait_for(lambda: self.inflight == 0)
+
+    def reopen(self):
+        with self.cv:
+            self.open = True
+            self.cv.notify_all()
+
+
+SERVING = Serving()
+
+
 def _restart(env):
-    """Stop taking work, let running jobs finish, reload everything from disk."""
+    """Stop serving, let running jobs finish, reload everything from disk."""
+    SERVING.close()
+    try:
+        _reload(env)
+    finally:
+        SERVING.reopen()
+
+
+def _reload(env):
     app = env["app"]
     q = env["queue"]
     q.stop()
@@ -89,6 +128,7 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
         while True:
             for _ in range(JOBS_PER_ROUND):
                 n += 1
+                SERVING.enter()
                 try:
                     q = c.post("/api/quotes", json={"draft_id": did})
                     if q.status_code != 200:
@@ -106,6 +146,8 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
                 except Exception as e:
                     with lock:
                         errors.append(repr(e)[:120])
+                finally:
+                    SERVING.leave()
             if time.time() >= stop_at:
                 return
             time.sleep(random.uniform(0.0, 0.3))

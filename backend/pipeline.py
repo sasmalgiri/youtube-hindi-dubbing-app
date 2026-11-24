@@ -11442,6 +11442,7 @@ class Pipeline:
         hosted = os.environ.get("VOICEDUB_PROFILE", "").strip().lower() == "hosted"
         tts_data = []
         fallbacks = 0
+        unvoiced = []
         for i, seg in enumerate(segments):
             self._check_cancelled()
             text = seg.get("text_translated", seg.get("text", "")).strip()
@@ -11471,6 +11472,7 @@ class Pipeline:
                 if ok:
                     raw = mp3
             if not ok:
+                unvoiced.append(i + 1)
                 continue
             self._run_proc([self._ffmpeg, "-y", "-i", str(raw), "-ar", str(self.SAMPLE_RATE),
                             "-ac", str(self.N_CHANNELS), str(wav_path)], check=True, capture_output=True)
@@ -11483,6 +11485,11 @@ class Pipeline:
                          f"Synthesized {i + 1}/{len(segments)} segments (Google {voice.split('-')[-1]})...")
         if fallbacks:
             self._report("synthesize", 0.9, f"Google TTS: {fallbacks} segment(s) used the fallback voice")
+        if unvoiced:
+            msg = f"{len(unvoiced)} line(s) could not be voiced by any provider (lines {unvoiced[:10]})"
+            if hosted:      # never deliver (or charge for) a dub with missing lines
+                raise RuntimeError(msg)
+            self._report("synthesize", 0.9, msg + " — they are silent in this dub")
         return tts_data
 
     # ── Fish Speech 1.5 ────────────────────────────────────────────────
