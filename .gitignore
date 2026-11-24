@@ -114,3 +114,5 @@ backend/queue.db*
 backend/manifests/
 backend/drafts/
 backend/features.json
+backend/backups/
+backups/

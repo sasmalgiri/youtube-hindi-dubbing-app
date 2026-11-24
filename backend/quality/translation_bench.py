@@ -98,6 +98,9 @@ def main(argv=None, translators: Optional[Dict[str, Callable]] = None) -> int:
     ap.add_argument("--baseline", default=None, help="earlier report JSON to compare with")
     ap.add_argument("--fail-drop", type=float, default=None, help="exit 1 if check pass rate drops by more than this")
     a = ap.parse_args(argv)
+    if translators is None:          # real engines: same keys as the server (backend/.env), like app.py
+        from setup_check import _load_env_file
+        _load_env_file()
     corpus = load_corpus(Path(a.corpus))
     runs = []
     out = Path(a.out)
