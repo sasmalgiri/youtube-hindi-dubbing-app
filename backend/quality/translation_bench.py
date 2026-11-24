@@ -30,7 +30,7 @@ def load_corpus(path: Path = CORPUS) -> List[Dict]:
     return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
 
 
-def pipeline_translator(engine: str) -> Callable[[List[str]], List[str]]:
+def pipeline_translator(engine: str, target: str = "hi") -> Callable[[List[str]], List[str]]:
     """Translate a list of English lines with the pipeline's own code path."""
     import tempfile
     from pipeline import Pipeline, PipelineConfig
@@ -38,7 +38,7 @@ def pipeline_translator(engine: str) -> Callable[[List[str]], List[str]]:
     def run(lines: List[str]) -> List[str]:
         with tempfile.TemporaryDirectory() as td:
             cfg = PipelineConfig(source="bench.mp4", work_dir=Path(td) / "w", output_path=Path(td) / "o.mp4",
-                                 translation_engine=engine, source_language="en", target_language="hi")
+                                 translation_engine=engine, source_language="en", target_language=target)
             p = Pipeline(cfg)
             # one segment per line, spaced apart so fragment merging never joins them
             segs = [{"start": i * 10.0, "end": i * 10.0 + 6.0, "text": t} for i, t in enumerate(lines)]
@@ -48,15 +48,15 @@ def pipeline_translator(engine: str) -> Callable[[List[str]], List[str]]:
     return run
 
 
-def run_engine(name: str, translate: Callable[[List[str]], List[str]], corpus: List[Dict]) -> Dict:
+def run_engine(name: str, translate: Callable[[List[str]], List[str]], corpus: List[Dict], target: str = "hi") -> Dict:
     t0 = time.time()
     err = None
     try:
         out = translate([c["en"] for c in corpus])
     except Exception as e:
         out, err = [""] * len(corpus), f"{type(e).__name__}: {str(e)[:200]}"
-    scored = [metrics.score_item(c, h) for c, h in zip(corpus, out)]
-    return {"engine": name, "seconds": round(time.time() - t0, 1), "error": err,
+    scored = [metrics.score_item(c, h, target) for c, h in zip(corpus, out)]
+    return {"engine": name, "target": target, "seconds": round(time.time() - t0, 1), "error": err,
             "summary": metrics.summarize(scored), "items": scored}
 
 
@@ -72,7 +72,7 @@ def compare(cur: Dict, base: Dict) -> Dict[str, Dict]:
 
 
 def markdown(report: Dict) -> str:
-    L = [f"# Translation benchmark — corpus {report['corpus']} ({report['items']} lines)", "",
+    L = [f"# Translation benchmark — en→{report.get('target', 'hi')}, corpus {report['corpus']} ({report['items']} lines)", "",
          f"Run {report['when']}. Automatic checks only; naturalness needs the Hindi reviewers.", "",
          "| Engine | Checks passed | chrF (drift) | Seconds | Error |", "|---|---|---|---|---|"]
     for r in report["runs"]:
@@ -94,6 +94,7 @@ def main(argv=None, translators: Optional[Dict[str, Callable]] = None) -> int:
     ap = argparse.ArgumentParser(description="Hindi translation benchmark")
     ap.add_argument("--engines", default="groq", help="comma list, e.g. groq,gemini,cerebras")
     ap.add_argument("--corpus", default=str(CORPUS))
+    ap.add_argument("--target", default="hi", help="target language code from languages.py (hi, es, bn, ar, ja, ...)")
     ap.add_argument("--out", default=str(REPORTS))
     ap.add_argument("--baseline", default=None, help="earlier report JSON to compare with")
     ap.add_argument("--fail-drop", type=float, default=None, help="exit 1 if check pass rate drops by more than this")
@@ -105,8 +106,8 @@ def main(argv=None, translators: Optional[Dict[str, Callable]] = None) -> int:
     runs = []
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    stem = f"translation_{time.strftime('%Y%m%d_%H%M%S')}"
-    report = {"corpus": Path(a.corpus).stem, "items": len(corpus),
+    stem = f"translation_{a.target}_{time.strftime('%Y%m%d_%H%M%S')}"
+    report = {"corpus": Path(a.corpus).stem, "items": len(corpus), "target": a.target,
               "when": time.strftime("%Y-%m-%d %H:%M:%S"), "runs": runs}
 
     def save():   # after every engine, so a hung provider never loses earlier results
@@ -114,9 +115,9 @@ def main(argv=None, translators: Optional[Dict[str, Callable]] = None) -> int:
         (out / f"{stem}.md").write_text(markdown(report), encoding="utf-8")
 
     for e in [x.strip() for x in a.engines.split(",") if x.strip()]:
-        tr = (translators or {}).get(e) or pipeline_translator(e)
+        tr = (translators or {}).get(e) or pipeline_translator(e, a.target)
         print(f"[bench] {e}: translating {len(corpus)} lines...", flush=True)
-        runs.append(run_engine(e, tr, corpus))
+        runs.append(run_engine(e, tr, corpus, a.target))
         s = runs[-1]["summary"]
         print(f"[bench] {e}: checks {s['check_pass_rate']:.1%}, chrF {s['chrf_mean']}"
               f"{' — ' + runs[-1]['error'] if runs[-1]['error'] else ''}", flush=True)

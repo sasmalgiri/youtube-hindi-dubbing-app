@@ -225,7 +225,8 @@ class SubmissionStore:
 
     # quotes
     def make_quote(self, *, draft_id: str, owner_id: Optional[str], languages: List[str], minutes: int,
-                   style: str, quality: str, batch: bool, available: Dict[str, int]) -> Dict[str, Any]:
+                   style: str, quality: str, batch: bool, available: Dict[str, int],
+                   currency: str = "INR") -> Dict[str, Any]:
         from billing import catalog
         from billing.quote import QuoteRefused, make_quote
         d = self.draft(draft_id, owner_id)
@@ -233,7 +234,7 @@ class SubmissionStore:
         try:
             q = make_quote(account_id=owner_id or "local", source_id=d["sha256"], source_duration=d["duration"],
                            languages=languages, style=style, quality=quality, start=0, end=end, batch=batch,
-                           available=available, now=self._now())
+                           available=available, now=self._now(), currency=currency)
         except (QuoteRefused, catalog.NotPriced) as e:
             raise SubmitError(str(e), 422)
         body = q.to_dict()

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import catalog
+from . import tax as _tax
 
 API = "https://api.razorpay.com/v1"
 
@@ -138,6 +139,10 @@ class PaymentStore:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(orders)")}
+        for col in ("country", "tax_label"):             # worldwide release: add without losing old rows
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
         self._lock = threading.RLock()
         self._ledger = ledger_factory
         self._create_order = create_order
@@ -157,38 +162,45 @@ class PaymentStore:
             return dict(zip([c[0] for c in cur.description], r)) if r else None
 
     # ── checkout ──
-    def create(self, owner_id: str, pack_id: str) -> Dict[str, Any]:
+    def create(self, owner_id: str, pack_id: str, country: Optional[str] = None) -> Dict[str, Any]:
         if not configured():
             raise PaymentError("Checkout is not configured yet", 503)
         try:
             p = catalog.pack(pack_id)
         except KeyError:
             raise PaymentError("Unknown pack", 404)
+        cc = (country or "IN").upper()
+        currency = catalog.sale_currency(cc)
+        if currency is None:
+            raise PaymentError(f"Buying from {cc} is not open yet", 409)
+        price = catalog.pack_price(p.id, currency)
+        rule = _tax.rule(cc)
         oid = "o_" + secrets.token_hex(8)
-        tax = catalog.tax_inclusive_share(p.price_minor)
+        tax = _tax.tax_minor(price, rule)
         now = self._now()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO orders(id, owner_id, pack_id, credit_type, seconds, amount_minor, tax_minor, currency, "
-                "price_version, status, created_at) VALUES (?,?,?,?,?,?,?,?,?, 'created', ?)",
-                (oid, owner_id, p.id, p.credit_type, p.seconds, p.price_minor, tax, p.currency,
-                 catalog.PRICE_VERSION, now))
+                "price_version, status, created_at, country, tax_label) VALUES (?,?,?,?,?,?,?,?,?, 'created', ?,?,?)",
+                (oid, owner_id, p.id, p.credit_type, p.seconds, price, tax, currency,
+                 catalog.price_version(currency), now, cc, rule["label"]))
         try:
-            rz = self._create_order(p.price_minor, p.currency, oid, {"order": oid, "pack": p.id})
+            rz = self._create_order(price, currency, oid, {"order": oid, "pack": p.id})
         except PaymentError:
             self._mark(oid, "failed", "order creation failed")
             raise
         except Exception as e:
             self._mark(oid, "failed", f"order creation failed: {type(e).__name__}")
             raise PaymentError("Could not reach the payment provider; try again", 502)
-        if int(rz.get("amount", -1)) != p.price_minor:
+        if int(rz.get("amount", -1)) != price:
             self._mark(oid, "failed", "provider amount mismatch")
             raise PaymentError("Payment provider returned a different amount", 502)
         with self._lock:
             self._conn.execute("UPDATE orders SET rzp_order_id=? WHERE id=?", (rz["id"], oid))
         return {"order_id": oid, "razorpay_order_id": rz["id"], "key_id": keys()["key_id"],
-                "amount_minor": p.price_minor, "currency": p.currency, "pack_id": p.id,
-                "display": {"amount": catalog.fmt_money(p.price_minor), "tax": catalog.fmt_money(tax),
+                "amount_minor": price, "currency": currency, "pack_id": p.id, "country": cc,
+                "display": {"amount": catalog.fmt_money(price, currency), "tax": catalog.fmt_money(tax, currency),
+                            "tax_label": rule["label"],
                             "time": catalog.fmt_seconds(p.seconds)}, "test_mode": test_mode()}
 
     def _mark(self, oid: str, status: str, note: str) -> None:
@@ -319,9 +331,11 @@ class PaymentStore:
         return {"id": o["id"], "pack_id": o["pack_id"], "credit_type": o["credit_type"], "seconds": o["seconds"],
                 "amount_minor": o["amount_minor"], "tax_minor": o["tax_minor"], "currency": o["currency"],
                 "status": o["status"], "receipt_no": o["receipt_no"], "paid_at": o["paid_at"],
-                "payment_id": o["payment_id"],
-                "display": {"amount": catalog.fmt_money(o["amount_minor"]), "tax": catalog.fmt_money(o["tax_minor"]),
-                            "net": catalog.fmt_money(o["amount_minor"] - o["tax_minor"]),
+                "payment_id": o["payment_id"], "country": o.get("country") or "IN",
+                "display": {"amount": catalog.fmt_money(o["amount_minor"], o["currency"]),
+                            "tax": catalog.fmt_money(o["tax_minor"], o["currency"]),
+                            "net": catalog.fmt_money(o["amount_minor"] - o["tax_minor"], o["currency"]),
+                            "tax_label": o.get("tax_label") or "GST 18% (included)",
                             "time": catalog.fmt_seconds(o["seconds"])}}
 
 
@@ -342,7 +356,8 @@ table{{width:100%;border-collapse:collapse}}td{{padding:6px 0;border-bottom:1px 
 <p>Receipt no. <strong>{html.escape(o['receipt_no'] or '')}</strong><br>Date {when}<br>Billed to {html.escape(buyer_email)}<br>
 Payment ref {html.escape(o['payment_id'] or '')}</p>{status}
 <table><tr><td>{kind} prepaid dubbing time, {d['time']}</td><td>{d['net']}</td></tr>
-<tr><td>GST 18% (included)</td><td>{d['tax']}</td></tr>
+<tr><td>{html.escape(d['tax_label'])}</td><td>{d['tax'] if o['tax_minor'] else '—'}</td></tr>
 <tr><td><strong>Total paid</strong></td><td><strong>{d['amount']}</strong></td></tr></table>
+{('<p>' + html.escape(_tax.rule(o.get('country')).get('note', '')) + '</p>') if o.get('country', 'IN') != 'IN' else ''}
 {('<p>' + html.escape(os.environ.get('VOICEDUB_RECEIPT_NOTE', '')) + '</p>') if os.environ.get('VOICEDUB_RECEIPT_NOTE') else ''}
 <button onclick="print()">Print / save as PDF</button></body></html>"""

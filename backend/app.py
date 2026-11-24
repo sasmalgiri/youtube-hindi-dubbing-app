@@ -829,16 +829,63 @@ def get_languages():
     return {"flagship": _languages.FLAGSHIP, "languages": _languages.describe(_features.profile() == "hosted")}
 
 
+def _buyer_country(request: Request, override: Optional[str] = None) -> str:
+    """Explicit ?country= (catalog preview), else the account's billing country, else IN."""
+    if override and re.fullmatch(r"[A-Za-z]{2}", override):
+        return override.upper()
+    sess = _session_of(request)
+    if sess is not None:
+        cc = _accounts.billing_country(sess.user.id)
+        if cc:
+            return cc
+    return "IN"
+
+
 @app.get("/api/catalog")
-def get_catalog():
-    from billing import catalog
-    return {"price_version": catalog.PRICE_VERSION, "currency": catalog.CURRENCY,
+def get_catalog(request: Request, country: Optional[str] = None):
+    """Packs priced for the buyer's country (currency + tax rule). Seconds are
+    the same everywhere; a country whose currency is not enabled is shown as
+    not on sale yet instead of being guessed into another currency."""
+    from billing import catalog, tax
+    cc = _buyer_country(request, country)
+    cur = catalog.sale_currency(cc)
+    rule = tax.rule(cc)
+    packs = []
+    for p in catalog.PACKS.values():
+        item = {"id": p.id, "credit_type": p.credit_type, "seconds": p.seconds}
+        if cur:
+            price = catalog.pack_price(p.id, cur)
+            item.update(price_minor=price, display={
+                "price": catalog.fmt_money(price, cur), "time": catalog.fmt_seconds(p.seconds),
+                "tax": catalog.fmt_money(tax.tax_minor(price, rule), cur), "tax_label": rule["label"]})
+        packs.append(item)
+    return {"price_version": catalog.price_version(cur) if cur else None, "currency": cur, "country": cc,
+            "on_sale": cur is not None, "tax": {"label": rule["label"], "note": rule["note"]},
+            "currencies": catalog.enabled_currencies(),
             "checkout": {"configured": _payments.configured(), "test_mode": _payments.test_mode(),
                          "simulated": _payments.simulated(), "script_url": _payments.checkout_script_url()},
-            "packs": [{"id": p.id, "credit_type": p.credit_type, "seconds": p.seconds, "price_minor": p.price_minor,
-                       "display": {"price": catalog.fmt_money(p.price_minor), "time": catalog.fmt_seconds(p.seconds),
-                                   "tax": catalog.fmt_money(catalog.tax_inclusive_share(p.price_minor))}}
-                      for p in catalog.PACKS.values()]}
+            "packs": packs}
+
+
+class CountryBody(BaseModel):
+    country: str
+
+
+@app.get("/api/account/billing-country")
+def get_billing_country(request: Request):
+    sess = _signed_in(request)
+    return {"country": _accounts.billing_country(sess.user.id)}
+
+
+@app.put("/api/account/billing-country")
+def put_billing_country(body: CountryBody, request: Request):
+    sess = _signed_in(request)
+    try:
+        cc = _accounts.set_billing_country(sess.user.id, body.country)
+    except _accounts_mod.AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    from billing import catalog
+    return {"country": cc, "currency": catalog.sale_currency(cc), "on_sale": catalog.sale_currency(cc) is not None}
 
 
 class CheckoutRequest(BaseModel):
@@ -849,7 +896,7 @@ class CheckoutRequest(BaseModel):
 def start_checkout(body: CheckoutRequest, request: Request):
     sess = _signed_in(request)
     try:
-        out = _payments_store().create(sess.user.id, body.pack_id)
+        out = _payments_store().create(sess.user.id, body.pack_id, _buyer_country(request))
     except _payments.PaymentError as e:
         _pay_error(e)
     out["prefill"] = {"email": sess.user.email, "name": sess.user.name or ""}
@@ -1181,9 +1228,11 @@ def create_quote(body: QuoteRequest, request: Request):
         if why:
             raise HTTPException(status_code=422, detail=why)
     try:
+        from billing import catalog as _cat
         q = _submissions().make_quote(draft_id=body.draft_id, owner_id=owner, languages=body.languages,
                                       minutes=body.minutes, style=body.style, quality=body.quality,
-                                      batch=False, available=available)
+                                      batch=False, available=available,
+                                      currency=_cat.sale_currency(_buyer_country(request)) or "INR")
     except _submission.SubmitError as e:
         _submit_error(e)
     c = _queue().counts()
@@ -1229,7 +1278,7 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
         st.record_rights(owner, draft_id, body.rights_accepted, body.rights_version)
         if q["cash_minor"] > 0:
             raise _submission.SubmitError(
-                f"Your balance does not cover this job ({catalog.fmt_money(q['cash_minor'])} due). "
+                f"Your balance does not cover this job ({catalog.fmt_money(q['cash_minor'], q.get('currency') or 'INR')} due). "
                 f"Buy prepaid time first; checkout opens with the Razorpay step.", 402)
         d = st.draft(draft_id, owner)
         hosted = _features.profile() == "hosted"

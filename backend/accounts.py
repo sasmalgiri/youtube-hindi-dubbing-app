@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS email_codes (
     used_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS email_codes_email ON email_codes(email, created_at);
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id          TEXT PRIMARY KEY,
+    billing_country  TEXT,
+    updated_at       INTEGER NOT NULL
+);
 """
 
 
@@ -319,6 +324,19 @@ class AccountStore:
         self._conn.execute("UPDATE users SET deleted_at=? WHERE id=? AND deleted_at IS NULL", (self._now(), user_id))
         self.revoke(user_id)
 
+    def billing_country(self, user_id: str) -> Optional[str]:
+        r = self._conn.execute("SELECT billing_country FROM profiles WHERE user_id=?", (user_id,)).fetchone()
+        return r[0] if r else None
+
+    def set_billing_country(self, user_id: str, country: str) -> str:
+        cc = (country or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", cc):
+            raise AuthError("Choose a country")
+        self._conn.execute("INSERT INTO profiles(user_id, billing_country, updated_at) VALUES (?,?,?) "
+                           "ON CONFLICT(user_id) DO UPDATE SET billing_country=excluded.billing_country, "
+                           "updated_at=excluded.updated_at", (user_id, cc, self._now()))
+        return cc
+
     def erase_user(self, user_id: str) -> None:
         """L04: close access and remove personal data. The id stays (it keys
         the ledger and receipts, which are kept as financial records); the
@@ -330,6 +348,7 @@ class AccountStore:
                            "WHERE id=?", (self._now(), f"deleted-{user_id}@invalid", user_id))
         if u:
             self._conn.execute("DELETE FROM email_codes WHERE email=?", (u[0],))
+        self._conn.execute("DELETE FROM profiles WHERE user_id=?", (user_id,))
 
 
 def _google_verify(credential: str, client_id: str) -> Dict:
