@@ -6248,6 +6248,21 @@ class Pipeline:
         return restored_count
 
     def _translate_segments(self, segments):
+        """Translate with the chosen engine, then check every line and repair
+        broken ones (wrong script, model notes, dropped numbers, untranslated)."""
+        self._translate_segments_raw(segments)
+        src = (self.cfg.source_language or "").split("-")[0]
+        tgt = (self.cfg.target_language or "").split("-")[0]
+        if not tgt or src == tgt:
+            return
+        try:
+            from dubbing import mt_guard
+            stats = mt_guard.guard(segments, tgt, report=lambda m: self._report("translate", 0.99, m))
+            self._mt_guard_stats = stats
+        except Exception as e:   # the guard must never break a job
+            print(f"[Translate] guard skipped: {e}", flush=True)
+
+    def _translate_segments_raw(self, segments):
         """Translate each segment individually, preserving timestamps for sync.
 
         Respects self.cfg.translation_engine setting.

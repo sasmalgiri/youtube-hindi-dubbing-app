@@ -84,6 +84,21 @@ def test_mode() -> bool:
     return keys()["key_id"].startswith("rzp_test_")
 
 
+def api_base() -> str:
+    """RAZORPAY_API_BASE points at a simulator (sim/razorpay_sim.py). Honoured
+    only with test keys, so a live key can never talk to anything but Razorpay."""
+    alt = os.environ.get("RAZORPAY_API_BASE", "").strip().rstrip("/")
+    return alt if (alt and test_mode()) else API
+
+
+def simulated() -> bool:
+    return api_base() != API
+
+
+def checkout_script_url() -> str:
+    return f"{api_base()}/checkout.js" if simulated() else "https://checkout.razorpay.com/v1/checkout.js"
+
+
 def payment_signature_ok(order_id: str, payment_id: str, signature: str, secret: str) -> bool:
     if not (order_id and payment_id and signature and secret):
         return False
@@ -101,7 +116,7 @@ def webhook_signature_ok(raw_body: bytes, signature: str, secret: str) -> bool:
 def _http_create_order(amount_minor: int, currency: str, receipt: str, notes: Dict[str, str]) -> Dict[str, Any]:
     import requests
     k = keys()
-    r = requests.post(f"{API}/orders", auth=(k["key_id"], k["key_secret"]), timeout=20,
+    r = requests.post(f"{api_base()}/orders", auth=(k["key_id"], k["key_secret"]), timeout=20,
                       json={"amount": amount_minor, "currency": currency, "receipt": receipt, "notes": notes})
     if r.status_code >= 400:
         raise PaymentError(f"Razorpay refused the order (HTTP {r.status_code})", 502)

@@ -179,3 +179,13 @@ def test_reconciliation_clean_then_flags_problems(pay):
     assert any("still 'created'" in x for x in res["orders"])
     assert any("lostjob" in x for x in res["reservations"])
     assert reconcile.main(["--state", str(pay["tmp"])]) == 1
+
+
+def test_simulator_url_only_honoured_with_test_keys(monkeypatch):
+    monkeypatch.setenv("RAZORPAY_API_BASE", "http://127.0.0.1:8790/v1")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_x")
+    assert P.simulated() and P.api_base() == "http://127.0.0.1:8790/v1"
+    assert P.checkout_script_url() == "http://127.0.0.1:8790/v1/checkout.js"
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_live_x")
+    assert not P.simulated() and P.api_base() == P.API
+    assert P.checkout_script_url() == "https://checkout.razorpay.com/v1/checkout.js"

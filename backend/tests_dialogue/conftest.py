@@ -1,3 +1,4 @@
+import pytest
 import atexit
 import os
 import shutil
@@ -19,3 +20,15 @@ os.environ["VOICEDUB_WORK"] = _WORK
 # create jobs, which used to land in the real job history (32 ghost jobs found).
 os.environ["VOICEDUB_STATE_DIR"] = _WORK
 atexit.register(shutil.rmtree, _WORK, True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_translation_repair(monkeypatch):
+    """The translation guard re-translates bad lines with real LLM keys; tests
+    must never reach a provider, so the repair has no clients unless a test
+    passes its own."""
+    try:
+        from dubbing import mt_guard
+    except Exception:
+        return
+    monkeypatch.setattr(mt_guard, "repair_clients", lambda: [])

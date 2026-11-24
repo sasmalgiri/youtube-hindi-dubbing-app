@@ -826,7 +826,8 @@ def _signed_in(request: Request):
 def get_catalog():
     from billing import catalog
     return {"price_version": catalog.PRICE_VERSION, "currency": catalog.CURRENCY,
-            "checkout": {"configured": _payments.configured(), "test_mode": _payments.test_mode()},
+            "checkout": {"configured": _payments.configured(), "test_mode": _payments.test_mode(),
+                         "simulated": _payments.simulated(), "script_url": _payments.checkout_script_url()},
             "packs": [{"id": p.id, "credit_type": p.credit_type, "seconds": p.seconds, "price_minor": p.price_minor,
                        "display": {"price": catalog.fmt_money(p.price_minor), "time": catalog.fmt_seconds(p.seconds),
                                    "tax": catalog.fmt_money(catalog.tax_inclusive_share(p.price_minor))}}

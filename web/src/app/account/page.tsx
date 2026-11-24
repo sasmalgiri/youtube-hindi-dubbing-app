@@ -10,11 +10,11 @@ type RzpResponse = { razorpay_order_id: string; razorpay_payment_id: string; raz
 type RzpInstance = { open: () => void; on: (e: string, f: (r: { error?: { description?: string } }) => void) => void };
 declare global { interface Window { Razorpay?: new (o: Record<string, unknown>) => RzpInstance } }
 
-function loadRazorpay(): Promise<void> {
+function loadRazorpay(src = 'https://checkout.razorpay.com/v1/checkout.js'): Promise<void> {
     if (typeof window !== 'undefined' && window.Razorpay) return Promise.resolve();
     return new Promise((ok, bad) => {
         const s = document.createElement('script');
-        s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+        s.src = src;
         s.onload = () => ok();
         s.onerror = () => bad(new Error('Could not load the payment window'));
         document.body.appendChild(s);
@@ -67,7 +67,7 @@ export default function AccountPage() {
         setError(null); setNotice(null); setBuying(packId);
         try {
             const o = await startCheckout(packId);
-            await loadRazorpay();
+            await loadRazorpay(catalog?.checkout.script_url);
             const rz = new window.Razorpay!({
                 key: o.key_id, order_id: o.razorpay_order_id, amount: o.amount_minor, currency: o.currency,
                 name: 'VoiceDub', description: `${o.display.time} prepaid time`, prefill: o.prefill,
@@ -144,7 +144,9 @@ export default function AccountPage() {
             <section className="glass-card p-4" id="buy" data-testid="buy">
                 <h2 className="text-sm font-semibold text-text-primary mb-3">Buy prepaid time</h2>
                 {catalog && !catalog.checkout.configured && <p className="text-xs text-amber-300 mb-2">Checkout is not switched on yet.</p>}
-                {catalog?.checkout.test_mode && <p className="text-xs text-amber-300 mb-2">Test mode: use Razorpay test cards; no real money moves.</p>}
+                {catalog?.checkout.test_mode && <p className="text-xs text-amber-300 mb-2">{catalog.checkout.simulated
+                    ? 'Simulated payments: a local stand-in for Razorpay; no real money moves.'
+                    : 'Test mode: use Razorpay test cards; no real money moves.'}</p>}
                 <div className="grid sm:grid-cols-3 gap-3">
                     {(catalog?.packs || []).map((p) => (
                         <div key={p.id} className="rounded-lg border border-white/10 p-3 space-y-1">

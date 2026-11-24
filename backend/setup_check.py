@@ -76,7 +76,8 @@ def _rzp_fmt():
 
 def _rzp_live():
     import requests
-    r = requests.get("https://api.razorpay.com/v1/orders", params={"count": 1},
+    from billing.payments import api_base
+    r = requests.get(f"{api_base()}/orders", params={"count": 1},
                      auth=(env("RAZORPAY_KEY_ID"), env("RAZORPAY_KEY_SECRET")), timeout=20)
     if r.status_code == 401:
         return "Razorpay refused the key id / secret (HTTP 401)"

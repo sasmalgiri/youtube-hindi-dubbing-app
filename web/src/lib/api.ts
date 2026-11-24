@@ -1128,7 +1128,7 @@ export const retryBatchFailures = (id: string, body: BatchStart) =>
 
 // ── Prepaid-time checkout (W5) ──
 export interface PackInfo { id: string; credit_type: 'standard' | 'premium'; seconds: number; price_minor: number; display: { price: string; time: string; tax: string } }
-export interface CatalogInfo { price_version: string; currency: string; checkout: { configured: boolean; test_mode: boolean }; packs: PackInfo[] }
+export interface CatalogInfo { price_version: string; currency: string; checkout: { configured: boolean; test_mode: boolean; simulated?: boolean; script_url?: string }; packs: PackInfo[] }
 export interface CheckoutOrder {
     order_id: string; razorpay_order_id: string; key_id: string; amount_minor: number; currency: string; pack_id: string;
     display: { amount: string; tax: string; time: string }; test_mode: boolean; prefill: { email: string; name: string };
