@@ -1127,8 +1127,27 @@ export const retryBatchFailures = (id: string, body: BatchStart) =>
     authFetch<{ id: string; retried: number }>(`/api/batches/${encodeURIComponent(id)}/retry-failed`, { method: 'POST', body: JSON.stringify(body) });
 
 // ── Prepaid-time checkout (W5) ──
-export interface PackInfo { id: string; credit_type: 'standard' | 'premium'; seconds: number; price_minor: number; display: { price: string; time: string; tax: string } }
-export interface CatalogInfo { price_version: string; currency: string; checkout: { configured: boolean; test_mode: boolean; simulated?: boolean; script_url?: string }; packs: PackInfo[] }
+export interface PackInfo { id: string; credit_type: 'standard' | 'premium'; seconds: number; price_minor?: number; display?: { price: string; time: string; tax: string; tax_label?: string } }
+export interface CatalogInfo {
+    price_version: string | null; currency: string | null; country: string; on_sale: boolean;
+    tax: { label: string; note: string }; currencies: string[];
+    checkout: { configured: boolean; test_mode: boolean; simulated?: boolean; script_url?: string }; packs: PackInfo[];
+}
+export interface LanguageInfo {
+    code: string; name: string; native: string; script: string; rtl: boolean; flagship: boolean;
+    voice: string | null; fallback: string | null; available: boolean; sellable: boolean; missing: string;
+}
+export const getLanguages = () => authFetch<{ flagship: string; languages: LanguageInfo[] }>('/api/languages');
+export const setBillingCountry = (country: string) =>
+    authFetch<{ country: string; currency: string | null; on_sale: boolean }>('/api/account/billing-country', { method: 'PUT', body: JSON.stringify({ country }) });
+export const COUNTRIES: [string, string][] = [
+    ['IN', 'India'], ['US', 'United States'], ['GB', 'United Kingdom'], ['CA', 'Canada'], ['AU', 'Australia'],
+    ['DE', 'Germany'], ['FR', 'France'], ['ES', 'Spain'], ['IT', 'Italy'], ['NL', 'Netherlands'], ['IE', 'Ireland'],
+    ['BR', 'Brazil'], ['MX', 'Mexico'], ['AR', 'Argentina'], ['AE', 'United Arab Emirates'], ['SA', 'Saudi Arabia'],
+    ['EG', 'Egypt'], ['NG', 'Nigeria'], ['ZA', 'South Africa'], ['KE', 'Kenya'], ['BD', 'Bangladesh'], ['PK', 'Pakistan'],
+    ['LK', 'Sri Lanka'], ['NP', 'Nepal'], ['SG', 'Singapore'], ['MY', 'Malaysia'], ['ID', 'Indonesia'], ['PH', 'Philippines'],
+    ['TH', 'Thailand'], ['VN', 'Vietnam'], ['JP', 'Japan'], ['KR', 'South Korea'], ['TR', 'Turkey'], ['PL', 'Poland'],
+];
 export interface CheckoutOrder {
     order_id: string; razorpay_order_id: string; key_id: string; amount_minor: number; currency: string; pack_id: string;
     display: { amount: string; tax: string; time: string }; test_mode: boolean; prefill: { email: string; name: string };

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { deleteAccount, getDeletionPlan, type DeletionPlan, getBalance, getCatalog, getOrders, getSessions, receiptUrl, revokeSession, signOut, signOutEverywhere, startCheckout, verifyCheckout, type CatalogInfo, type CreditBalance, type OrderInfo, type SessionInfo } from '@/lib/api';
+import { COUNTRIES, setBillingCountry, deleteAccount, getDeletionPlan, type DeletionPlan, getBalance, getCatalog, getOrders, getSessions, receiptUrl, revokeSession, signOut, signOutEverywhere, startCheckout, verifyCheckout, type CatalogInfo, type CreditBalance, type OrderInfo, type SessionInfo } from '@/lib/api';
 import { refreshAuth, useAuth } from '@/hooks/useAuth';
 
 type RzpResponse = { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string };
@@ -143,6 +143,16 @@ export default function AccountPage() {
 
             <section className="glass-card p-4" id="buy" data-testid="buy">
                 <h2 className="text-sm font-semibold text-text-primary mb-3">Buy prepaid time</h2>
+                <label className="flex items-center gap-2 text-xs text-text-muted mb-3">Billing country
+                    <select aria-label="Billing country" value={catalog?.country || 'IN'}
+                        className="rounded bg-white/5 border border-white/10 px-2 py-1 text-xs text-text-primary"
+                        onChange={async (e) => { try { await setBillingCountry(e.target.value); await load(); } catch (err) { setError(err instanceof Error ? err.message : 'Could not save the country'); } }}>
+                        {COUNTRIES.map(([cc, name]) => <option key={cc} value={cc}>{name}</option>)}
+                    </select>
+                    {catalog?.currency && <span>Prices in {catalog.currency}</span>}
+                </label>
+                {catalog && !catalog.on_sale && <p className="text-xs text-amber-300 mb-2" data-testid="not-on-sale">Buying from your country is not open yet. Prepaid time bought elsewhere still works.</p>}
+                {catalog?.on_sale && catalog.country !== 'IN' && catalog.tax.note && <p className="text-[11px] text-text-muted mb-2">{catalog.tax.note}</p>}
                 {catalog && !catalog.checkout.configured && <p className="text-xs text-amber-300 mb-2">Checkout is not switched on yet.</p>}
                 {catalog?.checkout.test_mode && <p className="text-xs text-amber-300 mb-2">{catalog.checkout.simulated
                     ? 'Simulated payments: a local stand-in for Razorpay; no real money moves.'
@@ -151,9 +161,11 @@ export default function AccountPage() {
                     {(catalog?.packs || []).map((p) => (
                         <div key={p.id} className="rounded-lg border border-white/10 p-3 space-y-1">
                             <p className="text-xs text-text-muted capitalize">{p.credit_type}</p>
-                            <p className="text-lg font-semibold text-text-primary">{p.display.time}</p>
-                            <p className="text-sm text-text-primary">{p.display.price} <span className="text-[11px] text-text-muted">incl. GST {p.display.tax}</span></p>
-                            <button type="button" className="btn-primary w-full py-1.5 text-sm" disabled={!catalog?.checkout.configured || !!buying}
+                            <p className="text-lg font-semibold text-text-primary">{fmtTime(p.seconds)}</p>
+                            {p.display ? (
+                                <p className="text-sm text-text-primary">{p.display.price} <span className="text-[11px] text-text-muted">{catalog?.country === 'IN' ? `incl. GST ${p.display.tax}` : p.display.tax_label}</span></p>
+                            ) : <p className="text-sm text-text-muted">—</p>}
+                            <button type="button" className="btn-primary w-full py-1.5 text-sm" disabled={!catalog?.checkout.configured || !catalog?.on_sale || !!buying}
                                 onClick={() => buy(p.id)}>{buying === p.id ? 'Opening…' : 'Buy'}</button>
                         </div>
                     ))}

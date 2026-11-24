@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getDraft, getQuote, getRights, submitDraft, uploadDraft, type DraftInfo, type QuoteInfo } from '@/lib/api';
+import { getDraft, getLanguages, getQuote, getRights, submitDraft, uploadDraft, type DraftInfo, type LanguageInfo, type QuoteInfo } from '@/lib/api';
 import { useAuth } from '@/hooks/useAuth';
 
 const DRAFT_KEY = 'voicedub.create.draft';
@@ -26,6 +26,9 @@ export default function CreatePage() {
     const [mode, setMode] = useState<'full' | 'first'>('full');
     const [minutes, setMinutes] = useState(10);
     const [quote, setQuote] = useState<QuoteInfo | null>(null);
+    const [langs, setLangs] = useState<LanguageInfo[]>([]);
+    const [target, setTarget] = useState('hi');
+    useEffect(() => { getLanguages().then((r) => setLangs(r.languages)).catch(() => {}); }, []);
     const [rights, setRights] = useState<{ version: string; text: string } | null>(null);
     const [accepted, setAccepted] = useState(false);
     const [busy, setBusy] = useState(false);
@@ -68,7 +71,7 @@ export default function CreatePage() {
         if (!draft) return;
         setBusy(true); setError(null);
         try {
-            const q = await getQuote({ draft_id: draft.id, languages: ['hi'], minutes: mode === 'full' ? 0 : minutes, style: 'dialogue', quality: 'standard' });
+            const q = await getQuote({ draft_id: draft.id, languages: [target], minutes: mode === 'full' ? 0 : minutes, style: 'dialogue', quality: 'standard' });
             submitKey.current = newKey();
             setQuote(q);
         } catch (e) { setError(e instanceof Error ? e.message : 'Could not price this job'); }
@@ -136,7 +139,17 @@ export default function CreatePage() {
                     </label>
                 </fieldset>
                 <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div><p className="text-xs text-text-muted">Language</p><p className="text-text-primary">English → Hindi</p></div>
+                    <div>
+                        <label className="text-xs text-text-muted block" htmlFor="target">English →</label>
+                        <select id="target" value={target} onChange={(e) => { setTarget(e.target.value); setQuote(null); }}
+                            className="input-field px-2 py-1 text-sm">
+                            {(langs.length ? langs : [{ code: 'hi', name: 'Hindi', native: 'हिन्दी', available: true } as LanguageInfo]).map((l) => (
+                                <option key={l.code} value={l.code} disabled={!l.available}>
+                                    {l.name} · {l.native}{l.available ? '' : ' (coming soon)'}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
                     <div><p className="text-xs text-text-muted">Style · Quality</p><p className="text-text-primary">Single-voice dialogue · Standard</p>
                         <p className="text-[11px] text-text-muted">Storytelling, multi-speaker and Highest Quality are not on sale yet.</p></div>
                 </div>
