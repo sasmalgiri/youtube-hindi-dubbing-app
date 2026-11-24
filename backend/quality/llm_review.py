@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+CHUNK = 12
 LANG = {"hi": "Hindi", "es": "Spanish", "bn": "Bengali", "ar": "Arabic", "ja": "Japanese", "ta": "Tamil",
         "fr": "French", "de": "German", "pt": "Portuguese", "te": "Telugu", "mr": "Marathi", "zh": "Chinese",
         "ko": "Korean", "id": "Indonesian", "tr": "Turkish", "ru": "Russian", "it": "Italian"}
@@ -63,11 +64,18 @@ def review(items: Sequence[Dict], target: str, clients: Sequence) -> Dict:
     data = [{"id": it["id"], "english": it["en"], "translation": it["hi"]} for it in items]
     per_judge = []
     for c in clients:
-        try:
-            raw = c.complete(SYSTEM.format(lang=lang), "Review these items:\n" + json.dumps({"items": data}, ensure_ascii=False))
-            per_judge.append({"judge": getattr(c, "model_id", type(c).__name__), "scores": _parse(raw)})
-        except Exception as e:
-            per_judge.append({"judge": getattr(c, "model_id", type(c).__name__), "scores": {}, "error": str(e)[:160]})
+        scores, errors = {}, []
+        for k in range(0, len(data), CHUNK):     # small batches: big JSON replies fail on some providers
+            try:
+                raw = c.complete(SYSTEM.format(lang=lang),
+                                 "Review these items:\n" + json.dumps({"items": data[k:k + CHUNK]}, ensure_ascii=False))
+                scores.update(_parse(raw))
+            except Exception as e:
+                errors.append(str(e)[:160])
+        j = {"judge": getattr(c, "model_id", type(c).__name__), "scores": scores}
+        if errors and not scores:
+            j["error"] = errors[0]
+        per_judge.append(j)
     lines = []
     for it in items:
         got = [j["scores"].get(it["id"]) for j in per_judge if j["scores"].get(it["id"])]
