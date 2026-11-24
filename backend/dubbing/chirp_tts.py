@@ -33,8 +33,19 @@ def api_key() -> str:
 
 
 def voice_for(lang: str) -> str:
+    """GOOGLE_TTS_VOICE_<LANG> wins; else the catalog's Chirp 3 HD voice for the language."""
+    lang = (lang or "hi").split("-")[0].lower()
     v = os.environ.get(f"GOOGLE_TTS_VOICE_{lang.upper()}", "").strip()
-    return v or DEFAULT_VOICE.get(lang, f"{lang}-IN-Chirp3-HD-Kore")
+    if v:
+        return v
+    if lang in DEFAULT_VOICE:
+        return DEFAULT_VOICE[lang]
+    import languages
+    entry = languages.get(lang)
+    voice = entry.chirp_voice() if entry else None
+    if not voice:
+        raise ChirpError(f"no Chirp 3 HD voice for language '{lang}'")
+    return voice
 
 
 def is_chirp(voice: str) -> bool:

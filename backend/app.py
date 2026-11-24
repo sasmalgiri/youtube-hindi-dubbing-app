@@ -822,6 +822,13 @@ def _signed_in(request: Request):
     return sess
 
 
+@app.get("/api/languages")
+def get_languages():
+    """Target languages: what each one uses and whether it can be bought here."""
+    import languages as _languages
+    return {"flagship": _languages.FLAGSHIP, "languages": _languages.describe(_features.profile() == "hosted")}
+
+
 @app.get("/api/catalog")
 def get_catalog():
     from billing import catalog
@@ -1168,6 +1175,11 @@ def create_quote(body: QuoteRequest, request: Request):
         available = led.spendable(_account_key(owner))
     finally:
         led.close()
+    import languages as _languages
+    for lang in body.languages:
+        why = _languages.refusal(lang, _features.profile() == "hosted")
+        if why:
+            raise HTTPException(status_code=422, detail=why)
     try:
         q = _submissions().make_quote(draft_id=body.draft_id, owner_id=owner, languages=body.languages,
                                       minutes=body.minutes, style=body.style, quality=body.quality,
@@ -1202,7 +1214,7 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
     if existing:
         return {"id": existing, "duplicate": True}
     acct = _account_key(owner)
-    reserved = False
+    reserved_ids, built = [], []
     job_id = uuid.uuid4().hex[:12]
     try:
         q = st.quote(body.quote_id, owner)
@@ -1221,62 +1233,79 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
                 f"Buy prepaid time first; checkout opens with the Razorpay step.", 402)
         d = st.draft(draft_id, owner)
         hosted = _features.profile() == "hosted"
-        req = JobCreateRequest(
-            url=d["path"], source_language="en", target_language=q["languages"][0], dub_duration=int(q.get("minutes") or 0),
-            use_edge_tts=_features.is_on("tts.edge"),
-            use_google_tts=(not _features.is_on("tts.edge")) and _features.is_on("tts.google"),
-            multi_speaker=False, visual_transforms=False if hosted else True)
-        msg = _features.job_refusal(req, "upload")
-        if msg:
-            raise _submission.SubmitError(msg, 400)
-        seconds = int(q["standard_seconds"]) + int(q["premium_seconds"])
-        led = _ledger()
-        try:
-            split = led.reserve(acct, job_id, seconds)
-        except InsufficientBalance:
-            raise _submission.SubmitError("Your balance changed since the quote; get a new quote", 409)
-        finally:
-            led.close()
-        reserved = True
+        import languages as _languages
+        lines = q.get("lines") or [{"language": l, "standard_seconds": q["standard_seconds"],
+                                    "premium_seconds": q["premium_seconds"]} for l in q["languages"][:1]]
+        for ln in lines:
+            why = _languages.refusal(ln["language"], hosted)
+            if why:
+                raise _submission.SubmitError(why, 422)
+        # One job per target language, each with its own reservation (a quote
+        # for N languages used to charge for N and dub only the first).
+        for i, ln in enumerate(lines):
+            jid = job_id if i == 0 else uuid.uuid4().hex[:12]
+            req = JobCreateRequest(
+                url=d["path"], source_language="en", target_language=ln["language"],
+                dub_duration=int(q.get("minutes") or 0),
+                use_edge_tts=_features.is_on("tts.edge"),
+                use_google_tts=(not _features.is_on("tts.edge")) and _features.is_on("tts.google"),
+                multi_speaker=False, visual_transforms=False if hosted else True)
+            msg = _features.job_refusal(req, "upload")
+            if msg:
+                raise _submission.SubmitError(msg, 400)
+            seconds = int(ln["standard_seconds"]) + int(ln["premium_seconds"])
+            led = _ledger()
+            try:
+                split = led.reserve(acct, jid, seconds)
+            except InsufficientBalance:
+                raise _submission.SubmitError("Your balance changed since the quote; get a new quote", 409)
+            finally:
+                led.close()
+            reserved_ids.append(jid)
+            built.append((jid, req, seconds, split))
         if not st.use_quote(body.quote_id, job_id):
             raise _submission.SubmitError("This quote was already used; get a new quote", 409)
-        job_dir = OUTPUTS / job_id / "work"
-        job_dir.mkdir(parents=True, exist_ok=True)
-        src = job_dir / ("source" + Path(d["path"]).suffix)
-        shutil.copy2(d["path"], src)              # the draft stays immutable
-        req.url = str(src)
-        job = Job(id=job_id, source_url=f"upload:{d['filename']}", target_language=req.target_language)
-        job.original_req = req
-        job.owner_id = owner
-        job.billing = {"account": acct, "reserve_key": job_id, "seconds": seconds, "split": split,
-                       "quote_id": body.quote_id, "price_version": q["price_version"], "draft_id": draft_id}
-        job.state = "queued"
-        job.message = "Waiting for a free worker"
-        _write_manifest(job, d, q, req, body.rights_version)
-        JOBS[job_id] = job
-        _store.save(job)
+        for jid, req, seconds, split in built:
+            job_dir = OUTPUTS / jid / "work"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            src = job_dir / ("source" + Path(d["path"]).suffix)
+            shutil.copy2(d["path"], src)              # the draft stays immutable
+            req.url = str(src)
+            job = Job(id=jid, source_url=f"upload:{d['filename']}", target_language=req.target_language)
+            job.original_req = req
+            job.owner_id = owner
+            job.billing = {"account": acct, "reserve_key": jid, "seconds": seconds, "split": split,
+                           "quote_id": body.quote_id, "price_version": q["price_version"], "draft_id": draft_id,
+                           "language": req.target_language, "siblings": [b[0] for b in built]}
+            job.state = "queued"
+            job.message = "Waiting for a free worker"
+            _write_manifest(job, d, q, req, body.rights_version)
+            JOBS[jid] = job
+            _store.save(job)
         st.complete_claim(owner, body.idempotency_key, job_id)
     except _submission.SubmitError as e:
         st.drop_claim(owner, body.idempotency_key)
-        if reserved:
-            led = _ledger()
-            try:
-                led.release(acct, job_id, note="submission failed before start")
-            finally:
-                led.close()
+        _release_all(acct, reserved_ids)
         _submit_error(e)
     except BaseException:
         st.drop_claim(owner, body.idempotency_key)
-        if reserved:
-            led = _ledger()
-            try:
-                led.release(acct, job_id, note="submission failed before start")
-            finally:
-                led.close()
+        _release_all(acct, reserved_ids)
         raise
     q_ = _queue()
-    q_.enqueue(job_id, acct)
-    return {"id": job_id, "duplicate": False, "reserved": split, "queue_position": q_.position(job_id)}
+    for jid, *_ in built:
+        q_.enqueue(jid, acct)
+    first = built[0]
+    return {"id": job_id, "ids": [b[0] for b in built], "duplicate": False, "reserved": first[3],
+            "queue_position": q_.position(job_id)}
+
+
+def _release_all(acct: str, job_ids) -> None:
+    for jid in job_ids:
+        led = _ledger()
+        try:
+            led.release(acct, jid, note="submission failed before start")
+        finally:
+            led.close()
 
 
 def _job_runner():
