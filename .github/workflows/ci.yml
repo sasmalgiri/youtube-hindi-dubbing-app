@@ -1,7 +1,8 @@
 # Offline CI (tracker A02, T01). Runs on every push and pull request.
 #
-# What this proves: the module matrix, billing/ledger, tracker alignment, the
-# web type-check and production build. What it does NOT run: GPU models,
+# What this proves: the release tests (module matrix, billing/ledger, payments,
+# batches, languages, privacy, delivery checks, security, ops), tracker
+# alignment, no known vulnerable web dependencies, the web type-check and build. What it does NOT run: GPU models,
 # provider calls, or the full dialogue suite (those need the owner's CUDA
 # environment; see docs/release/TRACKER.md "evidence" for where they ran).
 # The manual scripts backend/test_google_tts.py, test_sarvam_tts.py and
@@ -18,7 +19,7 @@ permissions:
 jobs:
   backend-core:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,11 +35,23 @@ jobs:
             requests==2.32.3 uvicorn==0.34.0
       - name: Tracker and TODO cover each other
         run: python docs/release/check_alignment.py
-      - name: Module matrix and billing tests
+      - name: ffmpeg (delivery checks probe real media)
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - name: Release tests (billing, payments, batches, languages, privacy, delivery, security, ops)
         working-directory: backend
         env:
           VOICEDUB_PROFILE: local
-        run: python -m pytest tests_dialogue/test_features.py tests_dialogue/test_billing.py -q -p no:cacheprovider
+        run: >
+          python -m pytest -q -p no:cacheprovider
+          tests_dialogue/test_features.py tests_dialogue/test_billing.py tests_dialogue/test_payments.py
+          tests_dialogue/test_submission.py tests_dialogue/test_batches.py tests_dialogue/test_languages.py
+          tests_dialogue/test_worldwide_billing.py tests_dialogue/test_account_deletion.py
+          tests_dialogue/test_hosted_security.py tests_dialogue/test_rate_limit.py tests_dialogue/test_delivery_check.py
+          tests_dialogue/test_ops_health.py tests_dialogue/test_backup_restore.py tests_dialogue/test_crash_recovery.py
+          tests_dialogue/test_mt_guard.py tests_dialogue/test_storage_setup.py tests_dialogue/test_narration.py
+          tests_dialogue/test_speaker_review.py tests_dialogue/test_translation_bench.py
+          tests_dialogue/test_provider_failures.py tests_dialogue/test_load_stress.py
+          tests_dialogue/test_e2e_review_revoice.py
 
   web:
     runs-on: ubuntu-latest
@@ -54,5 +67,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - name: No known vulnerabilities in production dependencies
+        run: npm audit --omit=dev --audit-level=low
       - run: npx tsc --noEmit -p .
       - run: npm run build
