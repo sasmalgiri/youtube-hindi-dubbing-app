@@ -60,6 +60,10 @@ class Runner:
         if self.outcome == "done":
             shutil.copy2(req.url, out)            # a real, audible file passes the delivery check
             job.result_path = out
+            if not getattr(self, "no_srt", False):
+                srt = out.with_suffix(".srt")
+                srt.write_text("1\n00:00:01,000 --> 00:00:03,000\nनमस्ते, आप कैसे हैं?\n", encoding="utf-8")
+                job.subtitles_path = str(srt)
             job.state = "done"
         elif self.outcome in ("silent", "garbage"):
             if self.outcome == "silent":
@@ -77,6 +81,7 @@ class Runner:
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("VOICEDUB_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("VOICEDUB_PROFILE", "hosted")
+    monkeypatch.setenv("VOICEDUB_PREVIEW_LANGUAGES", "hi")     # pilot: Hindi dubbable before sign-off
     import features
     importlib.reload(features)
     import app as app_module

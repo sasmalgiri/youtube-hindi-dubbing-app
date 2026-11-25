@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import delivery_check as D
+from tests_dialogue.test_submission import env, media  # noqa: F401,E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg needed")
 
@@ -71,3 +72,22 @@ def test_optional_spoken_language_check_uses_injected_asr(clips):
         def transcribe(self, p): return "नमस्ते यह हिंदी है"
     assert any("Hindi" in w for w in D.check(clips / "ok.m4a", asr_factory=Eng)["warnings"])
     assert D.check(clips / "ok.m4a", asr_factory=Hin)["warnings"] == []
+
+
+def test_paid_dub_without_its_subtitles_is_not_settled(env, media):
+    from tests_dialogue.test_submission import grant, upload, rights, wait_closed, balance
+    c, uid = env["client"]("srt@example.com")
+    grant(env, uid, 3_600, "pay:s1")
+    env["runner"].no_srt = True
+    did = upload(c, media["ok"]).json()["id"]
+    qid = c.post("/api/quotes", json={"draft_id": did}).json()["id"]
+    jid = c.post(f"/api/drafts/{did}/submit", json={"quote_id": qid, "idempotency_key": "k1",
+                                                    "rights_accepted": True, "rights_version": rights(c)}).json()["id"]
+    assert wait_closed(env, jid) == "released"
+    assert "subtitle file is missing" in env["app"].JOBS[jid].error
+    assert balance(env, uid).consumed == 0
+
+
+def test_short_output_tolerance_is_tight():
+    import delivery_check as D
+    assert D.SHORT_FRACTION >= 0.97

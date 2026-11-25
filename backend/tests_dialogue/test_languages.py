@@ -15,8 +15,26 @@ def test_catalog_entries_are_consistent():
         if lang.chirp_locale:
             assert lang.chirp_voice().endswith("-Chirp3-HD-Kore")
     assert L.get("hi-IN").code == "hi" and L.get("xx") is None
-    assert L.sellable("hi")                                   # flagship: baseline + owner decision
     assert not L.sellable("es") and "reviewer" in L.status("es")["why"]
+
+
+def test_every_language_needs_a_voice_bound_signoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "SIGNOFFS", tmp_path / "s.json")
+    assert not L.sellable("hi") and "sign-off" in L.status("hi")["why"]          # no flagship exception
+    (tmp_path / "s.json").write_text('{"hi": {"by": "a,b", "date": "2026-12-01", "voice": "hi-IN-Old"}}')
+    assert not L.sellable("hi") and "current voice" in L.status("hi")["why"]
+    (tmp_path / "s.json").write_text('{"hi": {"by": "a,b", "date": "2026-12-01", "voice": "%s"}}' % L.get("hi").chirp_voice())
+    assert L.sellable("hi")
+
+
+def test_preview_languages_are_dubbable_not_sellable(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "SIGNOFFS", tmp_path / "none.json")
+    monkeypatch.delenv("VOICEDUB_PREVIEW_LANGUAGES", raising=False)
+    assert L.refusal("hi", hosted=True)
+    monkeypatch.setenv("VOICEDUB_PREVIEW_LANGUAGES", "hi")
+    assert L.refusal("hi", hosted=True) is None and not L.sellable("hi")
+    d = {x["code"]: x for x in L.describe(True)}
+    assert d["hi"]["available"] and not d["hi"]["sellable"] and not d["es"]["available"]
 
 
 def test_voice_per_language(monkeypatch):
@@ -83,13 +101,18 @@ def test_failed_second_reservation_releases_the_first(env, media, monkeypatch):
     assert b.reserved == 50 and b.spendable == 150             # only the unrelated hold remains
 
 
-def test_hindi_glossary_and_pronunciation_never_reach_other_languages(tmp_path):
+def test_hindi_glossary_and_pronunciation_never_reach_other_languages(tmp_path, monkeypatch):
+    import json
+    import pipeline
     from pipeline import Pipeline, PipelineConfig
+    g = tmp_path / "glossary.json"          # the real glossary is gitignored: bring our own
+    g.write_text(json.dumps({"_note": "x", "mother": "माँ", "YouTube": "YouTube"}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "GLOSSARY_PATH", g)
     def pipe(code):
         return Pipeline(PipelineConfig(source="x.mp4", work_dir=tmp_path / code, output_path=tmp_path / "o.mp4",
                                        source_language="en", target_language=code))
     hi, es = pipe("hi"), pipe("es")
     assert any(not str(v).isascii() for v in hi._glossary.values())
-    assert all(str(v).isascii() for v in es._glossary.values())
+    assert es._glossary == {"youtube": "YouTube"}
     assert es._apply_pronunciation("Uso ChatGPT") == "Uso ChatGPT"
     assert hi._apply_pronunciation("ChatGPT") != "ChatGPT"

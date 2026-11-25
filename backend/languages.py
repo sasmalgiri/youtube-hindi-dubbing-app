@@ -7,7 +7,7 @@ voice used on this PC (local profile only).
 
 A language is *sellable* in the hosted service only when it has
   * a translation benchmark baseline  (quality/reports/baseline_<engine>_<lang>*.json), and
-  * a reviewer sign-off              (quality/signoffs.json: {"<lang>": {"by": ..., "date": ...}})
+  * a reviewer sign-off              (quality/signoffs.json: {"<lang>": {"by": ..., "date": ..., "voice": "<exact voice>", "styles": [...]}})
 Hindi is the flagship and is signed off by the owner decision of 2026-11-20.
 Everything else is "beta": usable locally, shown as coming soon in hosted.
 """
@@ -100,8 +100,11 @@ def status(code: str) -> Dict:
     missing = []
     if not has_baseline(lang.code):
         missing.append("translation benchmark baseline")
-    if lang.code != FLAGSHIP and lang.code not in _signoffs():
-        missing.append("native reviewer sign-off")
+    so = _signoffs().get(lang.code)
+    if not so:
+        missing.append("native reviewer sign-off")            # Hindi too: no flagship exception
+    elif so.get("voice") != lang.chirp_voice():
+        missing.append("sign-off for the current voice (it was given for " + str(so.get("voice")) + ")")
     if lang.chirp_locale is None and not lang.sarvam:
         missing.append("a commercially cleared voice")
     return {"sellable": not missing, "why": "; ".join(missing)}
@@ -118,14 +121,21 @@ def describe(hosted: bool) -> List[Dict]:
         out.append({"code": lang.code, "name": lang.name, "native": lang.native, "script": lang.script,
                     "rtl": lang.rtl, "flagship": lang.code == FLAGSHIP, "voice": lang.chirp_voice(),
                     "fallback": "sarvam" if lang.sarvam else None,
-                    "available": st["sellable"] or not hosted, "sellable": st["sellable"], "missing": st["why"]})
+                    "available": st["sellable"] or not hosted or lang.code in preview_languages(), "sellable": st["sellable"], "missing": st["why"]})
     return out
+
+
+def preview_languages() -> set:
+    """Invite-pilot languages (VOICEDUB_PREVIEW_LANGUAGES=hi,es): dubbable without sign-off,
+    shown as Preview, never sellable. Paid checkout stays gated on sellable()."""
+    import os
+    return {c.strip().lower() for c in (os.environ.get("VOICEDUB_PREVIEW_LANGUAGES") or "").split(",") if c.strip()}
 
 
 def refusal(code: str, hosted: bool) -> Optional[str]:
     lang = get(code)
     if lang is None:
         return f"'{code}' is not a supported target language"
-    if hosted and not sellable(lang.code):
+    if hosted and not sellable(lang.code) and lang.code not in preview_languages():
         return f"{lang.name} is not available yet ({status(lang.code)['why']})"
     return None

@@ -190,3 +190,21 @@ def test_simulator_url_only_honoured_with_test_keys(monkeypatch):
     monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_live_x")
     assert not P.simulated() and P.api_base() == P.API
     assert P.checkout_script_url() == "https://checkout.razorpay.com/v1/checkout.js"
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _hindi_signed_off(monkeypatch):
+    """Checkout opens only once a language is signed off; these tests are about payments."""
+    import languages
+    monkeypatch.setattr(languages, "sellable", lambda code: code == "hi")
+
+
+def test_checkout_closed_while_nothing_is_signed_off(env, monkeypatch):
+    import languages
+    monkeypatch.setattr(languages, "sellable", lambda code: False)
+    c, _ = env["client"]("a@example.com")
+    r = c.post("/api/checkout", json={"pack_id": "std_4h"})
+    assert r.status_code == 403 and "not on sale" in r.json()["detail"]

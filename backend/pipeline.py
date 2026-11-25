@@ -407,6 +407,10 @@ class _GroqKeyRotator:
 _groq_keys = _GroqKeyRotator()
 
 
+# Owner's English -> Hindi glossary (gitignored; may be absent on a fresh checkout).
+GLOSSARY_PATH = Path(__file__).resolve().parent / "translation_glossary.json"
+
+
 def get_groq_key() -> str:
     """Get the next available Groq API key (rotated)."""
     return _groq_keys.get_key()
@@ -1548,7 +1552,7 @@ class Pipeline:
 
         # Load translation glossary (English words to preserve/transliterate)
         self._glossary: Dict[str, str] = {}
-        glossary_path = Path(__file__).resolve().parent / "translation_glossary.json"
+        glossary_path = GLOSSARY_PATH
         try:
             import json as _json_g
             if glossary_path.exists():

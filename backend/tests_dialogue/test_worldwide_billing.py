@@ -71,3 +71,13 @@ def test_old_payments_db_gains_new_columns(tmp_path):
         assert o["country"] == "IN" and o["display"]["tax_label"] == "GST 18% (included)"
     finally:
         st.close()
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _hindi_signed_off(monkeypatch):
+    """Checkout opens only once a language is signed off; these tests are about payments."""
+    import languages
+    monkeypatch.setattr(languages, "sellable", lambda code: code == "hi")

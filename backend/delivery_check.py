@@ -30,7 +30,8 @@ CLIP_PEAK_DB = -0.1         # true peak at/above this with many clipped samples 
 CLIP_MIN_SAMPLES = 50
 GAP_DB = -45.0              # quieter than this counts as a gap
 GAP_SECONDS = 8.0           # a gap this long while subtitles say someone speaks = missing line
-SHORT_FRACTION = 0.8        # output shorter than this share of the paid seconds = problem
+SHORT_FRACTION = 0.97       # output shorter than this share of the paid seconds = problem
+SHORT_GRACE_S = 2.0         # ...and by more than this many seconds (rounding on short clips)
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 LATIN = re.compile(r"[A-Za-z]")
 TS = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})")
@@ -170,7 +171,8 @@ def spoken_language_check(path: Path, duration: float, asr_factory: Optional[Cal
 
 
 def check(path: Path, *, srt: Optional[Path] = None, paid_seconds: Optional[float] = None,
-          target_lang: str = "hi", min_seconds: float = 1.0, asr_factory: Optional[Callable] = None) -> Dict:
+          target_lang: str = "hi", min_seconds: float = 1.0, asr_factory: Optional[Callable] = None,
+          srt_required: bool = False) -> Dict:
     """Returns {"ok", "problems", "warnings", "metrics"}; never raises."""
     problems: List[str] = []
     warnings: List[str] = []
@@ -190,7 +192,7 @@ def check(path: Path, *, srt: Optional[Path] = None, paid_seconds: Optional[floa
         metrics["sha256"] = sha256(path)
         if dur < min_seconds:
             problems.append(f"too short ({dur:.1f}s)")
-        if paid_seconds and dur < paid_seconds * SHORT_FRACTION:
+        if paid_seconds and dur < paid_seconds * SHORT_FRACTION and paid_seconds - dur > SHORT_GRACE_S:
             problems.append(f"output is {dur:.0f}s but {paid_seconds:.0f}s were paid for")
         st = _audio_stats(path)
         metrics.update({k: st[k] for k in ("max_volume_db", "mean_volume_db", "peak_db", "peak_count", "decode_errors")})
@@ -204,6 +206,8 @@ def check(path: Path, *, srt: Optional[Path] = None, paid_seconds: Optional[floa
             warnings.append(f"audio clips ({st['peak_count']} samples at full scale)")
         gaps = st["gaps"]
         metrics["long_gaps"] = len(gaps)
+        if srt_required and (srt is None or not Path(srt).exists() or Path(srt).stat().st_size == 0):
+            problems.append("the promised subtitle file is missing")
         if srt is not None and Path(srt).exists():
             p, w, m = check_srt(Path(srt).read_bytes(), dur, target_lang)
             problems += p

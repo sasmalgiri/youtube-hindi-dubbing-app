@@ -923,6 +923,10 @@ class CheckoutRequest(BaseModel):
 @app.post("/api/checkout")
 def start_checkout(body: CheckoutRequest, request: Request):
     sess = _signed_in(request)
+    import languages as _languages
+    if _features.profile() == "hosted" and not any(_languages.sellable(c) for c in _languages.LANGUAGES):
+        # pilot (preview languages only): nothing is for sale until a language is signed off
+        raise HTTPException(status_code=403, detail="Prepaid time is not on sale yet: no language has passed review.")
     try:
         out = _payments_store().create(sess.user.id, body.pack_id, _buyer_country(request))
     except _payments.PaymentError as e:

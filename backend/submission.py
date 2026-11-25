@@ -396,7 +396,8 @@ def close_billing(job, ledger_factory: Callable[[], Any], save: Callable[[Any], 
             srt = getattr(job, "subtitles_path", None)
             rep = delivery_check.check(Path(str(job.result_path)), srt=Path(srt) if srt else None,
                                        paid_seconds=b.get("seconds"),
-                                       target_lang=getattr(job, "target_language", "hi") or "hi")
+                                       target_lang=getattr(job, "target_language", "hi") or "hi",
+                                       srt_required=True)      # every paid dub promises subtitles
             b["delivery"] = rep               # Q05: problems, warnings, metrics, sha256
             problem = "; ".join(rep["problems"]) or None
             if problem:                       # P07: never "Complete" (or charged) on a bad output
