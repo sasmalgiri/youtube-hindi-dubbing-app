@@ -1086,7 +1086,7 @@ export interface DraftInfo {
 export interface QuoteInfo {
     id: string; interval: [number, number]; languages: string[]; minutes: number; expires_at: number;
     standard_seconds: number; premium_seconds: number; cash_seconds: number; cash_minor: number; tax_minor: number;
-    notes: string[]; display: { cash: string; tax: string; standard: string; premium: string; billed: string };
+    notes: string[]; display: { cash: string; tax: string; tax_label?: string; currency?: string; standard: string; premium: string; billed: string };
 }
 
 export async function uploadDraft(file: File): Promise<DraftInfo> {

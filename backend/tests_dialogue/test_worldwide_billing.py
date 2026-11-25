@@ -5,7 +5,7 @@ import sqlite3
 from billing import catalog, tax
 from billing import payments as P
 from tests_dialogue.test_payments import pay, sig, bal, hook, captured  # noqa: F401
-from tests_dialogue.test_submission import env  # noqa: F401
+from tests_dialogue.test_submission import env, media  # noqa: F401
 
 
 def test_currency_for_country_and_enabled_lists(monkeypatch):
@@ -81,3 +81,33 @@ def _hindi_signed_off(monkeypatch):
     """Checkout opens only once a language is signed off; these tests are about payments."""
     import languages
     monkeypatch.setattr(languages, "sellable", lambda code: code == "hi")
+
+
+def test_quote_screen_matches_buyer_currency_and_tax(monkeypatch):
+    """A 1 h USD quote shows US$5.00 with no GST and the USD price version, never rupees."""
+    from billing import catalog, tax
+    from billing.quote import make_quote, QuoteRefused
+    monkeypatch.setenv("VOICEDUB_CURRENCIES", "INR,USD")
+    q = make_quote(account_id="a", source_id="s", source_duration=3600, languages=["hi"], now=0,
+                   currency="USD", tax_rule=tax.rule("US"))
+    assert q.cash_minor == 500 and q.tax_minor == 0 and q.currency == "USD"
+    assert q.price_version == catalog.price_version("USD") and "GST" not in q.notes[0].replace("No GST", "")
+    assert catalog.fmt_money(q.cash_minor, "USD").startswith("$") or "US" in catalog.fmt_money(q.cash_minor, "USD")
+    inr = make_quote(account_id="a", source_id="s", source_duration=3600, languages=["hi"], now=0,
+                     currency="INR", tax_rule=tax.rule("IN"))
+    assert inr.tax_minor > 0 and inr.tax_label.startswith("GST")
+    import pytest
+    with pytest.raises(QuoteRefused):        # not on sale there: never silently priced in rupees
+        make_quote(account_id="a", source_id="s", source_duration=3600, languages=["hi"], now=0,
+                   currency=None, tax_rule=tax.rule("BR"))
+
+
+def test_quote_api_display_for_us_buyer(env, media, monkeypatch):
+    from tests_dialogue.test_submission import upload
+    monkeypatch.setenv("VOICEDUB_CURRENCIES", "INR,USD")
+    c, uid = env["client"]("us@example.com")
+    assert c.put("/api/account/billing-country", json={"country": "US"}).status_code == 200
+    did = upload(c, media["ok"]).json()["id"]
+    q = c.post("/api/quotes", json={"draft_id": did}).json()
+    assert q["currency"] == "USD" and q["price_version"].startswith("usd-")
+    assert q["display"]["currency"] == "USD" and "₹" not in q["display"]["cash"] and q["display"]["tax_label"].startswith("No GST")

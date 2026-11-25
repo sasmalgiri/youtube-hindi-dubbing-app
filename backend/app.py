@@ -857,6 +857,13 @@ def get_languages():
     return {"flagship": _languages.FLAGSHIP, "languages": _languages.describe(_features.profile() == "hosted")}
 
 
+def _buyer_pricing(request: Request) -> Dict[str, Any]:
+    """Currency (None = not on sale there) and tax rule for this buyer's billing country."""
+    from billing import catalog as _cat, tax as _tax
+    cc = _buyer_country(request)
+    return {"currency": _cat.sale_currency(cc), "tax_rule": _tax.rule(cc)}
+
+
 def _buyer_country(request: Request, override: Optional[str] = None) -> str:
     """Explicit ?country= (catalog preview), else the account's billing country, else IN."""
     if override and re.fullmatch(r"[A-Za-z]{2}", override):
@@ -1264,7 +1271,7 @@ def create_quote(body: QuoteRequest, request: Request):
         q = _submissions().make_quote(draft_id=body.draft_id, owner_id=owner, languages=body.languages,
                                       minutes=body.minutes, style=body.style, quality=body.quality,
                                       batch=False, available=available,
-                                      currency=_cat.sale_currency(_buyer_country(request)) or "INR")
+                                      **_buyer_pricing(request))
     except _submission.SubmitError as e:
         _submit_error(e)
     c = _queue().counts()
@@ -1305,7 +1312,7 @@ def submit_draft(draft_id: str, body: SubmitRequest, request: Request):
             raise _submission.SubmitError("This quote was already used; get a new quote", 409)
         if int(time.time()) >= q["expires_at"]:
             raise _submission.SubmitError("The quote expired; get a new quote", 409)
-        if q["price_version"] != catalog.PRICE_VERSION:
+        if q["price_version"] != _quote_mod._version(q.get("currency") or None):
             raise _submission.SubmitError("Prices changed; get a new quote", 409)
         st.record_rights(owner, draft_id, body.rights_accepted, body.rights_version)
         if q["cash_minor"] > 0:
@@ -1504,7 +1511,10 @@ class BatchSubmitRequest(BaseModel):
 MAX_BATCH_ITEMS = 50
 
 
-def _quote_batch_children(owner, draft_ids, minutes, languages):
+from billing import quote as _quote_mod
+
+
+def _quote_batch_children(owner, draft_ids, minutes, languages, pairs=None):
     """Itemized child quotes funded only by Premium time; each child sees the
     Premium left after the children before it. Raises SubmitError naming the item."""
     led = _ledger()
@@ -1514,17 +1524,22 @@ def _quote_batch_children(owner, draft_ids, minutes, languages):
         led.close()
     prem_left = int(available.get("premium", 0))
     children = []
-    for n, did in enumerate(draft_ids, 1):
+    # one child per (upload, language): each child is one job and one reservation,
+    # so N languages are N dubs, and a failed language returns exactly its own time
+    if pairs is None:
+        pairs = [(n, did, lang) for n, did in enumerate(draft_ids, 1) for lang in languages]
+    for n, did, lang in pairs:
+        d = _submissions().draft(did, owner)
         try:
-            q = _submissions().make_quote(draft_id=did, owner_id=owner, languages=languages, minutes=minutes,
+            q = _submissions().make_quote(draft_id=did, owner_id=owner, languages=[lang], minutes=minutes,
                                           style="dialogue", quality="standard", batch=True,
                                           available={"premium": prem_left, "standard": 0})
         except _submission.SubmitError as e:
-            raise _submission.SubmitError(f"Item {n}: {e}", e.status)
+            raise _submission.SubmitError(f"Item {n} ({lang}): {e}", e.status)
         prem_left -= int(q["premium_seconds"])
-        d = _submissions().draft(did, owner)
-        children.append({"n": n, "draft_id": did, "filename": d["filename"], "quote_id": q["id"],
-                         "premium_seconds": int(q["premium_seconds"]), "job_id": None, "attempts": []})
+        children.append({"n": n, "draft_id": did, "filename": d["filename"], "language": lang,
+                         "quote_id": q["id"], "premium_seconds": int(q["premium_seconds"]),
+                         "job_id": None, "attempts": []})
     return children
 
 
@@ -1537,8 +1552,10 @@ def _start_batch_child(owner, acct, child, batch_id, rights_version) -> str:
     q = st.quote(child["quote_id"], owner)
     if q.get("used_job_id"):
         raise _submission.SubmitError(f"Item {child['n']}: quote already used", 409)
-    if int(time.time()) >= q["expires_at"] or q["price_version"] != catalog.PRICE_VERSION:
+    if int(time.time()) >= q["expires_at"] or q["price_version"] != _quote_mod._version(q.get("currency") or None):
         raise _submission.SubmitError("The batch price expired; price the batch again", 409)
+    if len(q["languages"]) != 1:      # older multi-language child quotes: never dub fewer than were paid for
+        raise _submission.SubmitError("This batch was priced before a fix; price the batch again", 409)
     d = st.draft(child["draft_id"], owner)
     hosted = _features.profile() == "hosted"
     req = JobCreateRequest(
@@ -1610,6 +1627,13 @@ def create_batch(body: BatchQuoteRequest, request: Request):
         raise HTTPException(status_code=422, detail="Add at least one upload to the batch")
     if len(ids) > MAX_BATCH_ITEMS or len(set(ids)) != len(ids):
         raise HTTPException(status_code=422, detail=f"A batch holds up to {MAX_BATCH_ITEMS} different uploads")
+    import languages as _languages
+    if not body.languages or len(set(body.languages)) != len(body.languages):
+        raise HTTPException(status_code=422, detail="Choose each target language once")
+    for lang in body.languages:
+        why = _languages.refusal(lang, _features.profile() == "hosted")
+        if why:
+            raise HTTPException(status_code=422, detail=why)
     try:
         children = _quote_batch_children(owner, ids, body.minutes, body.languages)
     except _submission.SubmitError as e:
@@ -1713,7 +1737,9 @@ def retry_batch_failures(batch_id: str, body: BatchSubmitRequest, request: Reque
                 failed.append(c)
         if not failed:
             raise _submission.SubmitError("No failed items to retry", 409)
-        fresh = _quote_batch_children(owner, [c["draft_id"] for c in failed], b["minutes"], b["languages"])
+        fresh = _quote_batch_children(owner, None, b["minutes"], None,
+                                      pairs=[(c["n"], c["draft_id"], c.get("language") or b["languages"][0])
+                                             for c in failed])
         for c, f in zip(failed, fresh):
             c["quote_id"], c["premium_seconds"] = f["quote_id"], f["premium_seconds"]
         for c in failed:

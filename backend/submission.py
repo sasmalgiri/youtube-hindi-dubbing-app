@@ -226,7 +226,7 @@ class SubmissionStore:
     # quotes
     def make_quote(self, *, draft_id: str, owner_id: Optional[str], languages: List[str], minutes: int,
                    style: str, quality: str, batch: bool, available: Dict[str, int],
-                   currency: str = "INR") -> Dict[str, Any]:
+                   currency: Optional[str] = "INR", tax_rule: Optional[Dict] = None) -> Dict[str, Any]:
         from billing import catalog
         from billing.quote import QuoteRefused, make_quote
         d = self.draft(draft_id, owner_id)
@@ -234,7 +234,7 @@ class SubmissionStore:
         try:
             q = make_quote(account_id=owner_id or "local", source_id=d["sha256"], source_duration=d["duration"],
                            languages=languages, style=style, quality=quality, start=0, end=end, batch=batch,
-                           available=available, now=self._now(), currency=currency)
+                           available=available, now=self._now(), currency=currency, tax_rule=tax_rule)
         except (QuoteRefused, catalog.NotPriced) as e:
             raise SubmitError(str(e), 422)
         body = q.to_dict()
@@ -245,7 +245,9 @@ class SubmissionStore:
                            (qid, owner_id, draft_id, json.dumps(body), self._now()))
         body["id"] = qid
         body["display"] = {
-            "cash": catalog.fmt_money(q.cash_minor), "tax": catalog.fmt_money(q.tax_minor),
+            "cash": catalog.fmt_money(q.cash_minor, currency) if currency else "",
+            "tax": catalog.fmt_money(q.tax_minor, currency) if currency else "", "tax_label": q.tax_label,
+            "currency": currency or "",
             "standard": catalog.fmt_seconds(q.standard_seconds), "premium": catalog.fmt_seconds(q.premium_seconds),
             "billed": catalog.fmt_seconds(sum(l.billable_seconds for l in q.lines)),
         }

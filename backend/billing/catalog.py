@@ -109,6 +109,8 @@ def pack_price(pack_id: str, currency: str) -> int:
 
 
 def price_version(currency: str) -> str:
+    if currency == CURRENCY:
+        return PRICE_VERSION          # the INR version is the module constant (bumped in one place)
     return PRICE_LISTS[currency]["version"]
 
 

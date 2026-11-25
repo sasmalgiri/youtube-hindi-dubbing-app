@@ -118,3 +118,34 @@ def test_batches_are_private_and_survive_sign_out(env, media):
     assert c.get(f"/api/batches/{b['id']}").status_code == 401
     c3, _ = env["client"]("a@example.com")                          # signs in again
     assert c3.get(f"/api/batches/{b['id']}").json()["status"] == "quoted"
+
+
+
+def test_two_languages_make_two_dubs_and_a_failed_one_refunds_only_itself(env, media, monkeypatch):
+    monkeypatch.setenv("VOICEDUB_PREVIEW_LANGUAGES", "hi,bn")
+    c, uid = env["client"]("ml@example.com")
+    grant_premium(env, uid, 3_600, "pay:ml")
+    ids = _drafts(c, media, 1)
+    b = c.post("/api/batches", json={"draft_ids": ids, "languages": ["hi", "bn"]}).json()
+    assert [(k["language"], k["premium_seconds"]) for k in b["children"]] == [("hi", 91), ("bn", 91)]
+    runner = env["runner"]
+
+    def pick(job, req):                      # Bengali fails, Hindi is delivered
+        if req.target_language == "bn":
+            job.state, job.error = "error", "boom"
+            return
+        return runner(job, req)
+    monkeypatch.setattr(env["app"], "_job_runner", lambda: pick)
+    assert _start(c, b["id"]).json()["duplicate"] is False
+    v = c.get(f"/api/batches/{b['id']}").json()
+    outcome = {k["language"]: wait_closed(env, k["job_id"]) for k in v["children"]}
+    assert outcome == {"hi": "settled", "bn": "released"}
+    p = prem(env, uid)
+    assert (p.consumed, p.reserved, p.spendable) == (91, 0, 3_600 - 91)
+
+
+def test_batch_refuses_languages_not_open_here(env, media):
+    c, uid = env["client"]("nl@example.com")
+    grant_premium(env, uid, 3_600, "pay:nl")
+    r = c.post("/api/batches", json={"draft_ids": _drafts(c, media, 1), "languages": ["hi", "es"]})
+    assert r.status_code == 422 and "Spanish" in r.json()["detail"]

@@ -55,7 +55,8 @@ class Quote:
     premium_seconds: int = 0
     cash_seconds: int = 0
     cash_minor: int = 0            # job charge (tax-inclusive)
-    tax_minor: int = 0             # GST share of cash_minor
+    tax_minor: int = 0             # tax share of cash_minor under the buyer's rule
+    tax_label: str = ""            # e.g. "GST 18% (included)" / "No GST: export of services"
     max_cash_minor: int = 0        # never charge more than this for this quote
     notes: List[str] = field(default_factory=list)
     binding: str = ""
@@ -92,10 +93,19 @@ def _binding(**kw) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def _version(currency: Optional[str]) -> str:
+    """The price version of the quote's currency ('' when nothing is on sale)."""
+    if not currency:
+        return ""
+    return catalog.price_version(currency) if currency in catalog.PRICE_LISTS else catalog.PRICE_VERSION
+
+
 def make_quote(*, account_id: str, source_id: str, source_duration: float, languages: Sequence[str],
                style: str = "dialogue", quality: str = "standard", start: Optional[float] = None,
                end: Optional[float] = None, batch: bool = False, available: Optional[Dict[str, int]] = None,
-               now: int, currency: str = catalog.CURRENCY) -> Quote:
+               now: int, currency: Optional[str] = catalog.CURRENCY, tax_rule: Optional[Dict] = None) -> Quote:
+    """currency None = the buyer's country is not on sale (time-only quotes still work).
+    tax_rule: billing.tax.rule(country); default India GST."""
     """``available``: spendable seconds per credit type from the ledger (may be empty)."""
     langs = [l.strip() for l in languages if l and l.strip()]
     if not langs:
@@ -117,17 +127,22 @@ def make_quote(*, account_id: str, source_id: str, source_duration: float, langu
             ln.standard_seconds = min(need, std_left); std_left -= ln.standard_seconds; need -= ln.standard_seconds
         ln.premium_seconds = min(need, prem_left); prem_left -= ln.premium_seconds; need -= ln.premium_seconds
         ln.cash_seconds = need
+        if need and currency is None:
+            raise QuoteRefused("your balance does not cover this, and prepaid time is not on sale in your country yet")
         ln.cash_minor = catalog.cash_minor(need, currency) if need else 0
         lines.append(ln)
 
     q = Quote(account_id=account_id, source_id=source_id, interval=interval, languages=langs, style=style,
-              quality=quality, batch=batch, currency=currency, price_version=catalog.PRICE_VERSION, lines=lines,
+              quality=quality, batch=batch, currency=currency or "", price_version=_version(currency), lines=lines,
               created_at=int(now), expires_at=int(now) + QUOTE_TTL_SECONDS)
     q.standard_seconds = sum(l.standard_seconds for l in lines)
     q.premium_seconds = sum(l.premium_seconds for l in lines)
     q.cash_seconds = sum(l.cash_seconds for l in lines)
     q.cash_minor = sum(l.cash_minor for l in lines)
-    q.tax_minor = catalog.tax_inclusive_share(q.cash_minor)
+    from billing import tax as _tax
+    rule = tax_rule or _tax.rule("IN")
+    q.tax_minor = _tax.tax_minor(q.cash_minor, rule)
+    q.tax_label = rule["label"]
     q.max_cash_minor = q.cash_minor
     if batch and q.cash_seconds:
         raise QuoteRefused(
@@ -135,10 +150,10 @@ def make_quote(*, account_id: str, source_id: str, source_duration: float, langu
             f"(Standard time and per-job cash cannot fund a batch)")
     if q.cash_seconds:
         q.notes.append(f"{catalog.fmt_seconds(q.cash_seconds)} not covered by your balance: "
-                       f"{catalog.fmt_money(q.cash_minor, currency)} incl. GST")
+                       f"{catalog.fmt_money(q.cash_minor, currency)} ({rule['label']})")
     q.binding = _binding(account_id=account_id, source_id=source_id, interval=interval, languages=langs,
-                         style=style, quality=quality, batch=batch, currency=currency,
-                         price_version=catalog.PRICE_VERSION, std=q.standard_seconds, prem=q.premium_seconds,
+                         style=style, quality=quality, batch=batch, currency=currency or "",
+                         price_version=_version(currency), std=q.standard_seconds, prem=q.premium_seconds,
                          cash=q.cash_minor, expires_at=q.expires_at)
     return q
 
@@ -148,7 +163,7 @@ def check_still_valid(q: Quote, *, now: int, account_id: str, source_id: str, in
     """Raise QuoteRefused when the quote expired, the price version moved, or the draft changed."""
     if now >= q.expires_at:
         raise QuoteRefused("the quote expired; get a new quote")
-    if q.price_version != catalog.PRICE_VERSION:
+    if q.price_version != _version(q.currency or None):
         raise QuoteRefused("prices changed since this quote; get a new quote")
     same = (q.account_id == account_id and q.source_id == source_id and list(q.interval) == list(interval)
             and list(q.languages) == list(languages) and q.style == style and q.quality == quality

@@ -164,7 +164,7 @@ export default function CreatePage() {
                         <dt className="text-text-muted">Time billed</dt><dd className="text-text-primary">{quote.display.billed}</dd>
                         <dt className="text-text-muted">From Standard time</dt><dd className="text-text-primary">{quote.display.standard}</dd>
                         <dt className="text-text-muted">From Premium time</dt><dd className="text-text-primary">{quote.display.premium}</dd>
-                        <dt className="text-text-muted">To pay now</dt><dd className="text-text-primary font-semibold">{quote.display.cash} <span className="text-xs text-text-muted font-normal">(incl. GST {quote.display.tax})</span></dd>
+                        <dt className="text-text-muted">To pay now</dt><dd className="text-text-primary font-semibold">{quote.display.cash} <span className="text-xs text-text-muted font-normal">({quote.display.tax_label || 'tax'}{quote.tax_minor > 0 ? ` ${quote.display.tax}` : ''})</span></dd>
                     </dl>
                     {cashDue && (
                         <p className="text-sm text-amber-300">
