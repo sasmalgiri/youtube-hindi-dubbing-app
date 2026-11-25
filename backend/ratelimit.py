@@ -19,6 +19,8 @@ RULES: Sequence[Tuple[str, Optional[str], int]] = (
     ("/api/auth/google", "POST", 10),
     ("/api/drafts", "POST", 20),
     ("/api/quotes", "POST", 30),
+    ("/api/uploads/", "PUT", 120),          # 50 MB pieces: a 2 GB file is 41 requests
+    ("/api/uploads", "POST", 30),
     ("/api/checkout", "POST", 20),
     ("/api/account/delete", "POST", 5),
     ("/api/", None, 600),

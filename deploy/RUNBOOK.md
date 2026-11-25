@@ -7,6 +7,7 @@ One Windows machine runs everything: the backend on `127.0.0.1:8000`, the web ap
 1. **Keys.** Put every key in `backend\.env` (never in chat or git). Then run
    `cd backend; python setup_check.py --live` until it shows no red lines.
    Required in hosted: Razorpay (live), Google TTS (Chirp), SMTP, Google OAuth client id, `VOICEDUB_ADMIN_TOKEN` (any long random string), `VOICEDUB_CORS_ORIGINS=https://app.example.com`.
+   Pilot: `VOICEDUB_PREVIEW_LANGUAGES=hi` lets invited users dub Hindi before the listener sign-off; checkout stays closed until a language is signed off in `backend/quality/signoffs.json` (with the exact voice).
    Optional: `VOICEDUB_ALERT_EMAIL` (where alerts go), `VOICEDUB_CURRENCIES=INR,USD,EUR,GBP` (once prices are approved), `VOICEDUB_BACKUP_DIR` (a folder that syncs off this machine), `NEXT_PUBLIC_BRAND`.
 2. **Build the web app.** `cd web; npx next build`
 3. **Tunnel.** Follow the comments in `deploy\cloudflared.yml` (login, create, route DNS, install as a service).
@@ -43,5 +44,5 @@ Open `/admin`. It shows active alerts, the queue, dubs in the last 24 h, failure
 ## Limits worth knowing
 
 - Request limits per visitor (per minute): 5 sign-in codes, 20 uploads, 30 quotes, 20 checkouts, 600 API calls overall (`backend\ratelimit.py`).
-- Uploads up to 2048 MB (`VOICEDUB_MAX_UPLOAD_MB`), but Cloudflare's free plan stops request bodies at 100 MB.
+- Uploads up to 2048 MB (`VOICEDUB_MAX_UPLOAD_MB`). Files over 50 MB are sent in 50 MB pieces (each piece retried, so a flaky connection resumes), which keeps every request under Cloudflare's 100 MB limit. Unfinished uploads are removed after 24 h.
 - Each dub can be re-voiced 5 times for free (`VOICEDUB_MAX_REVOICES`); only changed lines are voiced again.

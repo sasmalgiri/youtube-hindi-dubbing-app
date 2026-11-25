@@ -159,7 +159,6 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 | Razorpay test key id/secret + webhook secret | W5 |
 | `GOOGLE_TTS_API_KEY` with Text-to-Speech enabled | Chirp 3 HD voices |
 | `VOICEDUB_ADMIN_TOKEN`, `VOICEDUB_ALERT_EMAIL` | `/admin` page and emailed alerts |
-| Large uploads through the tunnel: Cloudflare's free plan stops request bodies at 100 MB (decide: chunked upload, or a paid plan) | uploads over 100 MB |
 
 ## Ship-readiness pass (2026-11-25)
 
@@ -175,3 +174,16 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 | Owner `/admin` overview + alerts every 5 min (`ops/health.py`, `alerts.jsonl`, email when SMTP set) | done | `test_ops_health.py`, browser check |
 | Deploy kit: `deploy/start-hosted.ps1`, `install-tasks.ps1`, `backup-nightly.ps1`, `cloudflared.yml`, `RUNBOOK.md` | done | backup script run once; scripts parse |
 | 24 h soak | running | – |
+
+## External review fixes (2026-11-25, review of efdfbea)
+
+| Item | State | Evidence |
+| --- | --- | --- |
+| Quotes priced, labelled and versioned in the buyer's currency and tax rule (USD was shown as ₹ + GST); not-on-sale countries refused | done | `test_worldwide_billing.py` (unit + API) |
+| Premium batches: one child per upload × language; failed language refunds only itself; retry per child; hosted language gate | done | `test_batches.py` |
+| Paid dubs need their subtitle file; output must be within 3 % (and 2 s) of the paid length | done | `test_delivery_check.py` |
+| Every language incl. Hindi needs a sign-off bound to the exact voice; `VOICEDUB_PREVIEW_LANGUAGES` for the invite pilot; checkout closed until a language is signed off | done | `test_languages.py`, `test_payments.py` |
+| Glossary test independent of the gitignored glossary | done | `test_languages.py` |
+| Next.js 15.5.29 + React 19.2.9 (14.x had an unpatched critical RCE on Windows hosts); npm audit 0; proxy body limit 64 MB | done | browser re-runs; CI audit step |
+| CI runs 22 release test modules + dependency audit | done | GitHub run for 778d6af: success |
+| Resumable 50 MB-piece uploads (137 MB through the proxy, dropped piece retried) | done | `test_chunked_upload.py`, browser check |

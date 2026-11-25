@@ -10,5 +10,5 @@ ingress:
     service: http://127.0.0.1:3000      # the web app; it proxies /api to the backend on 127.0.0.1:8000
     originRequest:
       connectTimeout: 30s
-      # large uploads: Cloudflare's free plan caps request bodies at 100 MB
+      # uploads over 50 MB arrive in 50 MB pieces, under Cloudflare's 100 MB request cap
   - service: http_status:404

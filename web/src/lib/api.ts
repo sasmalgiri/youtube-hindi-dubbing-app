@@ -1089,7 +1089,37 @@ export interface QuoteInfo {
     notes: string[]; display: { cash: string; tax: string; tax_label?: string; currency?: string; standard: string; premium: string; billed: string };
 }
 
-export async function uploadDraft(file: File): Promise<DraftInfo> {
+const CHUNKED_ABOVE = 50 * 1024 * 1024;   // larger files go in pieces (the tunnel caps one request at 100 MB)
+
+async function uploadChunked(file: File, onProgress?: (fraction: number) => void): Promise<DraftInfo> {
+    const u = await authFetch<{ id: string; chunk_size: number; chunks: number; received: number[] }>(
+        '/api/uploads', { method: 'POST', body: JSON.stringify({ filename: file.name, size: file.size }) });
+    let done = 0;
+    for (let i = 0; i < u.chunks; i++) {
+        const piece = file.slice(i * u.chunk_size, Math.min(file.size, (i + 1) * u.chunk_size));
+        for (let attempt = 1; ; attempt++) {           // a dropped piece is simply sent again
+            try {
+                const res = await fetch(`${API_BASE}/api/uploads/${u.id}/chunks/${i}`, {
+                    method: 'PUT', body: piece, credentials: 'include', headers: { ...EXTRA_HEADERS } });
+                if (res.ok) break;
+                if (res.status < 500 && res.status !== 429) {
+                    const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+                    throw Object.assign(new Error(typeof err.detail === 'string' ? err.detail : `Upload failed (HTTP ${res.status})`), { fatal: true });
+                }
+                throw new Error(`HTTP ${res.status}`);
+            } catch (e) {
+                if ((e as { fatal?: boolean }).fatal || attempt >= 4) throw e;
+                await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+            }
+        }
+        done += piece.size;
+        onProgress?.(done / file.size);
+    }
+    return authFetch<DraftInfo>(`/api/uploads/${u.id}/complete`, { method: 'POST' });
+}
+
+export async function uploadDraft(file: File, onProgress?: (fraction: number) => void): Promise<DraftInfo> {
+    if (file.size > CHUNKED_ABOVE) return uploadChunked(file, onProgress);
     const form = new FormData();
     form.append('file', file);
     const res = await fetch(`${API_BASE}/api/drafts`, { method: 'POST', body: form, credentials: 'include', headers: { ...EXTRA_HEADERS } });

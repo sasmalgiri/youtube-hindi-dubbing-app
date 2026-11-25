@@ -51,7 +51,7 @@ jobs:
           tests_dialogue/test_mt_guard.py tests_dialogue/test_storage_setup.py tests_dialogue/test_narration.py
           tests_dialogue/test_speaker_review.py tests_dialogue/test_translation_bench.py
           tests_dialogue/test_provider_failures.py tests_dialogue/test_load_stress.py
-          tests_dialogue/test_e2e_review_revoice.py
+          tests_dialogue/test_e2e_review_revoice.py tests_dialogue/test_chunked_upload.py
 
   web:
     runs-on: ubuntu-latest

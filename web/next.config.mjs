@@ -10,6 +10,11 @@ import { fileURLToPath } from 'node:url';
 
 const nextConfig = {
     reactStrictMode: true,
+    experimental: {
+        // The /api proxy cuts request bodies at 10 MB by default (Next 15). Uploads over
+        // 50 MB go in 50 MB pieces (lib/api.ts uploadChunked), so 64 MB covers every request.
+        middlewareClientMaxBodySize: '64mb',
+    },
     // a stray lockfile in the user folder must not become the tracing root
     outputFileTracingRoot: path.dirname(fileURLToPath(import.meta.url)),
     async rewrites() {

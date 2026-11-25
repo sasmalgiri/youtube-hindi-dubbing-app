@@ -23,6 +23,7 @@ export default function CreatePage() {
     const auth = useAuth();
     const [draft, setDraft] = useState<DraftInfo | null>(null);
     const [uploading, setUploading] = useState(false);
+    const [uploadPct, setUploadPct] = useState<number | null>(null);
     const [mode, setMode] = useState<'full' | 'first'>('full');
     const [minutes, setMinutes] = useState(10);
     const [quote, setQuote] = useState<QuoteInfo | null>(null);
@@ -62,9 +63,10 @@ export default function CreatePage() {
     const onFile = async (f: File | null) => {
         if (!f) return;
         setUploading(true); setError(null); setDraft(null);
-        try { setDraft(await uploadDraft(f)); }
+        setUploadPct(0);
+        try { setDraft(await uploadDraft(f, (x) => setUploadPct(Math.round(x * 100)))); }
         catch (e) { setError(e instanceof Error ? e.message : 'Upload failed'); }
-        finally { setUploading(false); }
+        finally { setUploading(false); setUploadPct(null); }
     };
 
     const price = async () => {
@@ -109,7 +111,7 @@ export default function CreatePage() {
                 <label className="block cursor-pointer border-2 border-dashed rounded-xl p-5 text-center border-border hover:border-primary/50 hover:bg-primary/5">
                     <input type="file" accept=".mp4,.mov,.mkv,.webm,.m4v,.avi,.mp3,.wav,.m4a" className="sr-only"
                         onChange={(e) => onFile(e.target.files?.[0] || null)} disabled={uploading} aria-label="Choose a video file" />
-                    <span className="text-sm text-text-muted">{uploading ? 'Uploading and checking the file…' : draft ? 'Choose a different file' : 'Choose a video or audio file'}</span>
+                    <span className="text-sm text-text-muted">{uploading ? (uploadPct !== null && uploadPct > 0 && uploadPct < 100 ? `Uploading… ${uploadPct}%` : 'Uploading and checking the file…') : draft ? 'Choose a different file' : 'Choose a video or audio file'}</span>
                 </label>
                 {draft && (
                     <div className="text-sm text-text-primary space-y-1" data-testid="draft">

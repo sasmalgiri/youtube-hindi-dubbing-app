@@ -31,7 +31,19 @@ MAX_UPLOAD_BYTES = int(os.environ.get("VOICEDUB_MAX_UPLOAD_MB", "2048")) * 1024 
 MAX_SOURCE_SECONDS = int(os.environ.get("VOICEDUB_MAX_SOURCE_MINUTES", "180")) * 60
 ALLOWED_EXT = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".mp3", ".wav", ".m4a")
 
+CHUNK_BYTES = 50 * 1024 * 1024       # per request: under Cloudflare's 100 MB request-body cap
+UPLOAD_TTL_S = 24 * 3600             # unfinished resumable uploads are removed after this
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS uploads (
+    id          TEXT PRIMARY KEY,
+    owner_id    TEXT,
+    filename    TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    chunk       INTEGER NOT NULL,
+    received    TEXT NOT NULL DEFAULT '[]',   -- JSON list of chunk indexes on disk
+    created_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS drafts (
     id          TEXT PRIMARY KEY,
     owner_id    TEXT,
@@ -140,6 +152,7 @@ class SubmissionStore:
         self.drafts_dir.mkdir(parents=True, exist_ok=True)
         self._clock = clock
         self._lock = threading.Lock()
+        self._upload_lock = threading.Lock()     # chunk bookkeeping (helpers below take _lock themselves)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
@@ -173,11 +186,108 @@ class SubmissionStore:
             except OSError:
                 pass
         n = self.owner_counts(owner_id)
+        for (uid,) in self._x("SELECT id FROM uploads WHERE owner_id=?", (owner_id,)).fetchall():
+            self._drop_upload(uid)
         self._x("DELETE FROM drafts WHERE owner_id=?", (owner_id,))
         self._x("DELETE FROM quotes WHERE owner_id=?", (owner_id,))
         self._x("DELETE FROM batches WHERE owner_id=?", (owner_id,))
         self._x("DELETE FROM submissions WHERE owner_key LIKE ?", (f"{owner_id}:%",))
         return n
+
+    # resumable uploads (large files in CHUNK_BYTES pieces; each piece can be retried)
+    def _upload_part(self, uid: str) -> Path:
+        return self.drafts_dir / f"{uid}.upload"
+
+    def _drop_upload(self, uid: str) -> None:
+        try:
+            self._upload_part(uid).unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._x("DELETE FROM uploads WHERE id=?", (uid,))
+
+    def _upload_row(self, uid: str, owner_id: Optional[str]) -> Dict[str, Any]:
+        r = self._one("SELECT id, owner_id, filename, size, chunk, received, created_at FROM uploads WHERE id=?", (uid,))
+        if r is None or r[1] != owner_id:
+            raise SubmitError("Upload not found", 404)
+        return {"id": r[0], "filename": r[2], "size": r[3], "chunk_size": r[4], "received": json.loads(r[5]),
+                "chunks": -(-r[3] // r[4]), "created_at": r[6]}
+
+    def start_upload(self, owner_id: Optional[str], filename: str, size: int) -> Dict[str, Any]:
+        self.expire_uploads()
+        name = Path(filename or "").name
+        ext = Path(name).suffix.lower()
+        if ext not in ALLOWED_EXT:
+            raise SubmitError(f"Unsupported file type {ext or '(none)'}; use {', '.join(ALLOWED_EXT)}", 415)
+        if size <= 0:
+            raise SubmitError("The file is empty", 400)
+        if size > MAX_UPLOAD_BYTES:
+            raise SubmitError(f"The file is larger than {MAX_UPLOAD_BYTES // 2**20} MB", 413)
+        if owner_id is not None:
+            open_n = self._one("SELECT COUNT(*) FROM uploads WHERE owner_id=?", (owner_id,))[0]
+            if open_n >= 5:
+                raise SubmitError("Too many unfinished uploads; finish or wait for them to expire", 429)
+        uid = "u_" + secrets.token_hex(8)
+        with open(self._upload_part(uid), "wb") as f:
+            f.truncate(size)                     # sparse file: chunks land at their offsets
+        self._x("INSERT INTO uploads(id, owner_id, filename, size, chunk, created_at) VALUES (?,?,?,?,?,?)",
+                (uid, owner_id, name[:200], int(size), CHUNK_BYTES, self._now()))
+        return self._upload_row(uid, owner_id)
+
+    def upload_status(self, uid: str, owner_id: Optional[str]) -> Dict[str, Any]:
+        return self._upload_row(uid, owner_id)
+
+    async def put_chunk(self, uid: str, owner_id: Optional[str], index: int, stream) -> Dict[str, Any]:
+        """``stream``: async iterator of bytes (request.stream()). Same chunk twice = overwritten, harmless."""
+        u = self._upload_row(uid, owner_id)
+        if not 0 <= index < u["chunks"]:
+            raise SubmitError("Chunk number out of range", 400)
+        want = min(u["chunk_size"], u["size"] - index * u["chunk_size"])
+        got = 0
+        with open(self._upload_part(uid), "r+b") as f:
+            f.seek(index * u["chunk_size"])
+            async for piece in stream:
+                got += len(piece)
+                if got > want:
+                    raise SubmitError("Chunk is larger than expected", 400)
+                f.write(piece)
+        if got != want:
+            raise SubmitError(f"Chunk {index} arrived incomplete ({got} of {want} bytes); send it again", 400)
+        with self._upload_lock:                  # read-modify-write of the received list
+            r = self._one("SELECT received FROM uploads WHERE id=?", (uid,))
+            rec = sorted(set(json.loads(r[0])) | {index})
+            self._x("UPDATE uploads SET received=? WHERE id=?", (json.dumps(rec), uid))
+        return {"received": len(rec), "chunks": u["chunks"]}
+
+    def finish_upload(self, uid: str, owner_id: Optional[str]) -> Dict[str, Any]:
+        u = self._upload_row(uid, owner_id)
+        missing = sorted(set(range(u["chunks"])) - set(u["received"]))
+        if missing:
+            raise SubmitError(f"{len(missing)} chunk(s) still missing (first: {missing[0]})", 409)
+        ext = Path(u["filename"]).suffix.lower()
+        did = "d_" + secrets.token_hex(8)
+        final = self.drafts_dir / f"{did}{ext}"
+        h = hashlib.sha256()
+        with open(self._upload_part(uid), "rb") as f:
+            while block := f.read(1024 * 1024):
+                h.update(block)
+        os.replace(self._upload_part(uid), final)
+        self._x("DELETE FROM uploads WHERE id=?", (uid,))
+        try:
+            probe = probe_media(final)
+        except BaseException:
+            final.unlink(missing_ok=True)
+            raise
+        self._x("INSERT INTO drafts(id, owner_id, path, filename, size, sha256, duration, probe, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (did, owner_id, str(final), u["filename"], u["size"], h.hexdigest(), probe["duration"],
+                 json.dumps(probe), self._now()))
+        return self.draft(did, owner_id)
+
+    def expire_uploads(self) -> int:
+        old = self._x("SELECT id FROM uploads WHERE created_at < ?", (self._now() - UPLOAD_TTL_S,)).fetchall()
+        for (uid,) in old:
+            self._drop_upload(uid)
+        return len(old)
 
     # drafts
     async def save_upload(self, upload, owner_id: Optional[str]) -> Dict[str, Any]:

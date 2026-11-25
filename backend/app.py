@@ -1228,6 +1228,49 @@ async def create_draft(request: Request, file: UploadFile = File(...)):
         _submit_error(e)
 
 
+class UploadStart(BaseModel):
+    filename: str
+    size: int
+
+
+@app.post("/api/uploads")
+def start_upload(body: UploadStart, request: Request):
+    """Resumable upload for large files: send CHUNK_BYTES pieces with PUT, then complete.
+    Each request stays under the tunnel's request-size cap; a failed piece is just sent again."""
+    owner = _require_owner(request)
+    try:
+        return _submissions().start_upload(owner, body.filename, body.size)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
+@app.get("/api/uploads/{upload_id}")
+def upload_status(upload_id: str, request: Request):
+    try:
+        return _submissions().upload_status(upload_id, _require_owner(request))
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
+@app.put("/api/uploads/{upload_id}/chunks/{index}")
+async def put_upload_chunk(upload_id: str, index: int, request: Request):
+    owner = _require_owner(request)
+    try:
+        return await _submissions().put_chunk(upload_id, owner, index, request.stream())
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
+@app.post("/api/uploads/{upload_id}/complete")
+def complete_upload(upload_id: str, request: Request):
+    """Assemble, checksum and probe: the result is an ordinary draft (same as POST /api/drafts)."""
+    owner = _require_owner(request)
+    try:
+        return _submissions().finish_upload(upload_id, owner)
+    except _submission.SubmitError as e:
+        _submit_error(e)
+
+
 @app.get("/api/drafts/{draft_id}")
 def get_draft(draft_id: str, request: Request):
     try:
