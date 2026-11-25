@@ -1,5 +1,7 @@
 'use client';
 
+import { BRAND_SPLIT } from '@/lib/brand';
+
 export default function Header() {
     return (
         <header className="h-16 border-b border-border bg-card/50 backdrop-blur-sm flex items-center px-6 sticky top-0 z-50">
@@ -12,12 +14,12 @@ export default function Header() {
                     </svg>
                 </div>
                 <h1 className="text-lg font-semibold text-text-primary">
-                    Hindi<span className="text-primary">Dub</span>
+                    {BRAND_SPLIT[0]}<span className="text-primary">{BRAND_SPLIT[1]}</span>
                 </h1>
             </div>
             <div className="ml-auto flex items-center gap-4">
                 <span className="text-xs text-text-muted px-3 py-1 rounded-full bg-white/5 border border-border">
-                    Hindi Dubbing
+                    AI Dubbing
                 </span>
             </div>
         </header>

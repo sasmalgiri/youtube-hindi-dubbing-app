@@ -3,8 +3,8 @@ import type { Metadata } from 'next';
 import Sidebar from '@/components/Sidebar';
 
 export const metadata: Metadata = {
-    title: 'YouTube Hindi Dubbing',
-    description: 'Dub YouTube videos into Hindi with AI-powered voice synthesis.',
+    title: process.env.NEXT_PUBLIC_BRAND || 'VoiceDub',
+    description: 'Dub your videos into other languages with AI translation and voices.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

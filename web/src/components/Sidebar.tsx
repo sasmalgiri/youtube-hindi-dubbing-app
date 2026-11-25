@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { getJobs, type JobStatus } from '@/lib/api';
 import { formatTimeAgo } from '@/lib/utils';
+import { BRAND_SPLIT } from '@/lib/brand';
 
 interface SidebarProps {
     onNewDubbing?: () => void;
@@ -13,7 +14,8 @@ interface SidebarProps {
 
 export default function Sidebar({ onNewDubbing }: SidebarProps) {
     const [jobs, setJobs] = useState<JobStatus[]>([]);
-    const { isOn } = useFeatures();
+    const { isOn, profile } = useFeatures();
+    const hosted = profile === 'hosted';
 
     useEffect(() => {
         const load = () => {
@@ -44,12 +46,13 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                     </svg>
                 </div>
                 <span className="text-lg font-semibold text-text-primary">
-                    Hindi<span className="text-primary">Dub</span>
+                    {BRAND_SPLIT[0]}<span className="text-primary">{BRAND_SPLIT[1]}</span>
                 </span>
             </div>
 
             {/* New Dubbing Button */}
             <div className="p-4">
+                {!hosted && (<>
                 <Link
                     href="/"
                     onClick={onNewDubbing}
@@ -67,11 +70,12 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                 >
                     Modules (on/off)
                 </Link>
+                </>)}
                 <Link
                     href="/create"
                     className="mt-2 w-full flex items-center justify-center gap-2 text-xs text-text-muted hover:text-text-primary py-1.5 rounded-lg border border-white/10 hover:bg-white/5"
                 >
-                    New dub (prepaid flow)
+                    {hosted ? 'New dub' : 'New dub (prepaid flow)'}
                 </Link>
                 <Link
                     href="/history"
@@ -133,7 +137,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
             {/* Footer */}
             <div className="p-4 border-t border-border">
                 <p className="text-[10px] text-text-muted text-center">
-                    Powered by Whisper + Chatterbox AI
+                    AI translation and voices · review before publishing
                 </p>
             </div>
         </aside>
