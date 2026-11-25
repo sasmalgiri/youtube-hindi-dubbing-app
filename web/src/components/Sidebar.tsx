@@ -16,6 +16,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
     const [jobs, setJobs] = useState<JobStatus[]>([]);
     const { isOn, profile } = useFeatures();
     const hosted = profile === 'hosted';
+    const [open, setOpen] = useState(false);   // phones: the sidebar is a drawer behind the menu button
 
     useEffect(() => {
         const load = () => {
@@ -35,7 +36,17 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
     };
 
     return (
-        <aside className="w-64 h-screen border-r border-border bg-card/30 flex flex-col fixed left-0 top-0">
+        <>
+        <div className="md:hidden fixed top-0 inset-x-0 h-14 z-40 flex items-center gap-3 px-4 border-b border-border bg-background">
+            <button type="button" aria-label={open ? 'Close menu' : 'Open menu'} aria-expanded={open} onClick={() => setOpen(!open)}
+                    className="p-2 -ml-2 rounded-lg hover:bg-white/5">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+            </button>
+            <span className="font-semibold">{BRAND_SPLIT[0]}<span className="text-primary">{BRAND_SPLIT[1]}</span></span>
+        </div>
+        {open && <div className="md:hidden fixed inset-0 z-40 bg-black/50" onClick={() => setOpen(false)} />}
+        <aside onClick={(e) => { if ((e.target as HTMLElement).closest('a')) setOpen(false); }}
+               className={`w-64 h-screen border-r border-border bg-background md:bg-card/30 flex-col fixed left-0 top-0 z-50 ${open ? 'flex' : 'hidden md:flex'}`}>
             {/* Logo */}
             <div className="h-16 flex items-center px-5 border-b border-border">
                 <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center mr-3">
@@ -92,6 +103,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                     </Link>
                 )}
                 <AccountLink />
+                <Link href="/pricing" className="mt-2 block text-center text-[11px] text-text-muted hover:text-text-primary">Pricing &amp; languages</Link>
                 <Link href="/legal" className="mt-2 block text-center text-[11px] text-text-muted hover:text-text-primary">Terms · Refunds · Privacy</Link>
             </div>
 
@@ -141,6 +153,7 @@ export default function Sidebar({ onNewDubbing }: SidebarProps) {
                 </p>
             </div>
         </aside>
+        </>
     );
 }
 

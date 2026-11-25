@@ -625,7 +625,7 @@ export async function submitDialogueReview(jobId: string, edits: DialogueEdits):
 }
 
 /** Re-voice a finished dialogue job from its own checkpoint (new run, same job). */
-export async function revoiceDialogue(jobId: string, body: DialogueRevoiceRequest): Promise<{ status: string }> {
+export async function revoiceDialogue(jobId: string, body: DialogueRevoiceRequest): Promise<{ status: string; revoices_left?: number }> {
     const res = await fetch(`${API_BASE}/api/jobs/${jobId}/dialogue/revoice`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...EXTRA_HEADERS },
@@ -1156,7 +1156,8 @@ export interface OrderInfo {
     id: string; pack_id: string; credit_type: string; seconds: number; amount_minor: number; status: string;
     receipt_no: string | null; paid_at: number | null; display: { amount: string; tax: string; net: string; time: string };
 }
-export const getCatalog = () => authFetch<CatalogInfo>('/api/catalog');
+export const getCatalog = (country?: string) =>
+    authFetch<CatalogInfo>(country ? `/api/catalog?country=${encodeURIComponent(country)}` : '/api/catalog');
 export const startCheckout = (pack_id: string) => authFetch<CheckoutOrder>('/api/checkout', { method: 'POST', body: JSON.stringify({ pack_id }) });
 export const verifyCheckout = (body: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) =>
     authFetch<OrderInfo>('/api/checkout/verify', { method: 'POST', body: JSON.stringify(body) });
@@ -1169,3 +1170,22 @@ export const getDeletionPlan = () => authFetch<DeletionPlan>('/api/account/delet
 export const deleteAccount = (confirm_email: string) =>
     authFetch<{ deleted: boolean; jobs_removed: number }>('/api/account/delete', { method: 'POST', body: JSON.stringify({ confirm_email }) });
 export const receiptUrl = (orderId: string) => `${API_BASE}/api/account/receipts/${encodeURIComponent(orderId)}`;
+
+// ── Owner admin (ops/health.py) ──
+export interface AdminAlert { key: string; level: 'critical' | 'warning'; text: string; at?: number; emailed?: boolean }
+export interface AdminOverview {
+    snapshot: {
+        at: number;
+        queue: { by_state: Record<string, number>; oldest_queued_s: number; expired_leases: number };
+        jobs_24h: { total: number; failed: number; done: number; recent_failures: { id: string; error: string }[] };
+        orders_30d: Record<string, { count: number; amount_minor: number }>;
+        paid_by_currency_30d: { currency: string; paid: number; amount_minor: number }[];
+        disk: { free_gb: number; total_gb: number };
+        backup: { dir: string; last_at: number | null; age_h: number | null };
+    };
+    reconcile: Record<string, string[]>;
+    alerts: AdminAlert[];
+    recent_alerts: AdminAlert[];
+}
+export const getAdminOverview = (token: string) =>
+    authFetch<AdminOverview>('/api/admin/overview', { headers: { 'x-admin-token': token } });

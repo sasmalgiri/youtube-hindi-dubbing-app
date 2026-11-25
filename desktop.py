@@ -83,7 +83,7 @@ def wait_for_server(url, timeout=60):
 # port is stopped the way start.bat does it (netstat -ano -> taskkill), and a
 # port held by anything that does not answer as VoiceDub is never touched.
 BACKEND_TITLE = "YouTube Hindi Dubbing API"   # FastAPI(title=...) in backend/app.py
-FRONTEND_TITLE = "YouTube Hindi Dubbing"      # metadata.title in web/src/app/layout.tsx
+FRONTEND_TITLE = "VoiceDub"                        # metadata.title in web/src/app/layout.tsx
 # The backend (uvicorn --host 0.0.0.0) listens on IPv4 only, and on Windows
 # "localhost" tries ::1 first: each request then waits ~2 s for the refusal.
 BACKEND_HOST = "127.0.0.1"

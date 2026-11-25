@@ -486,6 +486,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # Job history (jobs.db) and the saved/completed link lists. Overridable so
 # the test suite never writes its throwaway jobs into the real history.
 STATE_DIR = Path(os.environ.get("VOICEDUB_STATE_DIR") or BASE_DIR)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 # Use a short temp path on Windows to avoid 260-char path limit (WinError 206)
 if os.name == "nt":
     _short_root = Path(os.environ.get("VOICEDUB_WORK", "C:/tmp/vd"))
@@ -584,6 +585,24 @@ OUTPUTS.mkdir(parents=True, exist_ok=True)
 app.mount("/static/jobs", StaticFiles(directory=str(OUTPUTS)), name="job-files")
 
 
+import ratelimit as _ratelimit
+_limiter = _ratelimit.Limiter()
+
+
+@app.middleware("http")
+async def _rate_limit_gate(request: Request, call_next):
+    """Hosted only: per-client request limits (ratelimit.RULES). Webhooks are
+    exempt; the payment provider retries and is verified by signature."""
+    path = request.url.path
+    if _features.profile() == "hosted" and not path.startswith("/api/webhooks/"):
+        wait = _limiter.check(_ratelimit.client_of(request), path, request.method)
+        if wait:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=429, headers={"Retry-After": str(wait)},
+                                content={"detail": f"Too many requests. Try again in {wait} s."})
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _module_route_gate(request: Request, call_next):
     """A switched-off module's routes answer 403 locally (with the switch
@@ -661,6 +680,10 @@ def _job_visible(job, user_id: Optional[str]) -> bool:
     return owner is None or user_id is None or owner == user_id
 
 
+_UNBILLED_CREATE_PATHS = frozenset({"/api/jobs/upload", "/api/jobs/with-srt"})
+MAX_REVOICES = int(os.environ.get("VOICEDUB_MAX_REVOICES", "5"))
+
+
 @app.middleware("http")
 async def _ownership_gate(request: Request, call_next):
     """W1 / T04: every per-job route and file is checked here, before any
@@ -672,9 +695,14 @@ async def _ownership_gate(request: Request, call_next):
     if hosted and (path == "/api/jobs" or path.startswith("/api/jobs/") or path.startswith("/static/jobs/")):
         if _owner_of(request) is None:
             return JSONResponse(status_code=401, content={"detail": "Sign in first"})
+    if hosted and path in _UNBILLED_CREATE_PATHS:
+        # legacy create routes start a dub with no quote or payment: hosted uses drafts -> quotes -> submit
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
     m = _JOB_PATH.match(path)
     if m and m.group(1) not in _JOB_CREATE_PATHS:
         job = JOBS.get(m.group(1))
+        if hosted and job is None:
+            return JSONResponse(status_code=404, content={"detail": "Job not found"})
         if job is not None and not _job_visible(job, _owner_of(request)):
             return JSONResponse(status_code=404, content={"detail": "Job not found"})
     return await call_next(request)
@@ -4287,6 +4315,8 @@ def _maybe_purge_previous_url(new_url: str, enabled: bool):
     is different from the previously submitted one, purge the prior URL's
     work artifacts (frees multi-GB) before starting the new job."""
     global _last_submitted_url
+    if _features.profile() == "hosted":
+        return          # one global "last URL" would purge another account's work
     if not enabled:
         # Still update the tracker so a future enable can act on it
         with _last_url_lock:
@@ -4312,7 +4342,7 @@ def _maybe_purge_previous_url(new_url: str, enabled: bool):
 def _cleanup_old_jobs():
     """Remove oldest completed/errored jobs and orphaned work directories."""
     # Clean in-memory jobs exceeding limit
-    if len(JOBS) > MAX_JOBS:
+    if len(JOBS) > MAX_JOBS and _features.profile() != "hosted":   # hosted: paid dubs follow the retention policy, never evicted by count
         completed = sorted(
             [(jid, j) for jid, j in list(JOBS.items())
              if j.state in ("done", "error") and j.dialogue_revoice_prev is None],
@@ -5865,6 +5895,13 @@ def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = N
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if _features.profile() == "hosted":
+        used = int((job.billing or {}).get("revoices", 0))
+        if used >= MAX_REVOICES:
+            raise HTTPException(status_code=429, detail=f"This dub has been re-voiced {used} times, the most allowed. "
+                                                        "Start a new dub for more changes.")
+        job.billing = {**(job.billing or {}), "revoices": used + 1}
+        _store.save(job)
     body = body or DialogueRevoiceRequest()
     edits = _edits_from(body)
     container = None
@@ -5919,7 +5956,10 @@ def revoice_dialogue_job(job_id: str, body: Optional[DialogueRevoiceRequest] = N
                              daemon=True)
         job.worker_thread = t
         t.start()
-    return {"status": "started"}
+    out = {"status": "started"}
+    if _features.profile() == "hosted":
+        out["revoices_left"] = max(0, MAX_REVOICES - int((job.billing or {}).get("revoices", 0)))
+    return out
 
 
 _CLIP_NAME = re.compile(r"^[A-Za-z0-9_.-]+\.wav$")
@@ -5981,7 +6021,7 @@ def _pool_slot_ok(provider: str, voice: Any, pitch: Optional[str]) -> bool:
 
 
 @app.post("/api/dialogue/voice-preview")
-def dialogue_voice_preview(body: VoicePreviewRequest):
+def dialogue_voice_preview(body: VoicePreviewRequest, request: Request):
     """A short Hindi sample of one bindable voice, as WAV. Cached per
     (provider, voice, pitch, text); paid providers only with their key set."""
     import hashlib
@@ -5990,6 +6030,9 @@ def dialogue_voice_preview(body: VoicePreviewRequest):
     prov_name = (body.provider or "edge").strip()
     pitch = (body.pitch or "").strip() or None
     text = (body.text or "").strip() or VOICE_PREVIEW_TEXT
+    if _features.profile() == "hosted":
+        _signed_in(request)
+        text = VOICE_PREVIEW_TEXT          # fixed sample: free text would be free paid TTS
     if len(text) > 300:
         raise HTTPException(status_code=400, detail="Preview text is limited to 300 characters")
     opts = _dialogue_voice_options().get(prov_name)
@@ -6803,6 +6846,57 @@ def _refresh_ytdlp() -> None:
                   f"{(r.stderr or r.stdout or '')[-300:]}", flush=True)
     except Exception as e:
         print(f"[STARTUP] yt-dlp freshness check skipped: {e}", flush=True)
+
+
+# ── Owner admin + alerts (hosted: admin token; ops/health.py) ──────────────
+from ops import health as _health
+_alert_sink = None
+
+
+def _alerts():
+    global _alert_sink
+    if _alert_sink is None:
+        _alert_sink = _health.AlertSink(STATE_DIR)
+    return _alert_sink
+
+
+def _ops_snapshot() -> Dict[str, Any]:
+    jobs = [{"id": j.id, "state": j.state, "created_at": j.created_at, "error": j.error, "owner_id": j.owner_id}
+            for j in list(JOBS.values())]
+    return _health.snapshot(STATE_DIR, jobs=jobs)
+
+
+def _ops_check() -> Dict[str, Any]:
+    from billing import reconcile
+    snap = _ops_snapshot()
+    try:
+        active = {j.id for j in list(JOBS.values()) if j.state in ("queued", "running")}
+        problems = reconcile.run(STATE_DIR, active_jobs=active)
+    except Exception as e:
+        problems = {"reconcile": [f"could not run: {e}"]}
+    return {"snapshot": snap, "reconcile": problems, "alerts": _health.alerts(snap, problems)}
+
+
+def _alert_loop(stop: threading.Event, every: float = 300.0):
+    while not stop.wait(every):
+        try:
+            _alerts().emit(_ops_check()["alerts"])
+        except Exception as e:
+            print(f"[ALERT] check failed: {e}", flush=True)
+
+
+@app.get("/api/admin/overview")
+def admin_overview(request: Request):
+    _features_admin(request)
+    out = _ops_check()
+    out["recent_alerts"] = _alerts().recent(30)
+    return out
+
+
+@app.on_event("startup")
+def _start_alerts():
+    if _features.profile() == "hosted" and os.environ.get("VOICEDUB_ALERTS", "1") != "0":
+        threading.Thread(target=_alert_loop, args=(threading.Event(),), daemon=True, name="alerts").start()
 
 
 @app.on_event("startup")

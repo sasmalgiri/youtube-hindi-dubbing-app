@@ -32,3 +32,13 @@ def _no_real_translation_repair(monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(mt_guard, "repair_clients", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limits(monkeypatch):
+    """Each test starts with empty request counts (the app module is shared)."""
+    import sys
+    mod = sys.modules.get("app")
+    if mod is not None and hasattr(mod, "_limiter"):
+        import ratelimit
+        monkeypatch.setattr(mod, "_limiter", ratelimit.Limiter())

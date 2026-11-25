@@ -1554,6 +1554,10 @@ class Pipeline:
             if glossary_path.exists():
                 gdata = _json_g.loads(glossary_path.read_text(encoding="utf-8"))
                 self._glossary = {k.lower(): v for k, v in gdata.items() if not k.startswith("_")}
+                if self.cfg.target_language not in ("hi", "hi-IN"):
+                    # the file maps English -> Hindi; for any other target keep only the
+                    # "leave this word as it is" entries (ASCII values), never Hindi words
+                    self._glossary = {k: v for k, v in self._glossary.items() if str(v).isascii()}
                 if self._glossary:
                     print(f"[Pipeline] Loaded {len(self._glossary)} glossary entries "
                           f"(e.g. {list(self._glossary.items())[:3]})", flush=True)
@@ -1853,6 +1857,8 @@ class Pipeline:
         """
         if not self._pronunciation:
             return text
+        if self.cfg.target_language not in ("hi", "hi-IN"):
+            return text          # pronunciation.json spells words in Devanagari: Hindi voices only
         entries = {k: v for k, v in self._pronunciation.items()
                    if not k.startswith("_") and isinstance(v, str)}
         for src in sorted(entries, key=len, reverse=True):

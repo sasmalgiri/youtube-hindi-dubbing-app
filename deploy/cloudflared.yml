@@ -1,0 +1,14 @@
+# Cloudflare Tunnel config template. Fill TUNNEL_ID and the hostname, then:
+#   cloudflared tunnel login
+#   cloudflared tunnel create voicedub          (prints TUNNEL_ID, writes the credentials file)
+#   cloudflared tunnel route dns voicedub app.example.com
+#   cloudflared --config deploy\cloudflared.yml service install
+tunnel: TUNNEL_ID
+credentials-file: C:\Users\USER\.cloudflared\TUNNEL_ID.json
+ingress:
+  - hostname: app.example.com
+    service: http://127.0.0.1:3000      # the web app; it proxies /api to the backend on 127.0.0.1:8000
+    originRequest:
+      connectTimeout: 30s
+      # large uploads: Cloudflare's free plan caps request bodies at 100 MB
+  - service: http_status:404

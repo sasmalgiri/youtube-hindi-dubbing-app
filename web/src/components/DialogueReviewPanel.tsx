@@ -408,8 +408,10 @@ export default function DialogueReviewPanel({ jobId, mode, initialOutput, onSubm
                 else await continueJob(jobId);
                 setSent(withChanges && summary.total ? 'Sent — voicing continues with your changes.' : 'Voicing continues.');
             } else {
-                await revoiceDialogue(jobId, { ...edits, ...output });
-                setSent('Re-voice started — progress is shown above.');
+                const r = await revoiceDialogue(jobId, { ...edits, ...output });
+                const left = typeof r.revoices_left === 'number'
+                    ? ` Only changed lines are re-voiced. ${r.revoices_left} free re-voice${r.revoices_left === 1 ? '' : 's'} left for this dub.` : '';
+                setSent('Re-voice started — progress is shown above.' + left);
             }
             stop();
             onSubmitted?.();

@@ -32,7 +32,7 @@ export default function HomePage() {
     const router = useRouter();
     useEffect(() => {
         if (!auth.loaded) return;
-        if (auth.config?.required && !auth.user) router.push('/signin');
+        if (auth.config?.required && !auth.user) router.push('/pricing');   // public landing; it links to sign-in
         else if (auth.config?.profile === 'hosted') router.push('/create');   // the paid creator form (W2)
     }, [auth.loaded, auth.config?.required, auth.config?.profile, auth.user, router]);
     // The app is locked to English -> Hindi: 'auto' made Whisper guess the

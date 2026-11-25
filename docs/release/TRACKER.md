@@ -158,3 +158,20 @@ reviewer · Acct = accountant · Rev = two fluent listeners · Ops = release/sup
 | SMTP settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`) | real email codes in hosted |
 | Razorpay test key id/secret + webhook secret | W5 |
 | `GOOGLE_TTS_API_KEY` with Text-to-Speech enabled | Chirp 3 HD voices |
+| `VOICEDUB_ADMIN_TOKEN`, `VOICEDUB_ALERT_EMAIL` | `/admin` page and emailed alerts |
+| Large uploads through the tunnel: Cloudflare's free plan stops request bodies at 100 MB (decide: chunked upload, or a paid plan) | uploads over 100 MB |
+
+## Ship-readiness pass (2026-11-25)
+
+| Item | State | Evidence |
+| --- | --- | --- |
+| App shell rebranded to VoiceDub (`NEXT_PUBLIC_BRAND`); local-only links hidden in hosted; phone layout (drawer menu, no sideways scroll at 390 px) | done | browser check 12/12 |
+| Per-client rate limits in hosted (`ratelimit.py`); webhooks exempt | done | `test_rate_limit.py` |
+| Route audit fixes: legacy unbilled upload routes 404 in hosted; voice preview needs sign-in + fixed text; re-voices capped (`VOICEDUB_MAX_REVOICES`, default 5); no cross-account eviction; unknown job ids 404 | done | `test_hosted_security.py` |
+| Public `/pricing` page (prices by country, languages Available/Preview, FAQ); signed-out hosted visitors land there | done | browser check |
+| Re-voice only changed lines (already in place); remaining free re-voices shown | done | `test_e2e_review_revoice.py` |
+| Hindi glossary and pronunciation no longer applied to other target languages | done (bug fix) | `test_languages.py` |
+| Tamil style notes | tried, no gain (4.46/4.06 vs 4.44/4.14), reverted | `review_ta_20261125_054913.md` |
+| Owner `/admin` overview + alerts every 5 min (`ops/health.py`, `alerts.jsonl`, email when SMTP set) | done | `test_ops_health.py`, browser check |
+| Deploy kit: `deploy/start-hosted.ps1`, `install-tasks.ps1`, `backup-nightly.ps1`, `cloudflared.yml`, `RUNBOOK.md` | done | backup script run once; scripts parse |
+| 24 h soak | running | – |

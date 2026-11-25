@@ -81,3 +81,15 @@ def test_failed_second_reservation_releases_the_first(env, media, monkeypatch):
     assert r.status_code == 409
     b = balance(env, uid)
     assert b.reserved == 50 and b.spendable == 150             # only the unrelated hold remains
+
+
+def test_hindi_glossary_and_pronunciation_never_reach_other_languages(tmp_path):
+    from pipeline import Pipeline, PipelineConfig
+    def pipe(code):
+        return Pipeline(PipelineConfig(source="x.mp4", work_dir=tmp_path / code, output_path=tmp_path / "o.mp4",
+                                       source_language="en", target_language=code))
+    hi, es = pipe("hi"), pipe("es")
+    assert any(not str(v).isascii() for v in hi._glossary.values())
+    assert all(str(v).isascii() for v in es._glossary.values())
+    assert es._apply_pronunciation("Uso ChatGPT") == "Uso ChatGPT"
+    assert hi._apply_pronunciation("ChatGPT") != "ChatGPT"
