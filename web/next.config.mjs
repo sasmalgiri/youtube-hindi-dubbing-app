@@ -5,8 +5,13 @@
 // disagree about the port.
 const BACKEND_PORT = process.env.BACKEND_PORT || '8000';
 
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 const nextConfig = {
     reactStrictMode: true,
+    // a stray lockfile in the user folder must not become the tracing root
+    outputFileTracingRoot: path.dirname(fileURLToPath(import.meta.url)),
     async rewrites() {
         return [
             {

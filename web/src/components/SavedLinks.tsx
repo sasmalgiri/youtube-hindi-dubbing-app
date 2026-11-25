@@ -74,7 +74,7 @@ function PresetSummary({ preset }: { preset?: LinkPreset }) {
 
 function PresetEditor({ preset, onSave }: { preset: LinkPreset; onSave: (p: LinkPreset) => void }) {
     const [local, setLocal] = useState<LinkPreset>({ ...preset });
-    const timerRef = useRef<ReturnType<typeof setTimeout>>();
+    const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
     const update = (key: keyof LinkPreset, value: unknown) => {
         setLocal(prev => {
