@@ -32,10 +32,13 @@ class ChaosRunner:
     def __init__(self):
         self.calls = Counter()
         self.lock = threading.Lock()
+        self.queue, self.again = None, {}
 
     def __call__(self, job, req):
         with self.lock:
             self.calls[job.id] += 1
+            if self.calls[job.id] > 1 and self.queue is not None:
+                self.again[job.id] = (self.queue.row(job.id), RESTARTS[0])
         rnd = random.Random(job.id)
         time.sleep(rnd.uniform(0.02, 0.25))
         roll = rnd.random()
@@ -83,11 +86,14 @@ class Serving:
 
 
 SERVING = Serving()
+STILL_RUNNING = []         # restarts that reloaded while a worker or the dispatcher was still alive
+RESTARTS = [0]
 
 
 def _restart(env):
     """Stop serving, let running jobs finish, reload everything from disk."""
     SERVING.close()
+    RESTARTS[0] += 1
     try:
         _reload(env)
     finally:
@@ -98,7 +104,20 @@ def _reload(env):
     app = env["app"]
     q = env["queue"]
     q.stop()
-    q.wait_idle(60)
+    # A real restart kills the process, so nothing is still running when it reloads. Here the
+    # worker threads live on: wait for them (queued work can't drain with the dispatcher stopped).
+    t0 = time.time()
+    while q.counts().get("running") and time.time() - t0 < 120:
+        time.sleep(0.05)
+    if q.counts().get("running"):
+        import sys, traceback
+        frames = sys._current_frames()
+        stacks = ["".join(traceback.format_stack(frames[t.ident])[-6:]) for t in threading.enumerate()
+                  if t.name.startswith("job-") and t.ident in frames]
+        STILL_RUNNING.append((q.counts(), stacks[:2]))
+    n_disp = sum(1 for t in threading.enumerate() if t is q._thread and t.is_alive())
+    if n_disp:
+        STILL_RUNNING.append(f"restart {RESTARTS[0]}: {n_disp} dispatcher(s) alive after stop")
     app.JOBS.clear()
     app._store.load_all(app.JOBS)
     app._settle_loaded_jobs(app.JOBS, app._store)
@@ -111,6 +130,7 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
     app = env["app"]
     runner = ChaosRunner()
     monkeypatch.setattr(app, "_job_runner", lambda: runner)
+    runner.queue = env["queue"]
     monkeypatch.setattr(app._limiter, "rules", ())     # one test client plays every account: request limits are tested elsewhere
     GRANT = 200_000 + int(SOAK_S * 20)                 # a 24 h soak spends ~200k s per account: keep it funded
     users = []
@@ -174,6 +194,7 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
             break
         time.sleep(0.25)
 
+    assert not STILL_RUNNING, STILL_RUNNING[:5]
     assert not errors, errors[:5]
     assert len(submitted) == ACCOUNTS * JOBS_PER_ROUND or SOAK_S
     # no job lost, every reservation closed exactly once
@@ -186,7 +207,7 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
         assert (job.billing["closed"] == "settled") == (job.state == "done"), (j, job.state, job.billing["closed"])
     # nothing ran twice
     twice = {j: n for j, n in runner.calls.items() if n > 1}
-    assert not twice, twice
+    assert not twice, (twice, "restarts with live workers:", STILL_RUNNING, "second runs:", runner.again)
     # every second accounted for
     from billing.ledger import Ledger
     led = Ledger(env["tmp"] / "ledger.db")

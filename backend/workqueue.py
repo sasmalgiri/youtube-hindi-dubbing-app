@@ -137,16 +137,22 @@ class WorkQueue:
     # ── dispatcher ──
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
-            return
+            if not self._stop.is_set():
+                return                      # already running
+            self._thread.join()             # a stop is still finishing: never run two dispatchers
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="workqueue", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: Optional[float] = None) -> bool:
+        """Stop dispatching and wait for the dispatcher to exit (it never starts
+        new work afterwards). Returns False only if a timeout was given and hit."""
         self._stop.set()
         self._wake.set()
         if self._thread:
             self._thread.join(timeout)
+            return not self._thread.is_alive()
+        return True
 
     def wait_idle(self, timeout: float = 30.0) -> bool:
         """Tests: wait until nothing is queued or running."""
@@ -169,6 +175,7 @@ class WorkQueue:
 
     def _dispatch(self) -> None:
         now = self._now()
+        gave_up: List[str] = []     # their callback (billing + delivery check, can take minutes) runs outside the lock
         with self._lock:
             # a lease that ran out while this process lives = a dead worker thread
             for job_id, attempts in self._conn.execute(
@@ -179,7 +186,9 @@ class WorkQueue:
                         self._conn.execute("UPDATE work SET state='queued', updated_at=?, note='lease expired' "
                                            "WHERE job_id=?", (now, job_id))
                     else:
-                        self._give_up(job_id, "lease expired after the last attempt")
+                        self._conn.execute("UPDATE work SET state='failed', updated_at=?, note=? WHERE job_id=?",
+                                           (now, "lease expired after the last attempt", job_id))
+                        gave_up.append(job_id)
             running = self._conn.execute("SELECT account, COUNT(*) FROM work WHERE state='running' "
                                          "GROUP BY account").fetchall()
             per_acct = dict(running)
@@ -191,12 +200,25 @@ class WorkQueue:
                     break
                 if per_acct.get(account, 0) >= self.max_per_account:
                     continue
-                self._conn.execute("UPDATE work SET state='running', attempts=attempts+1, lease_until=?, "
+                t = self._threads.get(job_id)
+                if t is not None and t.is_alive():
+                    continue                # its earlier run is still going: never run a job twice at once
+                if self._stop.is_set():
+                    break                   # stopping: start nothing new
+                cur = self._conn.execute("UPDATE work SET state='running', attempts=attempts+1, lease_until=?, "
                                    "updated_at=? WHERE job_id=? AND state='queued'",
                                    (now + self.lease_seconds, now, job_id))
+                if cur.rowcount != 1:
+                    continue
                 per_acct[account] = per_acct.get(account, 0) + 1
                 total += 1
                 picks.append(job_id)
+        for job_id in gave_up:
+            if self._on_give_up:
+                try:
+                    self._on_give_up(job_id, "lease expired after the last attempt")
+                except Exception as e:
+                    print(f"[QUEUE] give-up callback failed for {job_id}: {e}", flush=True)
         for job_id in picks:
             t = threading.Thread(target=self._work, args=(job_id,), name=f"job-{job_id}", daemon=True)
             self._threads[job_id] = t

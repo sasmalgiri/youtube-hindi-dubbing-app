@@ -100,7 +100,10 @@ def env(tmp_path, monkeypatch):
     runner = Runner()
     monkeypatch.setattr(app_module, "_job_runner", lambda: runner)
     import workqueue
-    wq = workqueue.WorkQueue(tmp_path / "queue.db", app_module._run_funded, on_give_up=app_module._give_up_funded,
+    real_q = getattr(app_module._queue, "_q", None)
+    if real_q is not None:
+        real_q.stop()           # importing app starts the real queue: never let it run real jobs during tests
+    wq =workqueue.WorkQueue(tmp_path / "queue.db", app_module._run_funded, on_give_up=app_module._give_up_funded,
                              max_global=4, max_per_account=4)
     monkeypatch.setattr(app_module._queue, "_q", wq, raising=False)
     wq.start()
