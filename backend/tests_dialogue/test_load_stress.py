@@ -112,7 +112,7 @@ def test_many_accounts_with_restarts_lose_nothing(env, media, monkeypatch):
     runner = ChaosRunner()
     monkeypatch.setattr(app, "_job_runner", lambda: runner)
     monkeypatch.setattr(app._limiter, "rules", ())     # one test client plays every account: request limits are tested elsewhere
-    GRANT = 200_000
+    GRANT = 200_000 + int(SOAK_S * 20)                 # a 24 h soak spends ~200k s per account: keep it funded
     users = []
     for i in range(ACCOUNTS):
         c, uid = env["client"](f"user{i}@example.com")
